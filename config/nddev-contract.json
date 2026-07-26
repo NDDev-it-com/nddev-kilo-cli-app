@@ -1,0 +1,10 @@
+{
+  "contract_version": 1,
+  "product_name": "nddev-kilo-cli-app",
+  "github_repository": "NDDev-it-com/nddev-kilo-cli-app",
+  "license": "AGPL-3.0-or-later",
+  "skeleton": {
+    "status": "skeleton",
+    "harness_id": "kilo-cli"
+  }
+}
