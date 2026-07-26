@@ -3,18 +3,26 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+MANAGER_PATH = ROOT / "cli-tools" / "nddev_kilo_cli.py"
+MANAGER_SPEC = importlib.util.spec_from_file_location("nddev_kilo_cli", MANAGER_PATH)
+if MANAGER_SPEC is None or MANAGER_SPEC.loader is None:
+    raise RuntimeError(f"cannot load {MANAGER_PATH}")
+nddev_kilo_cli = importlib.util.module_from_spec(MANAGER_SPEC)
+sys.modules[MANAGER_SPEC.name] = nddev_kilo_cli
+MANAGER_SPEC.loader.exec_module(nddev_kilo_cli)
 VERSION = "0.1.0"
 KILO_VERSION = "7.4.16"
 SHARED_CI_COMMIT = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
 SETUPS = ("safe", "balanced", "full-auto")
 MANAGED_FILES = (
-    "config.json",
+    "xdg-config/kilo/kilo.jsonc",
     "instructions/nddev-builder.md",
     "skills/nddev-builder/SKILL.md",
 )
@@ -64,8 +72,21 @@ def validate_versions() -> None:
         fail("build version files are not synchronized")
     if version.get("kilo_cli_current") != KILO_VERSION:
         fail("unexpected Kilo CLI current version")
+    if version.get("kilo_cli_package") != nddev_kilo_cli.KILO_PACKAGE:
+        fail("unexpected Kilo CLI package")
+    if version.get("kilo_cli_package_integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
+        fail("unexpected Kilo CLI package integrity")
+    if version.get("kilo_cli_package_shasum") != nddev_kilo_cli.KILO_PACKAGE_SHASUM:
+        fail("unexpected Kilo CLI package shasum")
     if manifest.get("setups") != list(SETUPS):
         fail("manifest setup list is not synchronized")
+    software = manifest.get("software_lifecycle", {})
+    if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.BUN_INSTALL_ARGV):
+        fail("manifest Bun installer argv mismatch")
+    if software.get("layout", {}).get("manifest") != str(nddev_kilo_cli.SOFTWARE_MANIFEST_RELATIVE):
+        fail("manifest software layout mismatch")
+    if software.get("bounds", {}).get("max_paths") != nddev_kilo_cli.SOFTWARE_TREE_MAX_PATHS:
+        fail("manifest software path bound mismatch")
 
 
 def validate_contract() -> None:
@@ -77,6 +98,14 @@ def validate_contract() -> None:
     if contract.get("runtime_launch", {}).get("executable") != "kilo":
         fail("runtime executable must be kilo")
     runtime_launch = contract.get("runtime_launch", {})
+    if runtime_launch.get("config_path") != "xdg-config/kilo/kilo.jsonc":
+        fail("runtime config path must be target-owned kilo.jsonc")
+    if runtime_launch.get("path_inherited") is not False:
+        fail("runtime launch must not inherit PATH")
+    if runtime_launch.get("subcommand") != ["run"]:
+        fail("runtime launch subcommand must not force --auto globally")
+    if runtime_launch.get("auto_for_setups") != ["full-auto"]:
+        fail("runtime launch --auto must be limited to full-auto")
     if runtime_launch.get("max_runtime_seconds") != 3600:
         fail("runtime launch timeout must be pinned to 3600 seconds")
     if runtime_launch.get("forwards_child_exit_code") is not True:
@@ -89,10 +118,21 @@ def validate_contract() -> None:
     if builder.get("marketplace") is not None:
         fail("marketplace must remain null unless an official Kilo CLI marketplace is proven")
     managed = contract.get("managed_state", {})
-    if managed.get("config_file") != "config.json":
-        fail("managed config file must be config.json")
+    if managed.get("config_file") != "xdg-config/kilo/kilo.jsonc":
+        fail("managed config file must be target-owned kilo.jsonc")
     if managed.get("managed_files") != list(MANAGED_FILES):
         fail("managed file list is not synchronized")
+    software = contract.get("software_lifecycle", {})
+    if software.get("install_tool") != "bun":
+        fail("software lifecycle must use Bun")
+    if software.get("install_argv") != list(nddev_kilo_cli.BUN_INSTALL_ARGV):
+        fail("software lifecycle Bun argv mismatch")
+    if software.get("package_integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
+        fail("software lifecycle integrity mismatch")
+    if software.get("status_executes_binary") is not False:
+        fail("software-status must not execute the target binary")
+    if software.get("layout", {}).get("bin") != f"bin/{nddev_kilo_cli.KILO_COMMAND}":
+        fail("software lifecycle bin path mismatch")
 
 
 def validate_baseline() -> None:
@@ -102,6 +142,12 @@ def validate_baseline() -> None:
     npm = baseline.get("npm", {})
     if npm.get("package") != "@kilocode/cli" or npm.get("version") != KILO_VERSION:
         fail("unexpected npm package identity")
+    if npm.get("bin") != {"kilo": "bin/kilo", "kilocode": "bin/kilo"}:
+        fail("unexpected npm bin map")
+    if npm.get("scripts", {}).get("postinstall") != "node ./postinstall.mjs":
+        fail("unexpected npm postinstall script")
+    if npm.get("dist", {}).get("integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
+        fail("unexpected npm integrity")
     if npm.get("dist", {}).get("shasum") != "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d":
         fail("unexpected npm shasum")
     assets = json.dumps(baseline.get("release", {}).get("cli_assets", []), sort_keys=True)
@@ -167,11 +213,53 @@ def validate_workflows() -> None:
 
 
 def validate_manager_parse_args() -> None:
-    sys.path.insert(0, str(ROOT / "cli-tools"))
-    import nddev_kilo_cli
-
     nddev_kilo_cli.parse_args(["list", "--json"])
     nddev_kilo_cli.parse_args(["status", "--target", "/tmp/nddev-kilo-check", "--json"])
+    nddev_kilo_cli.parse_args(["software-status", "--target", "/tmp/nddev-kilo-check", "--json"])
+
+
+def validate_launch_guard() -> None:
+    executable = "/tmp/nddev-kilo-check/bin/kilo"
+    for setup_id, expected in (
+        ("safe", [executable, "run", "prompt"]),
+        ("balanced", [executable, "run", "prompt"]),
+        ("full-auto", [executable, "run", "--auto", "prompt"]),
+    ):
+        command = nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"])
+        if command != expected:
+            fail(f"{setup_id}: launch argv mismatch")
+        if setup_id != "full-auto" and "--auto" in command:
+            fail(f"{setup_id}: launch must not include --auto")
+        if setup_id == "full-auto" and command.count("--auto") != 1:
+            fail("full-auto launch must include exactly one managed --auto")
+    forbidden_cases = (
+        ["--", "--auto"],
+        ["--", "--auto=true"],
+        ["--", "--no-auto"],
+        ["--", "--dangerously-skip-permissions"],
+        ["--", "--dangerously-skip-permissions=true"],
+        ["--", "--config", "/tmp/other.json"],
+        ["--", "--config=/tmp/other.json"],
+        ["--", "--model", "provider/model"],
+        ["--", "--model=provider/model"],
+        ["--", "-m", "provider/model"],
+        ["--", "-mprovider/model"],
+        ["--", "-c"],
+        ["--", "-s", "session-id"],
+        ["--", "-s=session-id"],
+        ["--", "-f/tmp/secret"],
+        ["--", "--", "--auto"],
+        ["--", "prompt", "--", "--dangerously-skip-permissions"],
+        ["--", "--dir=/tmp/other"],
+        ["--", "--attach", "http://127.0.0.1:4096"],
+        ["--", "--share"],
+    )
+    for case in forbidden_cases:
+        try:
+            nddev_kilo_cli.normalize_launch_child_args(list(case))
+        except nddev_kilo_cli.ManagerError:
+            continue
+        fail(f"launch guard accepted managed child argv: {case}")
 
 
 def main() -> int:
@@ -182,6 +270,7 @@ def main() -> int:
         validate_setups()
         validate_workflows()
         validate_manager_parse_args()
+        validate_launch_guard()
     except ValidationError as exc:
         print(f"public contract validation failed: {exc}", file=sys.stderr)
         return 1

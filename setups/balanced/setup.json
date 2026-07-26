@@ -4,7 +4,7 @@
   "description": "Kilo Code CLI setup with sandboxed tools, denied sandbox network, and narrow auto-allowed development checks.",
   "permission_profile": "balanced",
   "managed_files": [
-    "config.json",
+    "xdg-config/kilo/kilo.jsonc",
     "instructions/nddev-builder.md",
     "skills/nddev-builder/SKILL.md"
   ],

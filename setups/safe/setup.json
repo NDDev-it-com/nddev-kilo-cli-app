@@ -4,7 +4,7 @@
   "description": "Human-gated Kilo Code CLI setup with sandboxed tools, denied sandbox network, and ask-by-default shell execution.",
   "permission_profile": "safe",
   "managed_files": [
-    "config.json",
+    "xdg-config/kilo/kilo.jsonc",
     "instructions/nddev-builder.md",
     "skills/nddev-builder/SKILL.md"
   ],

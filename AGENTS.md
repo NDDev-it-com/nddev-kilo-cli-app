@@ -9,7 +9,7 @@ Use only current Kilo Code CLI names and documented surfaces:
 
 - `kilo`
 - `KILO_CONFIG`
-- `~/.config/kilo/config.json`
+- `~/.config/kilo/kilo.jsonc`
 - `agent.<name>`
 - `skills.paths`
 - `command.<name>`

@@ -4,7 +4,7 @@
   "description": "Kilo Code CLI setup for autonomous runs with native allow permissions and sandbox network enabled.",
   "permission_profile": "full-auto",
   "managed_files": [
-    "config.json",
+    "xdg-config/kilo/kilo.jsonc",
     "instructions/nddev-builder.md",
     "skills/nddev-builder/SKILL.md"
   ],

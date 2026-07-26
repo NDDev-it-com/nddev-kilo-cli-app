@@ -5,7 +5,7 @@
     "name": "Kilo Code CLI",
     "documented_command": "kilo",
     "docs_title": "Kilo Code CLI: Run the AI Coding Agent from Your Terminal",
-    "install_command": "npm install -g @kilocode/cli"
+    "managed_install_command": "bun add --global --exact --trust @kilocode/cli@7.4.16"
   },
   "npm": {
     "package": "@kilocode/cli",
@@ -13,6 +13,9 @@
     "bin": {
       "kilo": "bin/kilo",
       "kilocode": "bin/kilo"
+    },
+    "scripts": {
+      "postinstall": "node ./postinstall.mjs"
     },
     "dist": {
       "integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
@@ -76,7 +79,12 @@
     ]
   },
   "native_surfaces": {
-    "config_file": "~/.config/kilo/config.json",
+    "config_file": "~/.config/kilo/kilo.jsonc",
+    "documented_compatibility_files": [
+      "~/.config/kilo/config.json",
+      "~/.config/kilo/kilo.json",
+      "kilo.jsonc"
+    ],
     "trusted_config_env": "KILO_CONFIG",
     "permission": "permission.* with ask, allow, deny actions",
     "sandbox": "sandbox.enabled, sandbox.network, sandbox.writable_paths, sandbox.allowed_hosts",

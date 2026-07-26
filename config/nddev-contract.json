@@ -17,11 +17,15 @@
   "runtime_launch": {
     "executable": "kilo",
     "subcommand": [
-      "run",
-      "--auto"
+      "run"
+    ],
+    "auto_for_setups": [
+      "full-auto"
     ],
     "config_env": "KILO_CONFIG",
+    "config_path": "xdg-config/kilo/kilo.jsonc",
     "isolated_child_home": true,
+    "path_inherited": false,
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
     "max_runtime_seconds": 3600
@@ -40,17 +44,21 @@
       "switch",
       "restore",
       "remove",
+      "software-status",
+      "install-cli",
+      "update-cli",
+      "remove-cli",
       "launch"
     ],
     "explicit_absolute_target": true,
     "target_bound_backup_slots": 10
   },
   "managed_state": {
-    "config_file": "config.json",
+    "config_file": "xdg-config/kilo/kilo.jsonc",
     "stamp_file": "NDDEV-KILO-CLI-SETUP.json",
     "backup_envelope": "NDDEV-KILO-CLI-BACKUP.json",
     "managed_files": [
-      "config.json",
+      "xdg-config/kilo/kilo.jsonc",
       "instructions/nddev-builder.md",
       "skills/nddev-builder/SKILL.md"
     ],
@@ -64,6 +72,30 @@
       "instructions",
       "experimental"
     ]
+  },
+  "software_lifecycle": {
+    "package": "@kilocode/cli",
+    "version": "7.4.16",
+    "command": "kilo",
+    "official_alias": "kilocode",
+    "install_tool": "bun",
+    "install_argv": [
+      "add",
+      "--global",
+      "--exact",
+      "--trust",
+      "@kilocode/cli@7.4.16"
+    ],
+    "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
+    "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
+    "layout": {
+      "bin": "bin/kilo",
+      "global_dir": "install/global",
+      "manifest": "software/kilo-cli.json"
+    },
+    "status_executes_binary": false,
+    "stage_version_probe": true,
+    "target_owned": true
   },
   "builder": {
     "enabled_by_default": true,

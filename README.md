@@ -12,10 +12,12 @@ Kilo during install, switch, restore, or remove operations.
 - Official source: <https://github.com/Kilo-Org/kilocode>
 - Current CLI package: `@kilocode/cli@7.4.16`
 - Runtime command used by this module: `kilo`
-- Managed config file inside a target: `config.json`
+- Managed config file inside a target: `xdg-config/kilo/kilo.jsonc`
 
-The npm package also exposes a secondary package bin, but this module's public
-runtime surface follows the documented user command, `kilo`.
+The npm package also exposes the official `kilocode` bin alias, but this
+module's public runtime surface follows the documented user command, `kilo`.
+Managed software installation is Bun-only:
+`bun add --global --exact --trust @kilocode/cli@7.4.16`.
 
 ## Setups
 
@@ -34,21 +36,33 @@ declared because an official Kilo CLI marketplace format is not proven here.
 python3 cli-tools/nddev_kilo_cli.py list --json
 python3 cli-tools/nddev_kilo_cli.py plan --setup safe --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --setup safe --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py install-cli --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py software-status --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py update-cli --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py switch --setup balanced --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py restore --backup 0 --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py remove-cli --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "implement the task"
 ```
 
-`launch` sets an isolated child `HOME`, XDG runtime directories, and
-`KILO_CONFIG=/absolute/kilo-target/config.json`; it strips provider credential
-environment variables before executing `kilo run --auto`, forwards the child
-exit code, and returns `124` on timeout.
+`launch` requires a clean managed setup and current target-owned CLI software,
+then releases the target lock before executing `/absolute/kilo-target/bin/kilo
+run`. Only the `full-auto` setup receives the managed `--auto` flag; `safe` and
+`balanced` keep native interactive permission prompts. It sets target-owned
+`HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+`XDG_STATE_HOME`, `XDG_CACHE_HOME`, `TMPDIR`, and
+`KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`; it does not
+inherit provider credential variables or use `PATH` to find Kilo. User-supplied
+launch arguments cannot override managed config, home, permission, auto, or
+working-scope controls, including model or agent selection, session resume,
+attached files, remote attach, share, and permission-bypass flags.
 
 ## Safety
 
 The manager requires an explicit absolute target, rejects target symlinks and
-managed symlink or hard-link paths, bounds reads, records target-bound stamps,
-rotates ten target-bound backup slots, detects managed drift before switch and
-remove operations, bounds launch processes, and rolls back target writes on
-mutation failure.
+managed symlink or hard-link paths, validates target-owned software symlinks,
+bounds reads and installed tree scans, records target-bound stamps, rotates ten
+target-bound backup slots, detects managed drift before switch and remove
+operations, bounds launch processes, and rolls back target writes on mutation
+failure.
