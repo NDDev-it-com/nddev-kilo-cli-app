@@ -57,7 +57,10 @@ def validate_versions() -> None:
     manifest = load_json(require_file("build/manifest.json"))
     if version_text != VERSION:
         fail("VERSION is not synchronized")
-    if version.get("build_version") != version_text or manifest.get("build_version") != version_text:
+    if (
+        version.get("build_version") != version_text
+        or manifest.get("build_version") != version_text
+    ):
         fail("build version files are not synchronized")
     if version.get("kilo_cli_current") != KILO_VERSION:
         fail("unexpected Kilo CLI current version")
@@ -130,9 +133,15 @@ def validate_setups() -> None:
         if config.get("sandbox", {}).get("enabled") is not True:
             fail(f"{setup_id}: sandbox must be enabled")
         if setup_id == "full-auto":
-            if config.get("permission") != "allow" or config.get("sandbox", {}).get("network") != "allow":
+            if (
+                config.get("permission") != "allow"
+                or config.get("sandbox", {}).get("network") != "allow"
+            ):
                 fail("full-auto must use allow permissions and sandbox network allow")
-        elif config.get("permission") == "allow" or config.get("sandbox", {}).get("network") != "deny":
+        elif (
+            config.get("permission") == "allow"
+            or config.get("sandbox", {}).get("network") != "deny"
+        ):
             fail(f"{setup_id}: expected gated permissions and sandbox network deny")
         for relative in MANAGED_FILES[1:]:
             require_file(f"setups/{setup_id}/{relative}")

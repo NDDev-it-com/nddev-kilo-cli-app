@@ -234,7 +234,9 @@ def parse_json_object(content: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def read_json_file(path: Path, label: str, *, max_bytes: int = METADATA_MAX_BYTES) -> dict[str, Any]:
+def read_json_file(
+    path: Path, label: str, *, max_bytes: int = METADATA_MAX_BYTES
+) -> dict[str, Any]:
     return parse_json_object(read_regular_file(path, label, max_bytes=max_bytes), label)
 
 
@@ -321,7 +323,11 @@ def extract_managed_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def merge_config(existing: dict[str, Any], managed: dict[str, Any]) -> dict[str, Any]:
-    merged = {key: copy.deepcopy(value) for key, value in existing.items() if key not in CONFIG_MANAGED_KEYS}
+    merged = {
+        key: copy.deepcopy(value)
+        for key, value in existing.items()
+        if key not in CONFIG_MANAGED_KEYS
+    }
     for key, value in managed.items():
         merged[key] = copy.deepcopy(value)
     return merged
@@ -335,7 +341,9 @@ def managed_config_fragment(setup: Setup, target: Path) -> dict[str, Any]:
     fragment["instructions"] = [str((target / BUILDER_INSTRUCTIONS).resolve(strict=False))]
     agent = copy.deepcopy(fragment.get("agent", {}))
     builder_agent = copy.deepcopy(agent.get("nddev-builder", {}))
-    builder_agent["prompt"] = "{file:" + str((target / BUILDER_INSTRUCTIONS).resolve(strict=False)) + "}"
+    builder_agent["prompt"] = (
+        "{file:" + str((target / BUILDER_INSTRUCTIONS).resolve(strict=False)) + "}"
+    )
     requirements = copy.deepcopy(builder_agent.get("requirements", {}))
     requirements["skills"] = ["nddev-builder"]
     builder_agent["requirements"] = requirements
@@ -356,7 +364,9 @@ def digest_for_content(relative: str, content: bytes) -> str:
     return sha256_bytes(content)
 
 
-def stamp_for_desired(target: Path, setup_id: str, desired: dict[str, bytes | None]) -> dict[str, Any]:
+def stamp_for_desired(
+    target: Path, setup_id: str, desired: dict[str, bytes | None]
+) -> dict[str, Any]:
     managed_records = []
     for relative in MANAGED_FILES:
         content = desired.get(relative)
@@ -425,7 +435,9 @@ def current_digest(target: Path, relative: str) -> str | None:
         path.lstat()
     except FileNotFoundError:
         return None
-    content = read_regular_file(path, f"managed file {relative}", max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
+    content = read_regular_file(
+        path, f"managed file {relative}", max_bytes=MANAGED_PAYLOAD_MAX_BYTES
+    )
     return digest_for_content(relative, content)
 
 
@@ -511,7 +523,9 @@ def atomic_write(target: Path, relative: str, content: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, OWNER_FILE_MODE)
-        if identity_of(require_directory(path.parent, f"managed parent {path.parent}")) != identity_of(parent_info):
+        if identity_of(
+            require_directory(path.parent, f"managed parent {path.parent}")
+        ) != identity_of(parent_info):
             raise ConcurrentTargetChange(f"managed parent changed while writing {relative}")
         os.replace(temporary, path)
         os.chmod(path, OWNER_FILE_MODE)
@@ -560,7 +574,9 @@ def snapshot_paths(target: Path, relatives: set[str]) -> dict[str, bytes | None]
         except FileNotFoundError:
             snapshot[relative] = None
             continue
-        snapshot[relative] = read_regular_file(path, f"snapshot {relative}", max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
+        snapshot[relative] = read_regular_file(
+            path, f"snapshot {relative}", max_bytes=MANAGED_PAYLOAD_MAX_BYTES
+        )
     return snapshot
 
 
@@ -677,7 +693,9 @@ def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | 
 
 def desired_for_remove(target: Path) -> dict[str, bytes | None]:
     config = current_config(target)
-    unmanaged = {key: copy.deepcopy(value) for key, value in config.items() if key not in CONFIG_MANAGED_KEYS}
+    unmanaged = {
+        key: copy.deepcopy(value) for key, value in config.items() if key not in CONFIG_MANAGED_KEYS
+    }
     desired: dict[str, bytes | None] = {
         CONFIG: canonical_json(unmanaged) if unmanaged else None,
         BUILDER_INSTRUCTIONS: None,
@@ -876,12 +894,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--target", required=True)
     plan_parser.add_argument("--json", action="store_true")
 
-    install_parser = subparsers.add_parser("install", help="install a setup into an explicit target")
+    install_parser = subparsers.add_parser(
+        "install", help="install a setup into an explicit target"
+    )
     install_parser.add_argument("--setup", required=True, choices=setup_ids())
     install_parser.add_argument("--target", required=True)
     install_parser.add_argument("--json", action="store_true")
 
-    switch_parser = subparsers.add_parser("switch", help="switch an installed target to another setup")
+    switch_parser = subparsers.add_parser(
+        "switch", help="switch an installed target to another setup"
+    )
     switch_parser.add_argument("--setup", required=True, choices=setup_ids())
     switch_parser.add_argument("--target", required=True)
     switch_parser.add_argument("--json", action="store_true")
@@ -895,7 +917,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser.add_argument("--target", required=True)
     remove_parser.add_argument("--json", action="store_true")
 
-    launch_parser = subparsers.add_parser("launch", help="launch Kilo with isolated HOME and KILO_CONFIG")
+    launch_parser = subparsers.add_parser(
+        "launch", help="launch Kilo with isolated HOME and KILO_CONFIG"
+    )
     launch_parser.add_argument("--target", required=True)
     launch_parser.add_argument("--timeout-seconds", type=int, default=3600)
     launch_parser.add_argument("child_args", nargs=argparse.REMAINDER)
