@@ -1,0 +1,40 @@
+{
+  "agent": {
+    "nddev-builder": {
+      "description": "NDDev setup manager builder and reviewer.",
+      "mode": "all",
+      "permission": "allow",
+      "prompt": "{file:instructions/nddev-builder.md}",
+      "requirements": {
+        "skills": [
+          "nddev-builder"
+        ]
+      }
+    }
+  },
+  "command": {
+    "nddev-builder": {
+      "agent": "nddev-builder",
+      "description": "Load NDDev builder context.",
+      "template": "Use the nddev-builder agent and skill to build or review the NDDev setup manager in this repository."
+    }
+  },
+  "default_agent": "nddev-builder",
+  "experimental": {
+    "openTelemetry": false
+  },
+  "instructions": [
+    "instructions/nddev-builder.md"
+  ],
+  "permission": "allow",
+  "sandbox": {
+    "enabled": true,
+    "network": "allow",
+    "writable_paths": []
+  },
+  "skills": {
+    "paths": [
+      "skills"
+    ]
+  }
+}

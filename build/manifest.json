@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "product_name": "nddev-kilo-cli-app",
+  "build_version": "0.1.0",
+  "runtime_baseline": "references/kilo-cli-baseline.json",
+  "contract": "config/nddev-contract.json",
+  "manager": "cli-tools/nddev_kilo_cli.py",
+  "validator": "cli-tools/validate_public_contracts.py",
+  "setups": [
+    "safe",
+    "balanced",
+    "full-auto"
+  ],
+  "managed_state": [
+    "config.json",
+    "instructions/nddev-builder.md",
+    "skills/nddev-builder/SKILL.md"
+  ]
+}

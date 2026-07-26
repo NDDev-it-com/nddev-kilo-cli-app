@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Human-gated Kilo Code CLI setup with sandboxed tools, denied sandbox network, and ask-by-default shell execution.",
+  "permission_profile": "safe",
+  "managed_files": [
+    "config.json",
+    "instructions/nddev-builder.md",
+    "skills/nddev-builder/SKILL.md"
+  ],
+  "managed_config_keys": [
+    "permission",
+    "sandbox",
+    "default_agent",
+    "agent",
+    "skills",
+    "command",
+    "instructions",
+    "experimental"
+  ],
+  "builder_enabled": true,
+  "builder_projection": "native-agent-skill-command-config",
+  "native_surfaces": [
+    "agent",
+    "skills",
+    "command",
+    "permission",
+    "sandbox"
+  ]
+}

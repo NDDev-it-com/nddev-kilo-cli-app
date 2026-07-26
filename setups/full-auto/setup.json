@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "full-auto",
+  "description": "Kilo Code CLI setup for autonomous runs with native allow permissions and sandbox network enabled.",
+  "permission_profile": "full-auto",
+  "managed_files": [
+    "config.json",
+    "instructions/nddev-builder.md",
+    "skills/nddev-builder/SKILL.md"
+  ],
+  "managed_config_keys": [
+    "permission",
+    "sandbox",
+    "default_agent",
+    "agent",
+    "skills",
+    "command",
+    "instructions",
+    "experimental"
+  ],
+  "builder_enabled": true,
+  "builder_projection": "native-agent-skill-command-config",
+  "native_surfaces": [
+    "agent",
+    "skills",
+    "command",
+    "permission",
+    "sandbox"
+  ]
+}

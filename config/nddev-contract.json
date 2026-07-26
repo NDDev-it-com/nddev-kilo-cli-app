@@ -3,8 +3,93 @@
   "product_name": "nddev-kilo-cli-app",
   "github_repository": "NDDev-it-com/nddev-kilo-cli-app",
   "license": "AGPL-3.0-or-later",
-  "skeleton": {
-    "status": "skeleton",
-    "harness_id": "kilo-cli"
+  "runtime_compatibility": {
+    "current_version": "7.4.16",
+    "minimum_version": "7.4.16",
+    "package": "@kilocode/cli",
+    "official_source": {
+      "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
+      "repository": "https://github.com/Kilo-Org/kilocode",
+      "package_json": "https://raw.githubusercontent.com/Kilo-Org/kilocode/main/packages/opencode/package.json",
+      "npm": "https://registry.npmjs.org/@kilocode/cli/7.4.16"
+    }
+  },
+  "runtime_launch": {
+    "executable": "kilo",
+    "subcommand": [
+      "run",
+      "--auto"
+    ],
+    "config_env": "KILO_CONFIG",
+    "isolated_child_home": true,
+    "credential_inheritance": false,
+    "forwards_child_exit_code": true,
+    "max_runtime_seconds": 3600
+  },
+  "setup_system": {
+    "setup_ids": [
+      "safe",
+      "balanced",
+      "full-auto"
+    ],
+    "lifecycle": [
+      "list",
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "restore",
+      "remove",
+      "launch"
+    ],
+    "explicit_absolute_target": true,
+    "target_bound_backup_slots": 10
+  },
+  "managed_state": {
+    "config_file": "config.json",
+    "stamp_file": "NDDEV-KILO-CLI-SETUP.json",
+    "backup_envelope": "NDDEV-KILO-CLI-BACKUP.json",
+    "managed_files": [
+      "config.json",
+      "instructions/nddev-builder.md",
+      "skills/nddev-builder/SKILL.md"
+    ],
+    "managed_config_keys": [
+      "permission",
+      "sandbox",
+      "default_agent",
+      "agent",
+      "skills",
+      "command",
+      "instructions",
+      "experimental"
+    ]
+  },
+  "builder": {
+    "enabled_by_default": true,
+    "projection": "native-agent-skill-command-config",
+    "native_surfaces": [
+      "agent",
+      "skills.paths",
+      "command",
+      "permission",
+      "sandbox"
+    ],
+    "marketplace": null,
+    "plugin": null,
+    "mcp": null,
+    "vscode_extensions": null
+  },
+  "safety": {
+    "preserve_unmanaged_config_keys": true,
+    "preserve_unmanaged_files": true,
+    "bounded_reads": true,
+    "bounded_processes": true,
+    "reject_target_symlink": true,
+    "reject_managed_symlink": true,
+    "reject_managed_hardlink": true,
+    "drift_detection": true,
+    "rollback_on_mutation_failure": true,
+    "live_state_default": "never"
   }
 }
