@@ -26,6 +26,19 @@ MANAGED_FILES = (
     "instructions/nddev-builder.md",
     "skills/nddev-builder/SKILL.md",
 )
+CONTRACT_KEYS = {
+    "contract_version",
+    "product_name",
+    "github_repository",
+    "license",
+    "runtime_compatibility",
+    "runtime_launch",
+    "setup_system",
+    "managed_state",
+    "software_lifecycle",
+    "builder",
+    "safety",
+}
 
 
 class ValidationError(Exception):
@@ -91,8 +104,8 @@ def validate_versions() -> None:
 
 def validate_contract() -> None:
     contract = load_json(require_file("config/nddev-contract.json"))
-    if "skeleton" in contract:
-        fail("public contract still declares skeleton state")
+    if set(contract) != CONTRACT_KEYS:
+        fail("public contract top-level keys are not exact")
     if contract.get("product_name") != "nddev-kilo-cli-app":
         fail("unexpected product name")
     if contract.get("runtime_launch", {}).get("executable") != "kilo":

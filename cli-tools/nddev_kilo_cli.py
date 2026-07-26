@@ -177,6 +177,16 @@ class Setup:
     files: dict[str, bytes]
 
 
+@dataclass
+class DirectoryTransaction:
+    created: list[Path]
+
+    def cleanup(self) -> None:
+        for path in reversed(self.created):
+            with contextlib.suppress(OSError):
+                path.rmdir()
+
+
 def fail(message: str) -> NoReturn:
     raise ManagerError(message)
 
@@ -244,6 +254,30 @@ def reject_absolute_symlink_ancestors(path: Path) -> None:
             fail(f"target path must not contain symlink ancestors: {current}")
         if current != path and not stat.S_ISDIR(info.st_mode):
             fail(f"target parent must be a real directory: {current}")
+
+
+def ensure_directory_chain(path: Path, transaction: DirectoryTransaction, label: str) -> None:
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                fail(f"{label} parent is missing")
+            current = parent
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"{label} must not contain symlink ancestors: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a real directory: {current}")
+        break
+    for directory in reversed(missing):
+        directory.mkdir(mode=OWNER_DIR_MODE)
+        directory.chmod(OWNER_DIR_MODE)
+        transaction.created.append(directory)
 
 
 def require_directory(path: Path, label: str) -> os.stat_result:
@@ -380,11 +414,20 @@ def resolve_target(raw: str | Path, *, create: bool = False) -> Path:
         original_info = None
     if original_info is not None and stat.S_ISLNK(original_info.st_mode):
         fail("target must not be a symlink")
+    reject_absolute_symlink_ancestors(path)
     path = path.resolve(strict=False)
     reject_absolute_symlink_ancestors(path)
     if create:
-        path.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
-        os.chmod(path, OWNER_DIR_MODE)
+        transaction = DirectoryTransaction([])
+        try:
+            ensure_directory_chain(path.parent, transaction, "target parent")
+            parent_info = require_directory(path.parent, "target parent")
+            if not is_owner_private_directory(parent_info):
+                fail("target parent must be private to the current user with mode 0700")
+            ensure_private_directory(path, create=True, transaction=transaction)
+        except BaseException:
+            transaction.cleanup()
+            raise
     else:
         try:
             info = path.lstat()
@@ -400,14 +443,22 @@ def resolve_target(raw: str | Path, *, create: bool = False) -> Path:
     return path
 
 
-def ensure_private_directory(path: Path, *, create: bool) -> bool:
+def ensure_private_directory(
+    path: Path,
+    *,
+    create: bool,
+    transaction: DirectoryTransaction | None = None,
+) -> bool:
     try:
         info = path.lstat()
     except FileNotFoundError:
         if not create:
             return False
-        path.mkdir(mode=OWNER_DIR_MODE, parents=True)
+        require_directory(path.parent, f"{path} parent")
+        path.mkdir(mode=OWNER_DIR_MODE)
         path.chmod(OWNER_DIR_MODE)
+        if transaction is not None:
+            transaction.created.append(path)
         return True
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         fail(f"{path} must be a real directory")
@@ -439,29 +490,49 @@ def lock_path(target: Path) -> Path:
 
 
 @contextlib.contextmanager
-def target_lock(target: Path) -> Iterator[None]:
+def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[DirectoryTransaction]:
+    transaction = DirectoryTransaction([])
+    if create_parent:
+        ensure_directory_chain(target.parent, transaction, "canonical target parent")
+    parent_info = require_directory(target.parent, "canonical target parent")
+    if not is_owner_private_directory(parent_info):
+        transaction.cleanup()
+        fail("canonical target parent must be private to the current user with mode 0700")
     lock = lock_path(target)
-    require_directory(target.parent, "canonical target parent")
+    owner = lock / "owner.json"
     try:
         lock.mkdir(mode=OWNER_DIR_MODE)
         lock.chmod(OWNER_DIR_MODE)
-        owner = lock / "owner.json"
         owner.write_bytes(
             canonical_json({"schema_version": 1, "pid": os.getpid(), "target": str(target)})
         )
         owner.chmod(OWNER_FILE_MODE)
     except FileExistsError:
+        transaction.cleanup()
         fail(f"target is locked: {lock}")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if path_exists_no_follow(owner) and not owner.is_symlink():
+                owner.unlink()
+            lock.rmdir()
+        transaction.cleanup()
+        raise
+    failed = False
     try:
-        yield
+        yield transaction
+    except BaseException:
+        failed = True
+        raise
     finally:
         try:
             owner = lock / "owner.json"
-            if owner.exists() and not owner.is_symlink():
+            if path_exists_no_follow(owner) and not owner.is_symlink():
                 owner.unlink()
             lock.rmdir()
         except OSError as exc:
             raise ManagerError(f"target lock cleanup failed: {lock}") from exc
+        if failed:
+            transaction.cleanup()
 
 
 def stamp_path(target: Path) -> Path:
@@ -869,29 +940,31 @@ def desired_for_remove(target: Path) -> dict[str, bytes | None]:
 
 
 def mutate_setup(target: Path, setup_id: str, operation: str) -> dict[str, Any]:
-    target = resolve_target(target, create=True)
+    target = resolve_target(target, create=False)
     backup_slot: int | None = None
-    if operation == "install":
-        stamp = read_stamp(target)
-        if stamp is None:
-            preflight_unmanaged_target(target)
-        else:
-            require_clean_installed(target)
+    with target_lock(target, create_parent=(operation == "install")) as transaction:
+        ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
+        if operation == "install":
+            stamp = read_stamp(target)
+            if stamp is None:
+                preflight_unmanaged_target(target)
+            else:
+                require_clean_installed(target)
+                if stamp["setup_id"] != setup_id:
+                    backup_slot = backup_current_state(target, stamp)
+        elif operation == "switch":
+            stamp = require_clean_installed(target)
             if stamp["setup_id"] != setup_id:
                 backup_slot = backup_current_state(target, stamp)
-    elif operation == "switch":
-        stamp = require_clean_installed(target)
-        if stamp["setup_id"] != setup_id:
-            backup_slot = backup_current_state(target, stamp)
-    else:
-        fail(f"unsupported mutation operation: {operation}")
-    desired = desired_for_setup(target, setup_id)
-    snapshot = snapshot_paths(target, set(desired))
-    try:
-        replace_managed_state(target, desired, None)
-    except Exception:
-        restore_snapshot(target, snapshot)
-        raise
+        else:
+            fail(f"unsupported mutation operation: {operation}")
+        desired = desired_for_setup(target, setup_id)
+        snapshot = snapshot_paths(target, set(desired))
+        try:
+            replace_managed_state(target, desired, None)
+        except Exception:
+            restore_snapshot(target, snapshot)
+            raise
     return {
         "operation": operation,
         "setup_id": setup_id,
@@ -902,14 +975,16 @@ def mutate_setup(target: Path, setup_id: str, operation: str) -> dict[str, Any]:
 
 
 def restore_setup(target: Path, slot: int) -> dict[str, Any]:
-    target = resolve_target(target, create=True)
-    setup_id, desired = desired_for_backup(target, slot)
-    snapshot = snapshot_paths(target, set(desired))
-    try:
-        replace_managed_state(target, desired, None)
-    except Exception:
-        restore_snapshot(target, snapshot)
-        raise
+    target = resolve_target(target, create=False)
+    with target_lock(target):
+        require_private_target_directory_for_software(target, allow_missing=False)
+        setup_id, desired = desired_for_backup(target, slot)
+        snapshot = snapshot_paths(target, set(desired))
+        try:
+            replace_managed_state(target, desired, None)
+        except Exception:
+            restore_snapshot(target, snapshot)
+            raise
     return {
         "operation": "restore",
         "setup_id": setup_id,
@@ -921,14 +996,15 @@ def restore_setup(target: Path, slot: int) -> dict[str, Any]:
 
 def remove_setup(target: Path) -> dict[str, Any]:
     target = resolve_target(target, create=False)
-    stamp = require_clean_installed(target)
-    desired = desired_for_remove(target)
-    snapshot = snapshot_paths(target, set(desired))
-    try:
-        replace_managed_state(target, desired, None)
-    except Exception:
-        restore_snapshot(target, snapshot)
-        raise
+    with target_lock(target):
+        stamp = require_clean_installed(target)
+        desired = desired_for_remove(target)
+        snapshot = snapshot_paths(target, set(desired))
+        try:
+            replace_managed_state(target, desired, None)
+        except Exception:
+            restore_snapshot(target, snapshot)
+            raise
     return {
         "operation": "remove",
         "removed_setup_id": stamp["setup_id"],
@@ -1766,9 +1842,13 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
                 "executable": preflight["executable"],
             }
     staging: Path | None = None
-    with target_lock(target):
+    with target_lock(target, create_parent=(command == "install-cli")) as transaction:
         try:
-            ensure_private_directory(target, create=True)
+            ensure_private_directory(
+                target,
+                create=(command == "install-cli"),
+                transaction=transaction,
+            )
             status = software_status(target)
             if command == "install-cli":
                 if status.get("partial"):
@@ -1836,6 +1916,7 @@ def remove_cli(target: Path) -> dict[str, Any]:
         }
         moved_old: list[Path] = []
         with target_lock(target):
+            require_private_target_directory_for_software(target, allow_missing=False)
             for relative in SOFTWARE_REPLACE_PATHS:
                 destination = target / relative
                 if path_exists_no_follow(destination):
