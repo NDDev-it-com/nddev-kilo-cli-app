@@ -75,19 +75,25 @@ its `bin/kilo`, writes a target-owned wrapper, and records wrapper, native
 binary, and resource digests in the software manifest.
 
 `launch` requires a clean active setup and current target-owned CLI software,
-then holds a persistent target-internal `fcntl.flock` lock file while
-`/absolute/kilo-target/bin/kilo run` executes and through timeout cleanup. It
-keeps only the dedicated lock parent and verified immutable
-wrapper/native/resource artifact directories traversable but non-writable while
-the child runs. The managed target root, runtime HOME/TMPDIR/XDG directories,
+then takes an external fixed-system-temp product/UID bootstrap `fcntl.flock`
+keyed to the canonical target before taking the persistent target-internal
+lock. Both locks are held while `/absolute/kilo-target/bin/kilo run` executes
+and through timeout cleanup, with the internal lock released before the
+external lock. The external lock path is not exposed to the child; the exact
+shape is recorded in `config/nddev-contract.json`.
+
+During launch, the manager keeps only the dedicated target-internal lock parent
+and verified immutable wrapper/native/resource artifact directories traversable
+but non-writable. The managed target root, runtime HOME/TMPDIR/XDG directories,
 and Kilo config/session directory stay writable for the launched CLI. Runtime
 paths are still validated as real target-owned 0700 directories without symlink
 components, and wrapper plus native executable inode and digest are revalidated
 immediately before child start. This is a write-protected verified-path handoff
 under the no-sandbox same-UID boundary; it is not portable fd execution and does
-not claim resistance to deliberate same-UID chmod. Lifecycle mutations fail
-while launch is running. Only the `full-auto` profile receives the managed
-`--auto` flag.
+not claim resistance to deliberate same-UID chmod or deliberate same-UID
+tampering with the external bootstrap root. Lifecycle mutations fail while
+launch is running. Only the `full-auto` profile receives the managed `--auto`
+flag.
 
 ## Safety
 

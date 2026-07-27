@@ -168,6 +168,37 @@ LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 LOCK_FILE_NAME = "lock"
 LOCK_OWNER_NAME = "owner.json"
 LOCK_HELD_PARENT_MODE = 0o500
+BOOTSTRAP_LOCK_SCHEMA = 1
+BOOTSTRAP_LOCK_PREFIX = f"{PRODUCT_NAME}-bootstrap-locks"
+BOOTSTRAP_LOCK_MAX_BYTES = 16 * 1024
+FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES = (
+    "NDDEV_KILO_BOOTSTRAP_LOCK_ROOT",
+    "NDDEV_KILO_TEST_BOOTSTRAP_LOCK_ROOT",
+    "KILO_BOOTSTRAP_LOCK_ROOT",
+    "BOOTSTRAP_LOCK_ROOT_OVERRIDE",
+)
+BOOTSTRAP_LOCK_CONTRACT = {
+    "kind": "external-product-uid-flock",
+    "system_root": "fixed-real-sticky-system-temp",
+    "macos_system_root": "/private/tmp",
+    "ubuntu_system_root": "/tmp",
+    "product_root_mode": "0700",
+    "file_mode": "0600",
+    "filename": "sha256-product-namespace-and-canonical-target",
+    "target_binding": "json-product-canonical-target-and-sha256",
+    "binding_exact": True,
+    "binding_revalidated_before_yield": True,
+    "fd_path_inode_revalidated_before_yield": True,
+    "persistent_inode": True,
+    "unlink_on_release": False,
+    "acquire_order": "external-before-internal",
+    "release_order": "internal-before-external",
+    "child_env_exposed": False,
+    "same_uid_tampering_resistant_without_sandbox": False,
+}
+BOOTSTRAP_LOCK_BINDING_KEYS = frozenset(
+    {"schema_version", "product_name", "target", "target_sha256"}
+)
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
@@ -878,6 +909,223 @@ def backup_slot_directory(target: Path, slot: int) -> Path:
     fail(f"backup slot is missing: {slot}")
 
 
+def canonical_target_for_bootstrap_lock(raw: str | Path) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        fail("target must be an absolute path")
+    path = Path(os.path.normpath(os.fspath(path)))
+    if path.parent == path or not path.name:
+        fail("target must name a directory below a real parent")
+    reject_absolute_symlink_ancestors(path.parent)
+    try:
+        parent = path.parent.resolve(strict=True)
+    except FileNotFoundError:
+        fail("target parent must exist before acquiring the bootstrap lifecycle lock")
+    reject_absolute_symlink_ancestors(parent)
+    reject_unsafe_target_ancestors(parent / path.name)
+    return parent / path.name
+
+
+def reject_public_bootstrap_lock_overrides() -> None:
+    present = [name for name in FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES if name in os.environ]
+    if present:
+        fail(
+            "bootstrap lifecycle lock root is fixed and cannot be overridden by environment: "
+            + ", ".join(present)
+        )
+
+
+def bootstrap_lock_parent() -> Path:
+    reject_public_bootstrap_lock_overrides()
+    raw = Path("/tmp")
+    try:
+        info = raw.lstat()
+    except FileNotFoundError:
+        fail("bootstrap lifecycle lock parent is missing: /tmp")
+    if stat.S_ISLNK(info.st_mode):
+        allowed = ALLOWED_SYSTEM_SYMLINK_ANCESTORS.get(raw)
+        if allowed is None:
+            fail("bootstrap lifecycle lock parent must not be an unsupported symlink")
+        parent = allowed
+    else:
+        parent = raw
+    parent_info = require_directory(parent, "bootstrap lifecycle lock parent")
+    if group_or_world_writable(parent_info) and not is_sticky_directory(parent_info):
+        fail("bootstrap lifecycle lock parent must not be group/world-writable unless sticky")
+    return parent
+
+
+def bootstrap_lock_root() -> Path:
+    if not hasattr(os, "geteuid"):
+        fail("bootstrap lifecycle locks require current-user ownership checks")
+    return bootstrap_lock_parent() / f"{BOOTSTRAP_LOCK_PREFIX}-{os.geteuid()}"
+
+
+def target_binding_sha256(target: Path) -> str:
+    return sha256_bytes(f"{PRODUCT_NAME}\0{os.fspath(target)}".encode("utf-8"))
+
+
+def bootstrap_lock_file_path(target: Path) -> Path:
+    return bootstrap_lock_root() / f"{target_binding_sha256(target)}.lock"
+
+
+def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    current = lock_file.lstat()
+    if identity_of(opened) != identity_of(current):
+        raise ConcurrentTargetChange("bootstrap lifecycle lock file changed after it was opened")
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        fail("bootstrap lifecycle lock file must be a single-link regular file")
+    if not is_owner_only_file(opened):
+        fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+    return opened
+
+
+def ensure_bootstrap_lock_root() -> Path:
+    root = bootstrap_lock_root()
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        try:
+            root.mkdir(mode=OWNER_DIR_MODE)
+        except FileExistsError:
+            info = root.lstat()
+        else:
+            final = chmod_directory_no_follow(root, OWNER_DIR_MODE, "bootstrap lifecycle lock root")
+            if not is_owner_private_directory(final):
+                fail("bootstrap lifecycle lock root must be private to the current user")
+            return root
+    if stat.S_ISLNK(info.st_mode):
+        fail("bootstrap lifecycle lock root must not be a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("bootstrap lifecycle lock root must be a real directory")
+    if not is_owner_private_directory(info):
+        fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+    return root
+
+
+def open_bootstrap_lock_file(target: Path) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("bootstrap lifecycle lock file requires O_NOFOLLOW support")
+    root = ensure_bootstrap_lock_root()
+    lock_file = root / f"{target_binding_sha256(target)}.lock"
+    for _attempt in range(2):
+        try:
+            info = lock_file.lstat()
+        except FileNotFoundError:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
+            except FileExistsError:
+                continue
+            os.fchmod(descriptor, OWNER_FILE_MODE)
+            require_open_bootstrap_lock_identity(descriptor, lock_file)
+            return descriptor
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            fail("bootstrap lifecycle lock file must be a regular file")
+        if info.st_nlink != 1:
+            fail("bootstrap lifecycle lock file must not have hard-link aliases")
+        if not is_owner_only_file(info):
+            fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_file, flags)
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            os.close(descriptor)
+            raise ConcurrentTargetChange("bootstrap lifecycle lock file changed while it was opened")
+        require_open_bootstrap_lock_identity(descriptor, lock_file)
+        return descriptor
+    raise ConcurrentTargetChange("bootstrap lifecycle lock file changed during creation")
+
+
+def read_bootstrap_lock_record(descriptor: int) -> dict[str, Any] | None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    content = os.read(descriptor, BOOTSTRAP_LOCK_MAX_BYTES + 1)
+    if len(content) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap lifecycle lock file exceeds the bounded read limit")
+    if not content:
+        return None
+    return parse_json_object(content, "bootstrap lifecycle lock file")
+
+
+def write_bootstrap_lock_record(descriptor: int, target: Path) -> None:
+    content = canonical_json(
+        {
+            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "target": os.fspath(target),
+            "target_sha256": target_binding_sha256(target),
+        }
+    )
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            fail("bootstrap lifecycle lock file write made no forward progress")
+        offset += written
+    os.ftruncate(descriptor, len(content))
+    os.fsync(descriptor)
+
+
+def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path) -> None:
+    if record is None:
+        return
+    if set(record) != BOOTSTRAP_LOCK_BINDING_KEYS:
+        fail("bootstrap lifecycle lock file binding keys mismatch")
+    if record.get("schema_version") != BOOTSTRAP_LOCK_SCHEMA:
+        fail("bootstrap lifecycle lock file schema mismatch")
+    if record.get("product_name") != PRODUCT_NAME:
+        fail("bootstrap lifecycle lock file belongs to another product")
+    if (
+        record.get("target") != os.fspath(target)
+        or record.get("target_sha256") != target_binding_sha256(target)
+    ):
+        fail("bootstrap lifecycle lock file target binding mismatch")
+
+
+@contextlib.contextmanager
+def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
+    if fcntl is None:
+        fail("bootstrap lifecycle locks require fcntl.flock on this platform")
+    target = canonical_target_for_bootstrap_lock(raw_target)
+    descriptor = -1
+    acquired = False
+    try:
+        descriptor = open_bootstrap_lock_file(target)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            os.close(descriptor)
+            descriptor = -1
+            fail(f"target is locked: {bootstrap_lock_file_path(target)}")
+        acquired = True
+        require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+        record = read_bootstrap_lock_record(descriptor)
+        validate_bootstrap_lock_binding(record, target)
+        if record is None:
+            write_bootstrap_lock_record(descriptor, target)
+            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+            record = read_bootstrap_lock_record(descriptor)
+            validate_bootstrap_lock_binding(record, target)
+            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+        yield target
+    finally:
+        if descriptor >= 0:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def lock_path(target: Path) -> Path:
     return target / LOCK_RELATIVE
 
@@ -1034,6 +1282,14 @@ def cleanup_lock_artifacts_for_created_target(target: Path, transaction: Directo
         lock.rmdir()
 
 
+def restore_internal_lock_path_for_cleanup(target: Path) -> None:
+    lock = lock_path(target)
+    if not path_exists_no_follow(lock):
+        descriptor = ensure_lock_file(target)
+        os.close(descriptor)
+    chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+
+
 @contextlib.contextmanager
 def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[DirectoryTransaction]:
     if fcntl is None:
@@ -1085,7 +1341,7 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
     finally:
         try:
             if acquired and descriptor >= 0:
-                chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+                restore_internal_lock_path_for_cleanup(target)
                 write_lock_owner(target, held=False)
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError as exc:
@@ -1579,8 +1835,19 @@ def desired_for_remove(target: Path) -> dict[str, bytes | None]:
 def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
     require_active_setup_id(setup_id)
     require_profile_id(profile_id)
-    target = resolve_target(target, create=False)
     backup_slot: int | None = None
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _mutate_setup_locked(target, setup_id, profile_id, operation, backup_slot)
+
+
+def _mutate_setup_locked(
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    operation: str,
+    backup_slot: int | None,
+) -> dict[str, Any]:
     with target_lock(target, create_parent=(operation == "install")) as transaction:
         ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
         if operation == "install":
@@ -1629,8 +1896,15 @@ def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -
 
 
 def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
-    target = resolve_target(target, create=False)
-    backup_slot: int | None = None
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        backup_slot: int | None = None
+        return _migrate_setup_locked(target, profile_id, backup_slot)
+
+
+def _migrate_setup_locked(
+    target: Path, profile_id: str | None, backup_slot: int | None
+) -> dict[str, Any]:
     with target_lock(target):
         stamp = require_clean_installed(target)
         if stamp_is_active(stamp):
@@ -1658,7 +1932,12 @@ def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
 
 
 def restore_setup(target: Path, slot: int) -> dict[str, Any]:
-    target = resolve_target(target, create=False)
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _restore_setup_locked(target, slot)
+
+
+def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target):
         require_private_target_directory_for_software(target, allow_missing=False)
         setup_id, desired = desired_for_backup(target, slot)
@@ -1678,7 +1957,12 @@ def restore_setup(target: Path, slot: int) -> dict[str, Any]:
 
 
 def remove_setup(target: Path) -> dict[str, Any]:
-    target = resolve_target(target, create=False)
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _remove_setup_locked(target)
+
+
+def _remove_setup_locked(target: Path) -> dict[str, Any]:
     with target_lock(target):
         stamp = require_clean_installed(target)
         desired = desired_for_remove(target)
@@ -1697,49 +1981,51 @@ def remove_setup(target: Path) -> dict[str, Any]:
 
 
 def status_payload(target: Path) -> dict[str, Any]:
-    target = resolve_target(target, create=False)
-    software = software_status(target)
-    stamp = read_stamp(target)
-    if stamp is None:
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        software = software_status(target)
+        stamp = read_stamp(target)
+        if stamp is None:
+            return {
+                "installed": False,
+                "target": str(target),
+                "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
+                "software": software,
+            }
+        drift = drift_paths(target, stamp)
+        active = stamp_is_active(stamp)
+        legacy = stamp_is_legacy(stamp)
         return {
-            "installed": False,
+            "installed": True,
             "target": str(target),
-            "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
+            "setup_id": stamp_setup_id(stamp),
+            "permission_profile": stamp_profile_id(stamp),
+            "build_version": stamp["build_version"],
+            "drift": drift,
+            "legacy": legacy,
+            "launchable": active and not drift,
+            "builder": stamp.get("builder", {"enabled": False, "projection": BUILDER_PROJECTION}),
+            "backup_pool": str(backup_pool(target)),
             "software": software,
         }
-    drift = drift_paths(target, stamp)
-    active = stamp_is_active(stamp)
-    legacy = stamp_is_legacy(stamp)
-    return {
-        "installed": True,
-        "target": str(target),
-        "setup_id": stamp_setup_id(stamp),
-        "permission_profile": stamp_profile_id(stamp),
-        "build_version": stamp["build_version"],
-        "drift": drift,
-        "legacy": legacy,
-        "launchable": active and not drift,
-        "builder": stamp.get("builder", {"enabled": False, "projection": BUILDER_PROJECTION}),
-        "backup_pool": str(backup_pool(target)),
-        "software": software,
-    }
 
 
 def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     load_setup(setup_id)
     load_profile(profile_id)
-    target = resolve_target(target, create=False)
-    stamp = read_stamp(target) if target.exists() else None
-    operation = "install" if stamp is None else "switch"
-    return {
-        "operation": operation,
-        "setup_id": setup_id,
-        "permission_profile": profile_id,
-        "target": str(target),
-        "mutates": False,
-        "managed_files": list(MANAGED_FILES),
-        "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
-    }
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        stamp = read_stamp(target) if target.exists() else None
+        operation = "install" if stamp is None else "switch"
+        return {
+            "operation": operation,
+            "setup_id": setup_id,
+            "permission_profile": profile_id,
+            "target": str(target),
+            "mutates": False,
+            "managed_files": list(MANAGED_FILES),
+            "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+        }
 
 
 def list_payload() -> dict[str, Any]:
@@ -1943,10 +2229,16 @@ def launch_environment(target: Path) -> dict[str, str]:
 @dataclass
 class LaunchDirectoryProtection:
     modes: list[tuple[Path, int]]
+    optional_missing: set[Path]
 
     def restore(self) -> None:
         for path, mode in reversed(self.modes):
-            chmod_directory_no_follow(path, mode, "launch-protected directory")
+            try:
+                chmod_directory_no_follow(path, mode, "launch-protected directory")
+            except ManagerError:
+                if path in self.optional_missing and not path_exists_no_follow(path):
+                    continue
+                raise
 
 
 def append_directory_chain(target: Path, relative: Path, directories: list[Path]) -> None:
@@ -2003,9 +2295,9 @@ def protect_launch_handoff_paths(
                     LOCK_HELD_PARENT_MODE,
                     "launch handoff directory",
                 )
-        return LaunchDirectoryProtection(protected)
+        return LaunchDirectoryProtection(protected, {lock_path(target)})
     except BaseException:
-        LaunchDirectoryProtection(protected).restore()
+        LaunchDirectoryProtection(protected, {lock_path(target)}).restore()
         raise
 
 
@@ -3285,6 +3577,12 @@ def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
 
 
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _install_or_update_cli_locked(target, command)
+
+
+def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
     target_existed_before = path_exists_no_follow(target)
     preflight = software_status(target)
     if command == "install-cli":
@@ -3368,6 +3666,12 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
 
 
 def remove_cli(target: Path) -> dict[str, Any]:
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _remove_cli_locked(target)
+
+
+def _remove_cli_locked(target: Path) -> dict[str, Any]:
     status = software_status(target)
     if status["software_state"] == "absent":
         return {
@@ -3532,9 +3836,14 @@ def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str
 
 
 def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return _launch_locked(target, child_args, timeout_seconds=timeout_seconds)
+
+
+def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
     if timeout_seconds <= 0:
         fail("launch timeout must be positive")
-    target = resolve_target(target, create=False)
     forwarded = normalize_launch_child_args(child_args)
     with target_lock(target):
         stamp = require_active_clean_installed(target)
@@ -3688,20 +3997,15 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_setup(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "software-status":
-        print_payload(
-            software_status(resolve_target(Path(args.target), create=False)), as_json=args.json
-        )
+        with bootstrap_lifecycle_lock(Path(args.target)) as locked_target:
+            target = resolve_target(locked_target, create=False)
+            print_payload(software_status(target), as_json=args.json)
         return 0
     if args.command in {"install-cli", "update-cli"}:
-        print_payload(
-            install_or_update_cli(resolve_target(Path(args.target), create=False), args.command),
-            as_json=args.json,
-        )
+        print_payload(install_or_update_cli(Path(args.target), args.command), as_json=args.json)
         return 0
     if args.command == "remove-cli":
-        print_payload(
-            remove_cli(resolve_target(Path(args.target), create=False)), as_json=args.json
-        )
+        print_payload(remove_cli(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "launch":
         return launch(Path(args.target), args.child_args, timeout_seconds=args.timeout_seconds)

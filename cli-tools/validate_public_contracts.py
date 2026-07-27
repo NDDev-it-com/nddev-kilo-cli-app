@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import contextlib
 import json
+import multiprocessing
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -33,6 +35,9 @@ SETUPS = nddev_kilo_cli.ACTIVE_SETUP_IDS
 PROFILES = nddev_kilo_cli.PROFILE_IDS
 LEGACY_SETUPS = nddev_kilo_cli.LEGACY_SETUP_IDS
 MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
+REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
+EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
+FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 CONTRACT_KEYS = {
     "contract_version",
     "product_name",
@@ -109,6 +114,8 @@ def validate_versions() -> None:
     runtime = manifest.get("runtime", {})
     if runtime.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("manifest launch lifecycle lock contract mismatch")
+    if runtime.get("bootstrap_lock") != EXPECTED_BOOTSTRAP_LOCK:
+        fail("manifest bootstrap lifecycle lock contract mismatch")
     if runtime.get("lock_file") != str(
         nddev_kilo_cli.lock_file_path(Path("/target")).relative_to("/target")
     ):
@@ -175,6 +182,8 @@ def validate_contract() -> None:
         fail("runtime launch --auto must be limited to full-auto profile")
     if runtime_launch.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("runtime launch must hold the target lifecycle lock through child completion")
+    if runtime_launch.get("bootstrap_lock") != EXPECTED_BOOTSTRAP_LOCK:
+        fail("runtime launch bootstrap lifecycle lock contract mismatch")
     if runtime_launch.get("lock_file") != str(
         nddev_kilo_cli.lock_file_path(Path("/target")).relative_to("/target")
     ):
@@ -530,6 +539,17 @@ def validate_launch_guard() -> None:
         except nddev_kilo_cli.ManagerError:
             continue
         fail(f"launch guard accepted managed child argv: {case}")
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-env-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        env = nddev_kilo_cli.launch_environment(target)
+        for name in FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES:
+            if name in env:
+                fail(f"launch environment exposed bootstrap lock override name: {name}")
+        if any(nddev_kilo_cli.BOOTSTRAP_LOCK_PREFIX in value for value in env.values()):
+            fail("launch environment exposed the bootstrap lifecycle lock root")
 
 
 def wait_until(label: str, predicate: Any, *, seconds: float = 5.0) -> None:
@@ -801,6 +821,107 @@ def validate_child_cannot_unlink_persistent_lock() -> None:
             )
         if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
             fail("persistent lock parent mode was not restored after child exit")
+
+
+def validate_external_lock_blocks_internal_lock_parent_rename() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-dual-lock-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        started = target / "child-started"
+        renamed = target / ".nddev-kilo-cli.lock.renamed"
+        rename_result = target / "child-rename-result"
+        stop = target / "child-stop"
+        executable, _native, installation = fake_launch_installation(
+            target,
+            (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                f'printf started > "{started}"\n'
+                f'if /bin/mv "{nddev_kilo_cli.lock_path(target)}" "{renamed}" 2>/dev/null; then\n'
+                f'  printf renamed > "{rename_result}"\n'
+                "else\n"
+                f'  printf denied > "{rename_result}"\n'
+                "fi\n"
+                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
+            ).encode("utf-8"),
+        )
+        del executable
+        original_require_current_software = nddev_kilo_cli.require_current_software
+        launch_result: dict[str, Any] = {}
+
+        def run_launch() -> None:
+            try:
+                launch_result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
+            except BaseException as exc:
+                launch_result["error"] = exc
+
+        nddev_kilo_cli.require_current_software = fake_current_software(target, installation)
+        thread = threading.Thread(target=run_launch)
+        thread.start()
+        try:
+            wait_until(
+                "child internal lock parent rename attempt",
+                lambda: rename_result.exists() or bool(launch_result.get("error")),
+            )
+            if "error" in launch_result:
+                raise launch_result["error"]
+            if rename_result.read_text(encoding="utf-8") != "renamed":
+                fail("internal lock parent rename regression did not exercise the rename path")
+            for label, mutation in (
+                (
+                    "switch",
+                    lambda: nddev_kilo_cli.mutate_setup(
+                        target,
+                        nddev_kilo_cli.DEFAULT_SETUP_ID,
+                        "safe",
+                        "switch",
+                    ),
+                ),
+                ("remove", lambda: nddev_kilo_cli.remove_setup(target)),
+                (
+                    "install",
+                    lambda: nddev_kilo_cli.mutate_setup(
+                        target,
+                        nddev_kilo_cli.DEFAULT_SETUP_ID,
+                        nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                        "install",
+                    ),
+                ),
+            ):
+                try:
+                    mutation()
+                except nddev_kilo_cli.ManagerError as exc:
+                    if "target is locked" not in str(exc):
+                        fail(f"{label} after internal lock rename failed for the wrong reason: {exc}")
+                else:
+                    fail(f"{label} was accepted after child renamed the internal lock parent")
+            stop.write_bytes(b"stop\n")
+            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            thread.join(timeout=5)
+        finally:
+            nddev_kilo_cli.require_current_software = original_require_current_software
+            if thread.is_alive():
+                stop.write_bytes(b"stop\n")
+                thread.join(timeout=10)
+            if renamed.exists() and not renamed.is_symlink():
+                with contextlib.suppress(OSError):
+                    renamed.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        if thread.is_alive():
+            fail("launch child thread did not finish after internal lock rename regression")
+        if "error" in launch_result:
+            raise launch_result["error"]
+        if launch_result.get("code") != 0:
+            fail(
+                "internal lock rename child returned unexpected code: "
+                f"{launch_result.get('code')}"
+            )
+        if not nddev_kilo_cli.lock_path(target).is_dir():
+            fail("canonical internal lock parent was not restored after child rename")
+        if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
+            fail("canonical internal lock parent mode was not restored after child rename")
 
 
 def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
@@ -1271,6 +1392,374 @@ def expect_manager_error(label: str, fn: Any) -> None:
     fail(f"{label} was accepted")
 
 
+@contextlib.contextmanager
+def patched_bootstrap_lock_parent(parent: Path) -> Any:
+    original = nddev_kilo_cli.bootstrap_lock_parent
+    nddev_kilo_cli.bootstrap_lock_parent = lambda: parent
+    try:
+        yield
+    finally:
+        nddev_kilo_cli.bootstrap_lock_parent = original
+
+
+def bootstrap_product_root(parent: Path) -> Path:
+    return parent / f"{nddev_kilo_cli.BOOTSTRAP_LOCK_PREFIX}-{os.geteuid()}"
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def real_bootstrap_root_path() -> Path:
+    return bootstrap_product_root(REAL_BOOTSTRAP_LOCK_PARENT())
+
+
+def snapshot_bootstrap_root_shallow(
+    root: Path,
+) -> list[dict[str, Any]]:
+    def record_for(path: Path, relative: str, info: os.stat_result) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "relative": relative,
+            "kind": "other",
+            "mode": stat.S_IMODE(info.st_mode),
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "uid": getattr(info, "st_uid", None),
+            "gid": getattr(info, "st_gid", None),
+            "nlink": info.st_nlink,
+            "size": info.st_size,
+        }
+        if stat.S_ISLNK(info.st_mode):
+            record["kind"] = "symlink"
+            record["link_target"] = os.readlink(path)
+        elif stat.S_ISDIR(info.st_mode):
+            record["kind"] = "directory"
+        elif stat.S_ISREG(info.st_mode):
+            record["kind"] = "file"
+            if info.st_size <= nddev_kilo_cli.BOOTSTRAP_LOCK_MAX_BYTES:
+                record["sha256"] = nddev_kilo_cli.sha256_bytes(path.read_bytes())
+            else:
+                record["sha256"] = None
+        return record
+
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return [{"relative": ".", "kind": "absent"}]
+    if not stat.S_ISDIR(info.st_mode):
+        return [record_for(root, ".", info)]
+    records = [record_for(root, ".", info)]
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(entries) > 256:
+        fail("real bootstrap lock root contains too many entries for bounded validation")
+    for path in entries:
+        records.append(record_for(path, path.name, path.lstat()))
+    return records
+
+
+def snapshot_real_bootstrap_state() -> list[dict[str, Any]]:
+    return snapshot_bootstrap_root_shallow(real_bootstrap_root_path())
+
+
+def validate_real_bootstrap_state_unchanged(
+    before: list[dict[str, Any]],
+) -> None:
+    after = snapshot_real_bootstrap_state()
+    if after != before:
+        fail("public validation changed the real fixed bootstrap lock root")
+
+
+def validate_public_bootstrap_override_denial() -> None:
+    original = {name: os.environ.get(name) for name in FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES}
+    try:
+        for name in FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES:
+            for other in FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES:
+                os.environ.pop(other, None)
+            os.environ[name] = "/tmp/forbidden-nddev-kilo-bootstrap-override"
+            expect_manager_error(
+                f"bootstrap lock override environment {name}",
+                lambda: REAL_BOOTSTRAP_LOCK_PARENT(),
+            )
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def validate_bootstrap_injection_is_active(parent: Path) -> None:
+    root = nddev_kilo_cli.bootstrap_lock_root()
+    if not is_relative_to(root, parent):
+        fail("public validator bootstrap lock injection is not active")
+    if root == real_bootstrap_root_path():
+        fail("public validator bootstrap lock injection resolved to the real product root")
+
+
+def validate_bootstrap_lock_precreation_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        outside = workspace / "outside"
+        outside.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        marker = outside / "marker"
+        marker.write_bytes(b"preserve\n")
+        marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+        def acquire_bootstrap() -> None:
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            os.symlink(outside, root)
+            expect_manager_error("symlink bootstrap lock root", acquire_bootstrap)
+            if marker.read_bytes() != b"preserve\n":
+                fail("external marker changed through precreated bootstrap root")
+            root.unlink()
+
+            root.mkdir(mode=0o777)
+            root.chmod(0o777)
+            expect_manager_error("world-writable bootstrap lock root", acquire_bootstrap)
+            root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            shutil.rmtree(root)
+
+            root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            os.symlink(marker, nddev_kilo_cli.bootstrap_lock_file_path(target))
+            expect_manager_error("symlink bootstrap lock file", acquire_bootstrap)
+            if marker.read_bytes() != b"preserve\n":
+                fail("external marker changed through precreated bootstrap lock file")
+            nddev_kilo_cli.bootstrap_lock_file_path(target).unlink()
+
+            lock_file = nddev_kilo_cli.bootstrap_lock_file_path(target)
+            lock_file.write_bytes(b"unsafe\n")
+            lock_file.chmod(0o644)
+            expect_manager_error("world-readable bootstrap lock file", acquire_bootstrap)
+            lock_file.unlink()
+
+            lock_file.write_bytes(b"{not-json\n")
+            lock_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            expect_manager_error("malformed bootstrap lock binding", acquire_bootstrap)
+            lock_file.unlink()
+
+            lock_file.write_bytes(b"[]\n")
+            lock_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            expect_manager_error("non-object bootstrap lock binding", acquire_bootstrap)
+            lock_file.unlink()
+
+            write_public_json(
+                lock_file,
+                {
+                    "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA,
+                    "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                    "target": str(target),
+                    "target_sha256": nddev_kilo_cli.target_binding_sha256(target),
+                    "extra": True,
+                },
+            )
+            expect_manager_error("extra-key bootstrap lock binding", acquire_bootstrap)
+            lock_file.unlink()
+
+            write_public_json(
+                lock_file,
+                {
+                    "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA,
+                    "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                    "target": str(
+                        nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+                    ),
+                    "target_sha256": nddev_kilo_cli.target_binding_sha256(
+                        nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+                    ),
+                },
+            )
+            expect_manager_error("mismatched bootstrap lock binding", acquire_bootstrap)
+            lock_file.unlink()
+
+            write_public_json(
+                lock_file,
+                {
+                    "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA + 1,
+                    "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                    "target": str(target),
+                    "target_sha256": nddev_kilo_cli.target_binding_sha256(target),
+                },
+            )
+            expect_manager_error("unknown bootstrap lock schema", acquire_bootstrap)
+            lock_file.unlink()
+
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target) as locked_target:
+                if locked_target != target:
+                    fail("bootstrap lock returned the wrong canonical target")
+            lock_info = lock_file.lstat()
+            if private_directory_mode(root) != nddev_kilo_cli.OWNER_DIR_MODE:
+                fail("bootstrap lock root mode is not 0700 after successful acquire")
+            if stat.S_IMODE(lock_info.st_mode) != nddev_kilo_cli.OWNER_FILE_MODE:
+                fail("bootstrap lock file mode is not 0600 after successful acquire")
+            if lock_info.st_nlink != 1:
+                fail("bootstrap lock file has unexpected hard-link aliases")
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            if lock_file.lstat().st_ino != lock_info.st_ino:
+                fail("bootstrap lock file inode changed across normal release/reacquire")
+            record = load_json(lock_file)
+            expected = {
+                "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA,
+                "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                "target": str(target),
+                "target_sha256": nddev_kilo_cli.target_binding_sha256(target),
+            }
+            if record != expected:
+                fail("bootstrap lock binding is not the canonical expected object")
+
+
+def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        observed, status = os.waitpid(pid, os.WNOHANG)
+        if observed == 0:
+            time.sleep(0.02)
+            continue
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            return
+        fail(f"{label} exited unsuccessfully: status {status}")
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+    fail(f"{label} did not exit before timeout")
+
+
+def terminate_process(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with contextlib.suppress(ChildProcessError):
+            observed, _status = os.waitpid(pid, os.WNOHANG)
+            if observed != 0:
+                return
+        time.sleep(0.02)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+
+
+def fork_validation_child(label: str, error_dir: Path, fn: Any) -> int:
+    if not hasattr(os, "fork"):
+        fail("bootstrap lock handover regression requires POSIX fork")
+    pid = os.fork()
+    if pid == 0:
+        try:
+            fn()
+        except BaseException as exc:
+            with contextlib.suppress(Exception):
+                (error_dir / f"{label}.error").write_text(
+                    f"{type(exc).__name__}: {exc}\n",
+                    encoding="utf-8",
+                )
+            os._exit(1)
+        os._exit(0)
+    return pid
+
+
+def validate_bootstrap_lock_persistent_inode_handover() -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        fail("bootstrap lock handover regression requires fork-capable multiprocessing")
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-handover-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+            pass
+        lock_file = nddev_kilo_cli.bootstrap_lock_file_path(target)
+        original_inode = lock_file.lstat().st_ino
+        a_ready = workspace / "a-ready"
+        a_release = workspace / "a-release"
+        b_holding = workspace / "b-holding"
+        b_release = workspace / "b-release"
+        c_denied = workspace / "c-denied"
+
+        def process_a() -> None:
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                if lock_file.lstat().st_ino != original_inode:
+                    raise RuntimeError("process A observed a replaced bootstrap lock inode")
+                a_ready.write_text("ready\n", encoding="utf-8")
+                while not a_release.exists():
+                    time.sleep(0.02)
+
+        def process_b() -> None:
+            while not a_ready.exists():
+                time.sleep(0.02)
+            while True:
+                try:
+                    with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                        if lock_file.lstat().st_ino != original_inode:
+                            raise RuntimeError("process B observed a replaced bootstrap lock inode")
+                        b_holding.write_text("holding\n", encoding="utf-8")
+                        while not b_release.exists():
+                            time.sleep(0.02)
+                        return
+                except nddev_kilo_cli.ManagerError as exc:
+                    if "target is locked" not in str(exc):
+                        raise
+                    time.sleep(0.02)
+
+        def process_c() -> None:
+            try:
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                    raise RuntimeError("process C acquired the lock while process B held it")
+            except nddev_kilo_cli.ManagerError as exc:
+                if "target is locked" not in str(exc):
+                    raise
+                c_denied.write_text("denied\n", encoding="utf-8")
+
+        pids: list[tuple[int, str]] = []
+        try:
+            pid_a = fork_validation_child("a", workspace, process_a)
+            pids.append((pid_a, "process A"))
+            wait_until("process A bootstrap lock", a_ready.exists)
+            pid_b = fork_validation_child("b", workspace, process_b)
+            pids.append((pid_b, "process B"))
+            time.sleep(0.1)
+            if b_holding.exists():
+                fail("process B acquired the bootstrap lock before process A released it")
+            a_release.write_text("release\n", encoding="utf-8")
+            wait_until("process B bootstrap lock", b_holding.exists)
+            wait_for_process(pid_a, "process A")
+            pids = [(pid, label) for pid, label in pids if pid != pid_a]
+            pid_c = fork_validation_child("c", workspace, process_c)
+            pids.append((pid_c, "process C"))
+            wait_for_process(pid_c, "process C")
+            pids = [(pid, label) for pid, label in pids if pid != pid_c]
+            if c_denied.read_text(encoding="utf-8") != "denied\n":
+                fail("process C did not record bootstrap lock denial")
+            b_release.write_text("release\n", encoding="utf-8")
+            wait_for_process(pid_b, "process B")
+            pids = [(pid, label) for pid, label in pids if pid != pid_b]
+        finally:
+            for pid, label in pids:
+                del label
+                terminate_process(pid)
+        if lock_file.lstat().st_ino != original_inode:
+            fail("bootstrap lock file inode changed after 3-process handover")
+        record = load_json(lock_file)
+        if record.get("target") != str(target):
+            fail("bootstrap lock persistent binding target mismatch after handover")
+
+
 def validate_package_lock_regressions() -> None:
     supported, _unsupported = nddev_kilo_cli.native_package_matrix()
     package = next(iter(supported))
@@ -1684,8 +2173,32 @@ def validate_fake_path_is_ignored() -> None:
                 os.environ["PATH"] = original_path
 
 
-def main() -> int:
-    try:
+def validate_no_public_bootstrap_override_references() -> None:
+    scanned_roots = (
+        ROOT / ".github",
+        ROOT / "build",
+        ROOT / "config",
+        ROOT / "docs",
+        ROOT / "setups",
+        ROOT / "README.md",
+    )
+    for root in scanned_roots:
+        paths = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        for path in paths:
+            if path.stat().st_size > nddev_kilo_cli.METADATA_MAX_BYTES:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for name in FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES:
+                if name in text:
+                    fail(f"public artifact documents unsupported bootstrap override: {path}")
+
+
+def run_all_validations(injected_bootstrap_parent: Path) -> None:
+    with patched_bootstrap_lock_parent(injected_bootstrap_parent):
+        validate_bootstrap_injection_is_active(injected_bootstrap_parent)
         validate_versions()
         validate_contract()
         validate_baseline()
@@ -1694,8 +2207,11 @@ def main() -> int:
         validate_workflows()
         validate_manager_parse_args()
         validate_launch_guard()
+        validate_bootstrap_lock_precreation_guards()
+        validate_bootstrap_lock_persistent_inode_handover()
         validate_launch_lock_scope_and_executable_revalidation()
         validate_child_cannot_unlink_persistent_lock()
+        validate_external_lock_blocks_internal_lock_parent_rename()
         validate_launch_handoff_denies_ordinary_replace_unlink()
         validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
@@ -1708,7 +2224,23 @@ def main() -> int:
         validate_lock_and_backup_precreation_guards()
         validate_sticky_tmp_target()
         validate_fake_path_is_ignored()
+        validate_no_public_bootstrap_override_references()
+
+
+def main() -> int:
+    real_bootstrap_before: list[dict[str, Any]] | None = None
+    try:
+        validate_public_bootstrap_override_denial()
+        real_bootstrap_before = snapshot_real_bootstrap_state()
+        with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-root-") as raw:
+            injected = Path(raw)
+            injected.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            run_all_validations(injected)
+        validate_real_bootstrap_state_unchanged(real_bootstrap_before)
     except ValidationError as exc:
+        if real_bootstrap_before is not None:
+            with contextlib.suppress(ValidationError):
+                validate_real_bootstrap_state_unchanged(real_bootstrap_before)
         print(f"public contract validation failed: {exc}", file=sys.stderr)
         return 1
     print("public contract validation passed")

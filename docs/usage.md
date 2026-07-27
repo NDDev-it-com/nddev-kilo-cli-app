@@ -35,18 +35,24 @@ The child process receives isolated runtime paths and
 `KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`. The manager
 requires target-owned `bin/kilo`, validates each runtime HOME/TMPDIR/XDG
 directory as a real target-owned 0700 directory without symlink components,
-holds a persistent target-internal `fcntl.flock` lock file until the child exits
-or timeout cleanup finishes, and keeps only the dedicated lock parent plus
-verified immutable wrapper/native/resource artifact directories traversable but
-non-writable while the child runs. The managed target root, runtime
-HOME/TMPDIR/XDG directories, and Kilo config/session directory stay writable for
-runtime state. It revalidates wrapper and native executable inode and digest
-immediately before child start, forwards the child exit code, and returns `124`
-if the bounded launch timeout expires. This is a write-protected verified-path
-handoff under the no-sandbox same-UID boundary, not portable fd execution, and
-it does not claim resistance to deliberate same-UID chmod. Lifecycle mutations
-fail while launch is running. The default `full-auto` profile uses
-`kilo run --auto`; `safe` uses `kilo run` without `--auto`.
+holds an external fixed-system-temp product/UID bootstrap `fcntl.flock` first,
+then holds the persistent target-internal lock until the child exits or timeout
+cleanup finishes. The external lock is keyed to the canonical target, remains
+outside the child runtime subtree, is not exposed in the child environment, and
+is specified in `config/nddev-contract.json`.
+
+While the child runs, the manager keeps only the dedicated target-internal lock
+parent plus verified immutable wrapper/native/resource artifact directories
+traversable but non-writable. The managed target root, runtime HOME/TMPDIR/XDG
+directories, and Kilo config/session directory stay writable for runtime state.
+It revalidates wrapper and native executable inode and digest immediately before
+child start, forwards the child exit code, and returns `124` if the bounded
+launch timeout expires. This is a write-protected verified-path handoff under
+the no-sandbox same-UID boundary, not portable fd execution, and it does not
+claim resistance to deliberate same-UID chmod or deliberate same-UID tampering
+with the external bootstrap root. Lifecycle mutations fail while launch is
+running. The default `full-auto` profile uses `kilo run --auto`; `safe` uses
+`kilo run` without `--auto`.
 
 User child arguments that try to override managed config, home, permission,
 auto, sandbox, working scope, agent, model, session, attached files, remote
