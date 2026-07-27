@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,12 @@ PROCESS_TIMEOUT_SECONDS = 180
 SOFTWARE_TREE_MAX_BYTES = 1024 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 120000
 SOFTWARE_GLOBAL_DIR_RELATIVE = Path("install") / "global"
+KILO_PACKAGE_BIN_RELATIVE = (
+    SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
+)
+KILO_NATIVE_BIN_RELATIVE = (
+    SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / ".kilo"
+)
 SOFTWARE_MANIFEST_RELATIVE = Path("software") / "kilo-cli.json"
 SOFTWARE_REPLACE_PATHS = (
     Path("bin") / KILO_COMMAND,
@@ -1124,6 +1131,22 @@ def install_stage_environment(stage_root: Path, live_stage: Path) -> dict[str, s
     return env
 
 
+def native_wrapper_bytes() -> bytes:
+    return (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'case "$0" in\n'
+        "  */*) self_dir=${0%/*} ;;\n"
+        "  *) self_dir=. ;;\n"
+        "esac\n"
+        'package_bin_dir="$self_dir/../install/global/node_modules/@kilocode/cli/bin"\n'
+        'if [ -f "$package_bin_dir/tree-sitter/tree-sitter.wasm" ]; then\n'
+        '  export KILO_TREE_SITTER_WASM_DIR="$package_bin_dir/tree-sitter"\n'
+        "fi\n"
+        'exec "$package_bin_dir/.kilo" "$@"\n'
+    ).encode("utf-8")
+
+
 def target_runtime_paths(target: Path) -> dict[str, Path]:
     return {
         "HOME": target / "home",
@@ -1192,6 +1215,46 @@ def chmod_private_tree(root: Path) -> None:
                 path.chmod(0o700)
             else:
                 path.chmod(OWNER_FILE_MODE)
+
+
+def materialize_hardlinked_regular_files(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts)):
+        if path.is_symlink():
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink == 1:
+            continue
+        if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+            fail(f"staged software file must be owned by the current user: {path}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode not in {OWNER_FILE_MODE, 0o700}:
+            fail(f"staged software file must be private before materializing hardlink: {path}")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        temporary = path.with_name(f".{path.name}.nddev-copy.{os.getpid()}.{time.time_ns()}")
+        try:
+            opened = os.fstat(descriptor)
+            if identity_of(opened) != identity_of(info):
+                raise ConcurrentTargetChange(f"staged software file changed while opened: {path}")
+            with os.fdopen(descriptor, "rb") as source, temporary.open("xb") as target_file:
+                shutil.copyfileobj(source, target_file, length=1024 * 1024)
+            descriptor = -1
+            temporary.chmod(mode)
+            os.replace(temporary, path)
+            require_regular_file(path, f"materialized staged software file {path}")
+            if path.lstat().st_nlink != 1:
+                fail(f"staged software hardlink materialization failed: {path}")
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def resolve_target_owned_symlink(path: Path, root: Path, label: str) -> Path:
@@ -1385,7 +1448,14 @@ def package_metadata(root: Path) -> dict[str, Any]:
     if metadata.get("version") != KILO_CURRENT_VERSION:
         fail("Kilo CLI package version is invalid")
     bins = metadata.get("bin")
-    if bins != {"kilo": "bin/kilo", "kilocode": "bin/kilo"}:
+    if isinstance(bins, dict):
+        normalized_bins = {
+            key: value[2:] if isinstance(value, str) and value.startswith("./") else value
+            for key, value in bins.items()
+        }
+    else:
+        normalized_bins = bins
+    if normalized_bins != {"kilo": "bin/kilo", "kilocode": "bin/kilo"}:
         fail("Kilo CLI package bin map is invalid")
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
@@ -1479,6 +1549,9 @@ def software_manifest_identity() -> dict[str, Any]:
         "package_shasum": KILO_PACKAGE_SHASUM,
         "bun_argv": list(BUN_INSTALL_ARGV),
         "executable": f"bin/{KILO_COMMAND}",
+        "entrypoint_kind": "target-owned-native-wrapper",
+        "package_bin": str(KILO_PACKAGE_BIN_RELATIVE),
+        "native_executable": str(KILO_NATIVE_BIN_RELATIVE),
         "install_root": str(SOFTWARE_GLOBAL_DIR_RELATIVE),
     }
 
@@ -1780,16 +1853,22 @@ def observed_kilo_version(executable: Path, target: Path) -> str:
     return KILO_CURRENT_VERSION
 
 
-def normalize_stage_entrypoint(live_stage: Path) -> None:
+def materialize_stage_entrypoint(live_stage: Path) -> None:
     entrypoint = live_stage / "bin" / KILO_COMMAND
+    package_bin = live_stage / KILO_PACKAGE_BIN_RELATIVE
+    native_bin = live_stage / KILO_NATIVE_BIN_RELATIVE
+    require_safe_executable(package_bin, live_stage, "staged Kilo CLI package bin")
+    require_safe_executable(native_bin, live_stage, "staged Kilo CLI native executable")
     info = entrypoint.lstat()
     if not stat.S_ISLNK(info.st_mode):
-        require_safe_executable(entrypoint, live_stage, "staged Kilo CLI executable")
-        return
+        fail("staged Kilo CLI executable must be the Bun global symlink")
     resolved = resolve_target_owned_symlink(entrypoint, live_stage, "staged Kilo CLI executable")
-    relative_target = os.path.relpath(resolved, entrypoint.parent)
+    if resolved != package_bin:
+        fail("staged Kilo CLI executable does not point at the official package bin")
     entrypoint.unlink()
-    entrypoint.symlink_to(relative_target)
+    entrypoint.write_bytes(native_wrapper_bytes())
+    entrypoint.chmod(0o700)
+    require_safe_executable(entrypoint, live_stage, "staged Kilo CLI executable")
 
 
 def run_bun_install(stage_root: Path, live_stage: Path) -> None:
@@ -1804,7 +1883,8 @@ def run_bun_install(stage_root: Path, live_stage: Path) -> None:
     if completed.returncode != 0:
         fail(f"bun install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}")
     chmod_private_tree(live_stage)
-    normalize_stage_entrypoint(live_stage)
+    materialize_hardlinked_regular_files(live_stage)
+    materialize_stage_entrypoint(live_stage)
     observed = observed_kilo_version(live_stage / "bin" / KILO_COMMAND, live_stage)
     if observed != KILO_CURRENT_VERSION:
         fail(f"Bun produced Kilo CLI {observed}, expected {KILO_CURRENT_VERSION}")
