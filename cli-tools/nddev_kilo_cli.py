@@ -21,6 +21,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,11 +30,13 @@ from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "setups"
+PROFILE_ROOT = ROOT / "profiles"
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-kilo-cli-app"
 STAMP_NAME = "NDDEV-KILO-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-KILO-CLI-BACKUP.json"
-STAMP_SCHEMA = 1
+STAMP_SCHEMA = 2
+LEGACY_STAMP_SCHEMA = 1
 BACKUP_SCHEMA = 1
 MAX_BACKUPS = 10
 OWNER_FILE_MODE = 0o600
@@ -40,10 +44,56 @@ OWNER_DIR_MODE = 0o700
 MANAGED_PAYLOAD_MAX_BYTES = 1024 * 1024
 METADATA_MAX_BYTES = 256 * 1024
 SOURCE_CONFIG = "config.json"
+SOURCE_PROFILE_CONFIG = "config.json"
+ACTIVE_SETUP_IDS = ("nddev-builder",)
+DEFAULT_SETUP_ID = "nddev-builder"
+PROFILE_IDS = ("full-auto", "safe")
+DEFAULT_PROFILE_ID = "full-auto"
+LEGACY_SETUP_IDS = ("safe", "balanced", "full-auto")
 CONFIG = "xdg-config/kilo/kilo.jsonc"
+AGENTS_FILE = "AGENTS.md"
 BUILDER_INSTRUCTIONS = "instructions/nddev-builder.md"
 BUILDER_SKILL = "skills/nddev-builder/SKILL.md"
-BUILDER_FILES = (BUILDER_INSTRUCTIONS, BUILDER_SKILL)
+BUILDER_SKILL_REFERENCES = (
+    "skills/nddev-builder/references/config.md",
+    "skills/nddev-builder/references/permissions-sandbox.md",
+    "skills/nddev-builder/references/agents-subagents.md",
+    "skills/nddev-builder/references/skills.md",
+    "skills/nddev-builder/references/commands.md",
+    "skills/nddev-builder/references/plugins-hooks.md",
+    "skills/nddev-builder/references/mcp-boundary.md",
+    "skills/nddev-builder/references/auth-boundary.md",
+    "skills/nddev-builder/references/memory-context.md",
+    "skills/nddev-builder/references/install-runtime.md",
+    "skills/nddev-builder/references/migration-validation.md",
+)
+ADDITIONAL_SKILLS = (
+    "skills/nddev-kilo-config/SKILL.md",
+    "skills/nddev-kilo-permissions/SKILL.md",
+    "skills/nddev-kilo-agents/SKILL.md",
+    "skills/nddev-kilo-plugins/SKILL.md",
+    "skills/nddev-kilo-runtime/SKILL.md",
+)
+AGENT_FILES = (
+    "xdg-config/kilo/agent/nddev-builder.md",
+    "xdg-config/kilo/agent/nddev-reviewer.md",
+)
+COMMAND_FILES = (
+    "xdg-config/kilo/command/nddev-builder.md",
+    "xdg-config/kilo/command/nddev-check.md",
+    "xdg-config/kilo/command/nddev-migrate.md",
+)
+BUILDER_PLUGIN = "xdg-config/kilo/nddev-builder-plugin.js"
+BUILDER_FILES = (
+    AGENTS_FILE,
+    BUILDER_INSTRUCTIONS,
+    BUILDER_SKILL,
+    *BUILDER_SKILL_REFERENCES,
+    *ADDITIONAL_SKILLS,
+    *AGENT_FILES,
+    *COMMAND_FILES,
+    BUILDER_PLUGIN,
+)
 MANAGED_FILES = (CONFIG, *BUILDER_FILES)
 CONFIG_MANAGED_KEYS = (
     "permission",
@@ -53,26 +103,60 @@ CONFIG_MANAGED_KEYS = (
     "skills",
     "command",
     "instructions",
+    "plugin",
     "experimental",
 )
-BUILDER_PROJECTION = "native-agent-skill-command-config"
+BUILDER_PROJECTION = "native-agent-skill-command-plugin-config"
 KILO_CURRENT_VERSION = "7.4.16"
 KILO_PACKAGE = "@kilocode/cli"
 KILO_COMMAND = "kilo"
 KILO_PACKAGE_SPEC = f"{KILO_PACKAGE}@{KILO_CURRENT_VERSION}"
+NPM_REGISTRY = "https://registry.npmjs.org/"
+KILO_PACKAGE_METADATA_URL = "https://registry.npmjs.org/@kilocode%2fcli/7.4.16"
+ALLOWED_SYSTEM_SYMLINK_ANCESTORS = {
+    Path("/tmp"): Path("/private/tmp"),
+    Path("/var"): Path("/private/var"),
+}
 KILO_PACKAGE_INTEGRITY = (
     "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/"
     "nk0OGNO1kRaygEyc7+Htr2Q=="
 )
 KILO_PACKAGE_SHASUM = "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d"
-BUN_INSTALL_ARGV = ("add", "--global", "--exact", "--trust", KILO_PACKAGE_SPEC)
+NPM_INSTALL_ARGV = (
+    "install",
+    "--global",
+    "--save-exact",
+    "--audit=false",
+    "--fund=false",
+    f"--registry={NPM_REGISTRY}",
+    KILO_PACKAGE_SPEC,
+)
+NPM_LOCK_ARGV = (
+    "install",
+    "--package-lock-only",
+    "--ignore-scripts",
+    "--save-exact",
+    "--audit=false",
+    "--fund=false",
+    f"--registry={NPM_REGISTRY}",
+    KILO_PACKAGE_SPEC,
+)
 CONTROLLED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+TRUSTED_NPM_CANDIDATES = (
+    "/opt/homebrew/bin/npm",
+    "/usr/local/bin/npm",
+    "/usr/bin/npm",
+)
 PROCESS_OUTPUT_MAX_BYTES = 256 * 1024
 PROCESS_TIMEOUT_SECONDS = 180
 STAGE_VERSION_PROBE_TIMEOUT_SECONDS = 60
 SOFTWARE_TREE_MAX_BYTES = 1024 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 120000
-SOFTWARE_GLOBAL_DIR_RELATIVE = Path("install") / "global"
+SOFTWARE_PREFIX_RELATIVE = Path("install") / "npm-prefix"
+SOFTWARE_GLOBAL_DIR_RELATIVE = SOFTWARE_PREFIX_RELATIVE / "lib"
+SOFTWARE_LOCK_RELATIVE = Path("software") / "package-lock.json"
+BACKUP_POOL_RELATIVE = Path(".nddev-kilo-cli-backups")
+LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
@@ -82,7 +166,8 @@ KILO_NATIVE_BIN_RELATIVE = (
 SOFTWARE_MANIFEST_RELATIVE = Path("software") / "kilo-cli.json"
 SOFTWARE_REPLACE_PATHS = (
     Path("bin") / KILO_COMMAND,
-    SOFTWARE_GLOBAL_DIR_RELATIVE,
+    SOFTWARE_PREFIX_RELATIVE,
+    SOFTWARE_LOCK_RELATIVE,
     SOFTWARE_MANIFEST_RELATIVE,
 )
 SOFTWARE_PARENT_PATHS = tuple(
@@ -110,7 +195,6 @@ SECRET_ENV_PREFIXES = (
     "VERTEX_",
     "XAI_",
     "npm_config_",
-    "BUN_CONFIG_",
 )
 SECRET_ENV_NAMES = {
     "AWS_ACCESS_KEY_ID",
@@ -129,8 +213,8 @@ SECRET_ENV_NAMES = {
     "KILOCODE_API_KEY",
     "NODE_AUTH_TOKEN",
     "NPM_TOKEN",
-    "BUN_AUTH_TOKEN",
     "npm_config_userconfig",
+    "NPM_CONFIG_USERCONFIG",
     "OPENAI_API_KEY",
 }
 FORBIDDEN_LAUNCH_ARGS = {
@@ -178,11 +262,18 @@ class ConcurrentTargetChange(ManagerError):
 class Setup:
     setup_id: str
     description: str
-    permission_profile: str
     builder_enabled: bool
     managed_files: tuple[str, ...]
     config: dict[str, Any]
     files: dict[str, bytes]
+
+
+@dataclass(frozen=True)
+class Profile:
+    profile_id: str
+    description: str
+    launch_auto: bool
+    config: dict[str, Any]
 
 
 @dataclass
@@ -223,6 +314,36 @@ def is_owner_private_directory(info: os.stat_result) -> bool:
     return True
 
 
+def is_sticky_directory(info: os.stat_result) -> bool:
+    return stat.S_ISDIR(info.st_mode) and bool(info.st_mode & stat.S_ISVTX)
+
+
+def group_or_world_writable(info: os.stat_result) -> bool:
+    return bool(stat.S_IMODE(info.st_mode) & 0o022)
+
+
+def require_safe_target_ancestor(path: Path, label: str) -> None:
+    info = require_directory(path, label)
+    if group_or_world_writable(info) and not is_sticky_directory(info):
+        fail(f"{label} must not be group/world-writable unless it is sticky")
+
+
+def reject_unsafe_target_ancestors(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"target path must not contain symlink ancestors: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"target parent must be a real directory: {current}")
+        if group_or_world_writable(info) and not is_sticky_directory(info):
+            fail(f"target ancestor must not be group/world-writable unless sticky: {current}")
+
+
 def is_owner_only_file(info: os.stat_result) -> bool:
     if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
         return False
@@ -259,6 +380,13 @@ def reject_absolute_symlink_ancestors(path: Path) -> None:
         except FileNotFoundError:
             return
         if stat.S_ISLNK(info.st_mode):
+            allowed = ALLOWED_SYSTEM_SYMLINK_ANCESTORS.get(current)
+            if allowed is not None:
+                try:
+                    if current.resolve(strict=True) == allowed:
+                        continue
+                except FileNotFoundError:
+                    pass
             fail(f"target path must not contain symlink ancestors: {current}")
         if current != path and not stat.S_ISDIR(info.st_mode):
             fail(f"target parent must be a real directory: {current}")
@@ -387,14 +515,33 @@ def read_json_file(
 
 
 def setup_ids() -> list[str]:
-    if not CATALOG_ROOT.is_dir():
-        return []
-    return sorted(path.name for path in CATALOG_ROOT.iterdir() if path.is_dir())
+    return [setup_id for setup_id in ACTIVE_SETUP_IDS if (CATALOG_ROOT / setup_id).is_dir()]
+
+
+def profile_ids() -> list[str]:
+    return [profile_id for profile_id in PROFILE_IDS if (PROFILE_ROOT / profile_id).is_dir()]
+
+
+def legacy_setup_id(setup_id: str) -> bool:
+    return setup_id in LEGACY_SETUP_IDS
+
+
+def active_setup_id(setup_id: str) -> bool:
+    return setup_id in setup_ids()
+
+
+def require_active_setup_id(setup_id: str) -> None:
+    if not active_setup_id(setup_id):
+        fail(f"unknown active setup id: {setup_id}")
+
+
+def require_profile_id(profile_id: str) -> None:
+    if profile_id not in profile_ids():
+        fail(f"unknown permission profile: {profile_id}")
 
 
 def load_setup(setup_id: str) -> Setup:
-    if setup_id not in setup_ids():
-        fail(f"unknown setup id: {setup_id}")
+    require_active_setup_id(setup_id)
     setup_root = CATALOG_ROOT / setup_id
     metadata = read_json_file(setup_root / "setup.json", f"setup {setup_id} metadata")
     if metadata.get("id") != setup_id:
@@ -410,11 +557,25 @@ def load_setup(setup_id: str) -> Setup:
     return Setup(
         setup_id=setup_id,
         description=str(metadata.get("description", "")),
-        permission_profile=str(metadata.get("permission_profile", "")),
         builder_enabled=bool(metadata.get("builder_enabled")),
         managed_files=managed_files,
         config=config,
         files=files,
+    )
+
+
+def load_profile(profile_id: str) -> Profile:
+    require_profile_id(profile_id)
+    profile_root = PROFILE_ROOT / profile_id
+    metadata = read_json_file(profile_root / "profile.json", f"profile {profile_id} metadata")
+    if metadata.get("id") != profile_id:
+        fail(f"profile metadata id mismatch for {profile_id}")
+    config = read_json_file(profile_root / SOURCE_PROFILE_CONFIG, f"profile {profile_id} config")
+    return Profile(
+        profile_id=profile_id,
+        description=str(metadata.get("description", "")),
+        launch_auto=bool(metadata.get("launch_auto")),
+        config=config,
     )
 
 
@@ -431,13 +592,12 @@ def resolve_target(raw: str | Path, *, create: bool = False) -> Path:
     reject_absolute_symlink_ancestors(path)
     path = path.resolve(strict=False)
     reject_absolute_symlink_ancestors(path)
+    reject_unsafe_target_ancestors(path)
     if create:
         transaction = DirectoryTransaction([])
         try:
             ensure_directory_chain(path.parent, transaction, "target parent")
-            parent_info = require_directory(path.parent, "target parent")
-            if not is_owner_private_directory(parent_info):
-                fail("target parent must be private to the current user with mode 0700")
+            require_safe_target_ancestor(path.parent, "target parent")
             ensure_private_directory(path, create=True, transaction=transaction)
         except BaseException:
             transaction.cleanup()
@@ -496,11 +656,30 @@ def require_private_target_directory_for_software(target: Path, *, allow_missing
 
 
 def backup_pool(target: Path) -> Path:
+    return target / BACKUP_POOL_RELATIVE
+
+
+def legacy_backup_pool(target: Path) -> Path:
     return target.parent / f".{target.name}.nddev-kilo-cli-backups"
 
 
+def backup_slot_directory(target: Path, slot: int) -> Path:
+    for pool in (backup_pool(target), legacy_backup_pool(target)):
+        slot_dir = pool / str(slot)
+        if not path_exists_no_follow(slot_dir):
+            continue
+        pool_info = require_directory(pool, "backup pool")
+        if not is_owner_private_directory(pool_info):
+            fail("backup pool must be private to the current user with mode 0700")
+        slot_info = require_directory(slot_dir, f"backup slot {slot}")
+        if not is_owner_private_directory(slot_info):
+            fail(f"backup slot {slot} must be private to the current user with mode 0700")
+        return slot_dir
+    fail(f"backup slot is missing: {slot}")
+
+
 def lock_path(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-kilo-cli.lock"
+    return target / LOCK_RELATIVE
 
 
 @contextlib.contextmanager
@@ -508,10 +687,11 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
     transaction = DirectoryTransaction([])
     if create_parent:
         ensure_directory_chain(target.parent, transaction, "canonical target parent")
-    parent_info = require_directory(target.parent, "canonical target parent")
-    if not is_owner_private_directory(parent_info):
-        transaction.cleanup()
-        fail("canonical target parent must be private to the current user with mode 0700")
+        require_safe_target_ancestor(target.parent, "canonical target parent")
+        ensure_private_directory(target, create=True, transaction=transaction)
+    else:
+        if not ensure_private_directory(target, create=False, transaction=transaction):
+            fail("target is missing")
     lock = lock_path(target)
     owner = lock / "owner.json"
     try:
@@ -578,27 +758,15 @@ def merge_config(existing: dict[str, Any], managed: dict[str, Any]) -> dict[str,
     return merged
 
 
-def managed_config_fragment(setup: Setup, target: Path) -> dict[str, Any]:
+def managed_config_fragment(setup: Setup, profile: Profile, target: Path) -> dict[str, Any]:
     fragment = extract_managed_config(setup.config)
+    for key, value in extract_managed_config(profile.config).items():
+        fragment[key] = copy.deepcopy(value)
     skills = copy.deepcopy(fragment.get("skills", {}))
     skills["paths"] = [str((target / "skills").resolve(strict=False))]
     fragment["skills"] = skills
     fragment["instructions"] = [str((target / BUILDER_INSTRUCTIONS).resolve(strict=False))]
-    agent = copy.deepcopy(fragment.get("agent", {}))
-    builder_agent = copy.deepcopy(agent.get("nddev-builder", {}))
-    builder_agent["prompt"] = (
-        "{file:" + str((target / BUILDER_INSTRUCTIONS).resolve(strict=False)) + "}"
-    )
-    requirements = copy.deepcopy(builder_agent.get("requirements", {}))
-    requirements["skills"] = ["nddev-builder"]
-    builder_agent["requirements"] = requirements
-    agent["nddev-builder"] = builder_agent
-    fragment["agent"] = agent
-    command = copy.deepcopy(fragment.get("command", {}))
-    builder_command = copy.deepcopy(command.get("nddev-builder", {}))
-    builder_command["agent"] = "nddev-builder"
-    command["nddev-builder"] = builder_command
-    fragment["command"] = command
+    fragment["plugin"] = ["./nddev-builder-plugin.js"]
     return fragment
 
 
@@ -610,10 +778,13 @@ def digest_for_content(relative: str, content: bytes) -> str:
 
 
 def stamp_for_desired(
-    target: Path, setup_id: str, desired: dict[str, bytes | None]
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    desired: dict[str, bytes | None],
 ) -> dict[str, Any]:
     managed_records = []
-    for relative in MANAGED_FILES:
+    for relative in sorted(relative for relative in desired if relative != STAMP_NAME):
         content = desired.get(relative)
         if content is None:
             fail(f"desired state omits managed file: {relative}")
@@ -623,6 +794,7 @@ def stamp_for_desired(
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "setup_id": setup_id,
+        "permission_profile": profile_id,
         "canonical_target": str(target),
         "managed_files": managed_records,
         "builder": {
@@ -630,6 +802,7 @@ def stamp_for_desired(
             "projection": BUILDER_PROJECTION,
             "agent": "nddev-builder",
             "skill": "nddev-builder",
+            "plugin": "nddev-builder",
             "files": list(BUILDER_FILES),
         },
         "runtime": {
@@ -641,16 +814,17 @@ def stamp_for_desired(
     }
 
 
-def desired_for_setup(target: Path, setup_id: str) -> dict[str, bytes | None]:
+def desired_for_setup(target: Path, setup_id: str, profile_id: str) -> dict[str, bytes | None]:
     setup = load_setup(setup_id)
-    managed = managed_config_fragment(setup, target)
+    profile = load_profile(profile_id)
+    managed = managed_config_fragment(setup, profile, target)
     merged = merge_config(current_config(target), managed)
-    desired: dict[str, bytes | None] = {
-        CONFIG: canonical_json(merged),
-        BUILDER_INSTRUCTIONS: setup.files[BUILDER_INSTRUCTIONS],
-        BUILDER_SKILL: setup.files[BUILDER_SKILL],
-    }
-    desired[STAMP_NAME] = canonical_json(stamp_for_desired(target, setup_id, desired))
+    desired: dict[str, bytes | None] = {CONFIG: canonical_json(merged)}
+    for relative in BUILDER_FILES:
+        desired[relative] = setup.files[relative]
+    desired[STAMP_NAME] = canonical_json(
+        stamp_for_desired(target, setup_id, profile_id, desired)
+    )
     return desired
 
 
@@ -662,7 +836,7 @@ def read_stamp(target: Path) -> dict[str, Any] | None:
         return None
     reject_relative_symlink_ancestors(target, STAMP_NAME)
     stamp = read_json_file(path, "target stamp", owner_only=True)
-    if stamp.get("schema_version") != STAMP_SCHEMA:
+    if stamp.get("schema_version") not in {STAMP_SCHEMA, LEGACY_STAMP_SCHEMA}:
         fail("target stamp schema is unsupported")
     if stamp.get("product_name") != PRODUCT_NAME:
         fail("target stamp belongs to another product")
@@ -670,6 +844,34 @@ def read_stamp(target: Path) -> dict[str, Any] | None:
         fail("target stamp is bound to a different target")
     if not isinstance(stamp.get("managed_files"), list):
         fail("target stamp has invalid managed file records")
+    return stamp
+
+
+def stamp_setup_id(stamp: dict[str, Any]) -> str:
+    return str(stamp.get("setup_id", ""))
+
+
+def stamp_profile_id(stamp: dict[str, Any]) -> str | None:
+    profile = stamp.get("permission_profile")
+    return str(profile) if isinstance(profile, str) and profile else None
+
+
+def stamp_is_active(stamp: dict[str, Any]) -> bool:
+    return stamp.get("schema_version") == STAMP_SCHEMA and active_setup_id(stamp_setup_id(stamp))
+
+
+def stamp_is_legacy(stamp: dict[str, Any]) -> bool:
+    setup_id = stamp_setup_id(stamp)
+    return stamp.get("schema_version") == LEGACY_STAMP_SCHEMA or legacy_setup_id(setup_id)
+
+
+def require_active_clean_installed(target: Path) -> dict[str, Any]:
+    stamp = require_clean_installed(target)
+    if not stamp_is_active(stamp):
+        fail("managed Kilo setup is legacy and must be migrated or removed before launch")
+    profile_id = stamp_profile_id(stamp)
+    if profile_id not in profile_ids():
+        fail("managed Kilo setup has an unsupported permission profile")
     return stamp
 
 
@@ -790,8 +992,13 @@ def replace_managed_state(
     expected: dict[str, str] | None = None,
     **_kwargs: Any,
 ) -> None:
-    del expected
     require_directory(target, "target")
+    if expected is not None:
+        for relative, expected_digest in expected.items():
+            content = snapshot_paths(target, {relative})[relative]
+            actual = "<missing>" if content is None else digest_for_content(relative, content)
+            if actual != expected_digest:
+                raise ConcurrentTargetChange(f"managed path changed before replacement: {relative}")
     for relative in desired:
         preflight_destination(target, relative)
     ordered = [relative for relative in desired if relative != STAMP_NAME]
@@ -828,6 +1035,13 @@ def snapshot_paths(target: Path, relatives: set[str]) -> dict[str, bytes | None]
     return snapshot
 
 
+def snapshot_digests(snapshot: dict[str, bytes | None]) -> dict[str, str]:
+    return {
+        relative: "<missing>" if content is None else digest_for_content(relative, content)
+        for relative, content in snapshot.items()
+    }
+
+
 def restore_snapshot(target: Path, snapshot: dict[str, bytes | None]) -> None:
     for relative, content in snapshot.items():
         path = target / safe_relative_path(relative)
@@ -861,8 +1075,16 @@ def write_backup_file(slot_dir: Path, relative: str, content: bytes) -> None:
 
 def backup_current_state(target: Path, stamp: dict[str, Any]) -> int:
     pool = backup_pool(target)
-    pool.mkdir(mode=OWNER_DIR_MODE, exist_ok=True)
-    require_directory(pool, "backup pool")
+    if path_exists_no_follow(pool):
+        pool_info = require_directory(pool, "backup pool")
+        if not is_owner_private_directory(pool_info):
+            fail("backup pool must be private to the current user with mode 0700")
+    else:
+        pool.mkdir(mode=OWNER_DIR_MODE)
+        pool.chmod(OWNER_DIR_MODE)
+    pool_info = require_directory(pool, "backup pool")
+    if not is_owner_private_directory(pool_info):
+        fail("backup pool must be private to the current user with mode 0700")
     slot = choose_backup_slot(pool)
     slot_dir = pool / str(slot)
     if slot_dir.exists():
@@ -902,8 +1124,7 @@ def backup_current_state(target: Path, stamp: dict[str, Any]) -> int:
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot >= MAX_BACKUPS:
         fail(f"backup slot must be between 0 and {MAX_BACKUPS - 1}")
-    slot_dir = backup_pool(target) / str(slot)
-    require_directory(slot_dir, f"backup slot {slot}")
+    slot_dir = backup_slot_directory(target, slot)
     envelope = read_json_file(slot_dir / BACKUP_NAME, f"backup {slot} envelope")
     if envelope.get("schema_version") != BACKUP_SCHEMA:
         fail("backup schema is unsupported")
@@ -916,14 +1137,15 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
 
 def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | None]]:
     envelope = load_backup(target, slot)
+    slot_dir = backup_slot_directory(target, slot)
     setup_id = str(envelope["source_setup_id"])
-    if setup_id not in setup_ids():
+    if not active_setup_id(setup_id) and not legacy_setup_id(setup_id):
         fail(f"backup references unknown setup id: {setup_id}")
     desired: dict[str, bytes | None] = {}
     for record in envelope["managed_files"]:
         relative = str(record["path"])
         content = read_regular_file(
-            backup_pool(target) / str(slot) / safe_relative_path(relative),
+            slot_dir / safe_relative_path(relative),
             f"backup {slot} {relative}",
             max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
         )
@@ -935,7 +1157,31 @@ def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | 
             desired[CONFIG] = canonical_json(merge_config(current_config(target), managed))
         else:
             desired[relative] = content
-    desired[STAMP_NAME] = canonical_json(stamp_for_desired(target, setup_id, desired))
+    profile_id = DEFAULT_PROFILE_ID
+    if active_setup_id(setup_id):
+        current_stamp = read_stamp(target)
+        profile_id = stamp_profile_id(current_stamp or {}) or DEFAULT_PROFILE_ID
+        desired[STAMP_NAME] = canonical_json(
+            stamp_for_desired(target, setup_id, profile_id, desired)
+        )
+    else:
+        legacy_stamp = {
+            "schema_version": LEGACY_STAMP_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "build_version": VERSION,
+            "setup_id": setup_id,
+            "canonical_target": str(target),
+            "managed_files": envelope["managed_files"],
+            "legacy": True,
+            "launchable": False,
+            "runtime": {
+                "command": "kilo",
+                "config_env": "KILO_CONFIG",
+                "package": KILO_PACKAGE,
+                "version": KILO_CURRENT_VERSION,
+            },
+        }
+        desired[STAMP_NAME] = canonical_json(legacy_stamp)
     return setup_id, desired
 
 
@@ -953,7 +1199,9 @@ def desired_for_remove(target: Path) -> dict[str, bytes | None]:
     return desired
 
 
-def mutate_setup(target: Path, setup_id: str, operation: str) -> dict[str, Any]:
+def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
+    require_active_setup_id(setup_id)
+    require_profile_id(profile_id)
     target = resolve_target(target, create=False)
     backup_slot: int | None = None
     with target_lock(target, create_parent=(operation == "install")) as transaction:
@@ -964,24 +1212,68 @@ def mutate_setup(target: Path, setup_id: str, operation: str) -> dict[str, Any]:
                 preflight_unmanaged_target(target)
             else:
                 require_clean_installed(target)
-                if stamp["setup_id"] != setup_id:
+                if not stamp_is_active(stamp):
+                    fail("legacy managed state must be migrated or removed before install")
+                if stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id:
                     backup_slot = backup_current_state(target, stamp)
         elif operation == "switch":
             stamp = require_clean_installed(target)
-            if stamp["setup_id"] != setup_id:
+            if not stamp_is_active(stamp):
+                fail("legacy managed state must be migrated or removed before switch")
+            if stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id:
                 backup_slot = backup_current_state(target, stamp)
         else:
             fail(f"unsupported mutation operation: {operation}")
-        desired = desired_for_setup(target, setup_id)
+        desired = desired_for_setup(target, setup_id, profile_id)
         snapshot = snapshot_paths(target, set(desired))
         try:
-            replace_managed_state(target, desired, None)
+            replace_managed_state(target, desired, snapshot_digests(snapshot))
         except Exception:
             restore_snapshot(target, snapshot)
             raise
     return {
         "operation": operation,
         "setup_id": setup_id,
+        "permission_profile": profile_id,
+        "target": str(target),
+        "backup_slot": backup_slot,
+        "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+    }
+
+
+def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -> str:
+    if requested_profile is not None:
+        require_profile_id(requested_profile)
+        return requested_profile
+    setup_id = stamp_setup_id(stamp)
+    if setup_id in {"safe", "full-auto"}:
+        return setup_id
+    fail("legacy balanced state has no native profile mapping; pass --profile safe or --profile full-auto")
+
+
+def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
+    target = resolve_target(target, create=False)
+    backup_slot: int | None = None
+    with target_lock(target):
+        stamp = require_clean_installed(target)
+        if stamp_is_active(stamp):
+            profile = profile_id or stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
+        elif stamp_is_legacy(stamp):
+            profile = infer_legacy_profile(stamp, profile_id)
+            backup_slot = backup_current_state(target, stamp)
+        else:
+            fail("managed Kilo setup is not migratable")
+        desired = desired_for_setup(target, DEFAULT_SETUP_ID, profile)
+        snapshot = snapshot_paths(target, set(desired))
+        try:
+            replace_managed_state(target, desired, snapshot_digests(snapshot))
+        except Exception:
+            restore_snapshot(target, snapshot)
+            raise
+    return {
+        "operation": "migrate",
+        "setup_id": DEFAULT_SETUP_ID,
+        "permission_profile": profile,
         "target": str(target),
         "backup_slot": backup_slot,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
@@ -995,7 +1287,7 @@ def restore_setup(target: Path, slot: int) -> dict[str, Any]:
         setup_id, desired = desired_for_backup(target, slot)
         snapshot = snapshot_paths(target, set(desired))
         try:
-            replace_managed_state(target, desired, None)
+            replace_managed_state(target, desired, snapshot_digests(snapshot))
         except Exception:
             restore_snapshot(target, snapshot)
             raise
@@ -1015,7 +1307,7 @@ def remove_setup(target: Path) -> dict[str, Any]:
         desired = desired_for_remove(target)
         snapshot = snapshot_paths(target, set(desired))
         try:
-            replace_managed_state(target, desired, None)
+            replace_managed_state(target, desired, snapshot_digests(snapshot))
         except Exception:
             restore_snapshot(target, snapshot)
             raise
@@ -1039,26 +1331,33 @@ def status_payload(target: Path) -> dict[str, Any]:
             "software": software,
         }
     drift = drift_paths(target, stamp)
+    active = stamp_is_active(stamp)
+    legacy = stamp_is_legacy(stamp)
     return {
         "installed": True,
         "target": str(target),
-        "setup_id": stamp["setup_id"],
+        "setup_id": stamp_setup_id(stamp),
+        "permission_profile": stamp_profile_id(stamp),
         "build_version": stamp["build_version"],
         "drift": drift,
+        "legacy": legacy,
+        "launchable": active and not drift,
         "builder": stamp.get("builder", {"enabled": False, "projection": BUILDER_PROJECTION}),
         "backup_pool": str(backup_pool(target)),
         "software": software,
     }
 
 
-def plan_payload(target: Path, setup_id: str) -> dict[str, Any]:
+def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     load_setup(setup_id)
+    load_profile(profile_id)
     target = resolve_target(target, create=False)
     stamp = read_stamp(target) if target.exists() else None
     operation = "install" if stamp is None else "switch"
     return {
         "operation": operation,
         "setup_id": setup_id,
+        "permission_profile": profile_id,
         "target": str(target),
         "mutates": False,
         "managed_files": list(MANAGED_FILES),
@@ -1074,12 +1373,28 @@ def list_payload() -> dict[str, Any]:
             {
                 "id": setup.setup_id,
                 "description": setup.description,
-                "permission_profile": setup.permission_profile,
+                "default_permission_profile": DEFAULT_PROFILE_ID,
                 "builder_enabled": setup.builder_enabled,
                 "managed_files": list(setup.managed_files),
             }
         )
-    return {"product_name": PRODUCT_NAME, "build_version": VERSION, "setups": setups}
+    profiles = [
+        {
+            "id": profile.profile_id,
+            "description": profile.description,
+            "launch_auto": profile.launch_auto,
+        }
+        for profile in (load_profile(profile_id) for profile_id in profile_ids())
+    ]
+    return {
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "default_setup": DEFAULT_SETUP_ID,
+        "default_permission_profile": DEFAULT_PROFILE_ID,
+        "setups": setups,
+        "permission_profiles": profiles,
+        "legacy_setup_ids": list(LEGACY_SETUP_IDS),
+    }
 
 
 def path_exists_no_follow(path: Path) -> bool:
@@ -1098,10 +1413,15 @@ def software_manifest_path(target: Path) -> Path:
     return target / SOFTWARE_MANIFEST_RELATIVE
 
 
-def safe_child_base_environment(*, include_path: bool) -> dict[str, str]:
+def safe_child_base_environment(
+    *, include_path: bool, path_entries: tuple[str, ...] = ()
+) -> dict[str, str]:
     env: dict[str, str] = {}
     if include_path:
-        env["PATH"] = os.environ.get("PATH", CONTROLLED_PATH)
+        entries = [entry for entry in path_entries if entry]
+        entries.extend(CONTROLLED_PATH.split(":"))
+        deduped = list(dict.fromkeys(entries))
+        env["PATH"] = os.pathsep.join(deduped)
     for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "CI"):
         value = os.environ.get(name)
         if value:
@@ -1109,18 +1429,30 @@ def safe_child_base_environment(*, include_path: bool) -> dict[str, str]:
     return env
 
 
-def install_stage_environment(stage_root: Path, live_stage: Path) -> dict[str, str]:
+def install_stage_environment(
+    stage_root: Path, live_stage: Path, *, path_entries: tuple[str, ...]
+) -> dict[str, str]:
     home = stage_root / "home"
     tmp = stage_root / "tmp"
     xdg_config = stage_root / "xdg-config"
     xdg_data = stage_root / "xdg-data"
     xdg_state = stage_root / "xdg-state"
     xdg_cache = stage_root / "xdg-cache"
-    bun_cache = stage_root / "bun-cache"
-    for directory in (home, tmp, xdg_config, xdg_data, xdg_state, xdg_cache, bun_cache):
+    npm_cache = stage_root / "npm-cache"
+    npm_prefix = live_stage / SOFTWARE_PREFIX_RELATIVE
+    npm_userconfig = stage_root / "npmrc"
+    npm_globalconfig = stage_root / "global-npmrc"
+    for directory in (home, tmp, xdg_config, xdg_data, xdg_state, xdg_cache, npm_cache, npm_prefix):
         directory.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
         directory.chmod(OWNER_DIR_MODE)
-    env = safe_child_base_environment(include_path=True)
+    npm_userconfig.write_text(
+        f"registry={NPM_REGISTRY}\naudit=false\nfund=false\n",
+        encoding="utf-8",
+    )
+    npm_userconfig.chmod(OWNER_FILE_MODE)
+    npm_globalconfig.write_text("", encoding="utf-8")
+    npm_globalconfig.chmod(OWNER_FILE_MODE)
+    env = safe_child_base_environment(include_path=True, path_entries=path_entries)
     env.update(
         {
             "HOME": str(home),
@@ -1130,9 +1462,17 @@ def install_stage_environment(stage_root: Path, live_stage: Path) -> dict[str, s
             "XDG_DATA_HOME": str(xdg_data),
             "XDG_STATE_HOME": str(xdg_state),
             "XDG_CACHE_HOME": str(xdg_cache),
-            "BUN_INSTALL_GLOBAL_DIR": str(live_stage / SOFTWARE_GLOBAL_DIR_RELATIVE),
-            "BUN_INSTALL_BIN": str(live_stage / "bin"),
-            "BUN_INSTALL_CACHE_DIR": str(bun_cache),
+            "npm_config_cache": str(npm_cache),
+            "npm_config_prefix": str(npm_prefix),
+            "npm_config_userconfig": str(npm_userconfig),
+            "npm_config_globalconfig": str(npm_globalconfig),
+            "npm_config_update_notifier": "false",
+            "npm_config_audit": "false",
+            "npm_config_fund": "false",
+            "NPM_CONFIG_CACHE": str(npm_cache),
+            "NPM_CONFIG_PREFIX": str(npm_prefix),
+            "NPM_CONFIG_USERCONFIG": str(npm_userconfig),
+            "NPM_CONFIG_GLOBALCONFIG": str(npm_globalconfig),
         }
     )
     return env
@@ -1146,7 +1486,7 @@ def native_wrapper_bytes() -> bytes:
         "  */*) self_dir=${0%/*} ;;\n"
         "  *) self_dir=. ;;\n"
         "esac\n"
-        'package_bin_dir="$self_dir/../install/global/node_modules/@kilocode/cli/bin"\n'
+        'package_bin_dir="$self_dir/../install/npm-prefix/lib/node_modules/@kilocode/cli/bin"\n'
         'if [ -f "$package_bin_dir/tree-sitter/tree-sitter.wasm" ]; then\n'
         '  export KILO_TREE_SITTER_WASM_DIR="$package_bin_dir/tree-sitter"\n'
         "fi\n"
@@ -1177,31 +1517,84 @@ def launch_environment(target: Path) -> dict[str, str]:
     return env
 
 
-def find_bun_executable() -> str:
-    candidate = shutil.which("bun", path=os.environ.get("PATH", ""))
-    if candidate is None:
-        fail("bun executable not found on PATH")
-    return candidate
+def reject_unsafe_tool_ancestors(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current = current / part
+        info = require_directory(current, f"tool ancestor {current}")
+        if group_or_world_writable(info) and not is_sticky_directory(info):
+            fail(f"tool ancestor must not be group/world-writable unless sticky: {current}")
+
+
+def trusted_executable(path: Path, label: str) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    resolved = path
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            return False
+    try:
+        reject_unsafe_tool_ancestors(path)
+        reject_unsafe_tool_ancestors(resolved)
+        resolved_info = resolved.lstat()
+    except ManagerError:
+        raise
+    except OSError:
+        return False
+    if stat.S_ISLNK(resolved_info.st_mode) or not stat.S_ISREG(resolved_info.st_mode):
+        return False
+    if group_or_world_writable(resolved_info):
+        fail(f"{label} must not be group/world-writable: {resolved}")
+    return os.access(resolved, os.X_OK)
+
+
+def find_npm_executable() -> tuple[str, tuple[str, ...]]:
+    for raw in TRUSTED_NPM_CANDIDATES:
+        path = Path(raw)
+        if trusted_executable(path, "npm executable"):
+            return str(path), (str(path.parent),)
+    fail("trusted npm executable not found in supported absolute locations")
 
 
 def bounded_process(
     command: list[str], *, cwd: Path, env: dict[str, str], timeout: int
 ) -> subprocess.CompletedProcess[str]:
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
+            start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError:
         fail(f"process executable not found: {command[0]}")
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, 15)
+        else:
+            process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.communicate(timeout=5)
+        if process.poll() is None:
+            if os.name == "posix":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+            else:
+                process.kill()
+            process.communicate()
         fail(f"process timed out after {timeout} seconds: {command[0]}")
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if (
         len(completed.stdout) > PROCESS_OUTPUT_MAX_BYTES
         or len(completed.stderr) > PROCESS_OUTPUT_MAX_BYTES
@@ -1557,6 +1950,99 @@ def resolved_executable_path(path: Path, root: Path, label: str) -> Path:
     return path
 
 
+def fetch_registry_metadata() -> dict[str, Any]:
+    request = urllib.request.Request(
+        KILO_PACKAGE_METADATA_URL,
+        headers={"Accept": "application/json", "User-Agent": f"{PRODUCT_NAME}/{VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=PROCESS_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                fail(f"npm registry returned HTTP {response.status} for {KILO_PACKAGE_SPEC}")
+            content = response.read(METADATA_MAX_BYTES + 1)
+    except urllib.error.URLError as exc:
+        fail(f"cannot read npm registry metadata for {KILO_PACKAGE_SPEC}: {exc}")
+    if len(content) > METADATA_MAX_BYTES:
+        fail("npm registry metadata exceeds the bounded read limit")
+    return parse_json_object(content, "npm registry metadata")
+
+
+def verify_registry_metadata(metadata: dict[str, Any]) -> None:
+    if metadata.get("name") != KILO_PACKAGE or metadata.get("version") != KILO_CURRENT_VERSION:
+        fail("npm registry metadata package identity is invalid")
+    dist = metadata.get("dist")
+    if not isinstance(dist, dict):
+        fail("npm registry metadata omits dist")
+    if dist.get("integrity") != KILO_PACKAGE_INTEGRITY:
+        fail("npm registry metadata integrity does not match the pinned baseline")
+    if dist.get("shasum") != KILO_PACKAGE_SHASUM:
+        fail("npm registry metadata shasum does not match the pinned baseline")
+    scripts = metadata.get("scripts")
+    if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
+        fail("npm registry metadata postinstall contract is invalid")
+
+
+def package_lock_path(root: Path) -> Path:
+    return root / SOFTWARE_LOCK_RELATIVE
+
+
+def package_lock_records(root: Path) -> dict[str, Any]:
+    lock = read_json_file(package_lock_path(root), "Kilo CLI package lock")
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        fail("Kilo CLI package lock omits package records")
+    cli = packages.get("node_modules/@kilocode/cli")
+    if not isinstance(cli, dict):
+        fail("Kilo CLI package lock omits @kilocode/cli")
+    if cli.get("version") != KILO_CURRENT_VERSION:
+        fail("Kilo CLI package lock version is invalid")
+    if cli.get("integrity") != KILO_PACKAGE_INTEGRITY:
+        fail("Kilo CLI package lock integrity is invalid")
+    optional = cli.get("optionalDependencies")
+    if not isinstance(optional, dict) or not optional:
+        fail("Kilo CLI package lock omits native optional dependencies")
+    for package, version in optional.items():
+        if str(package).startswith("@kilocode/cli-") and version != KILO_CURRENT_VERSION:
+            fail(f"Kilo CLI package lock has unexpected native dependency {package}@{version}")
+    return lock
+
+
+def installed_native_packages(root: Path) -> list[dict[str, str]]:
+    install_root = root / SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules"
+    records: list[dict[str, str]] = []
+    path_count = 0
+    for manifest in install_root.rglob("package.json"):
+        path_count += 1
+        if path_count > SOFTWARE_TREE_MAX_PATHS:
+            fail("installed package scan exceeded the path limit")
+        try:
+            metadata = read_json_file(
+                manifest,
+                f"installed package manifest {manifest}",
+                max_bytes=METADATA_MAX_BYTES,
+            )
+        except ManagerError:
+            continue
+        name = metadata.get("name")
+        version = metadata.get("version")
+        if not isinstance(name, str) or not name.startswith("@kilocode/cli-"):
+            continue
+        if name.startswith("@kilocode/cli-windows-"):
+            fail(f"Windows native package is not supported by this module: {name}")
+        if version != KILO_CURRENT_VERSION:
+            fail(f"installed native package has unexpected version: {name}@{version}")
+        records.append(
+            {
+                "name": name,
+                "version": str(version),
+                "path": str(manifest.parent.relative_to(root)),
+            }
+        )
+    if not records:
+        fail("Kilo CLI postinstall did not leave an installed native package")
+    return sorted(records, key=lambda item: item["name"])
+
+
 def package_metadata(root: Path) -> dict[str, Any]:
     metadata = read_json_file(
         root / SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "package.json",
@@ -1580,12 +2066,18 @@ def package_metadata(root: Path) -> dict[str, Any]:
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
         fail("Kilo CLI package postinstall contract is invalid")
+    optional = metadata.get("optionalDependencies")
+    if not isinstance(optional, dict) or not optional:
+        fail("Kilo CLI package native optional dependency map is invalid")
+    for package, version in optional.items():
+        if str(package).startswith("@kilocode/cli-") and version != KILO_CURRENT_VERSION:
+            fail(f"Kilo CLI package declares unexpected native dependency {package}@{version}")
     return metadata
 
 
 def iter_software_tree_paths(root: Path) -> list[Path]:
-    paths = [Path("bin") / KILO_COMMAND, SOFTWARE_GLOBAL_DIR_RELATIVE]
-    install_root = root / SOFTWARE_GLOBAL_DIR_RELATIVE
+    paths = [Path("bin") / KILO_COMMAND, SOFTWARE_PREFIX_RELATIVE, SOFTWARE_LOCK_RELATIVE]
+    install_root = root / SOFTWARE_PREFIX_RELATIVE
     if install_root.exists() or install_root.is_symlink():
         for path in install_root.rglob("*"):
             paths.append(path.relative_to(root))
@@ -1635,12 +2127,21 @@ def compute_software_tree_digest(root: Path) -> dict[str, Any]:
         )
     require_safe_executable(root / "bin" / KILO_COMMAND, root, "Kilo CLI executable")
     metadata = package_metadata(root)
+    lock = package_lock_records(root)
+    native_packages = installed_native_packages(root)
     return {
         "tree_digest": sha256_bytes(canonical_json(records)),
         "tree_bytes": byte_counter["value"],
         "tree_paths": len(records),
         "package_name": metadata["name"],
         "version": metadata["version"],
+        "native_packages": native_packages,
+        "package_lock_sha256": digest_regular_file(
+            package_lock_path(root),
+            "Kilo CLI package lock",
+            {"value": 0},
+        ),
+        "package_lock_version": lock.get("lockfileVersion"),
         "entrypoint_sha256": digest_regular_file(
             resolved_executable_path(
                 root / "bin" / KILO_COMMAND,
@@ -1668,16 +2169,19 @@ def software_manifest_identity() -> dict[str, Any]:
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "package": KILO_PACKAGE,
-        "install_method": "bun-global-trusted-exact",
+        "install_method": "npm-global-exact-isolated",
         "package_version": KILO_CURRENT_VERSION,
         "package_integrity": KILO_PACKAGE_INTEGRITY,
         "package_shasum": KILO_PACKAGE_SHASUM,
-        "bun_argv": list(BUN_INSTALL_ARGV),
+        "npm_registry": NPM_REGISTRY,
+        "npm_install_argv": list(NPM_INSTALL_ARGV),
+        "npm_lock_argv": list(NPM_LOCK_ARGV),
         "executable": f"bin/{KILO_COMMAND}",
         "entrypoint_kind": "target-owned-native-wrapper",
         "package_bin": str(KILO_PACKAGE_BIN_RELATIVE),
         "native_executable": str(KILO_NATIVE_BIN_RELATIVE),
-        "install_root": str(SOFTWARE_GLOBAL_DIR_RELATIVE),
+        "install_root": str(SOFTWARE_PREFIX_RELATIVE),
+        "package_lock": str(SOFTWARE_LOCK_RELATIVE),
     }
 
 
@@ -1808,15 +2312,15 @@ def validate_replace_destination(target: Path, relative: Path) -> None:
     if relative == Path("bin") / KILO_COMMAND:
         require_safe_executable(destination, target, "existing Kilo CLI executable")
         return
-    if relative == SOFTWARE_GLOBAL_DIR_RELATIVE:
+    if relative == SOFTWARE_PREFIX_RELATIVE:
         info = require_directory(destination, f"existing software directory {relative}")
         if not is_owner_private_directory(info):
             fail(f"existing software directory {relative} must be private to the current user")
         return
-    if relative == SOFTWARE_MANIFEST_RELATIVE:
+    if relative in {SOFTWARE_MANIFEST_RELATIVE, SOFTWARE_LOCK_RELATIVE}:
         require_regular_file(
             destination,
-            f"existing software manifest {relative}",
+            f"existing software file {relative}",
             owner_only=True,
         )
         return
@@ -1948,7 +2452,7 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
             installed_new.append(relative)
         status = software_status(target)
         if not status["installed"] or not status["current"]:
-            fail("installed Kilo CLI did not validate as the pinned Bun package")
+            fail("installed Kilo CLI did not validate as the pinned npm package")
     except BaseException:
         moved_old = [
             relative
@@ -1990,37 +2494,81 @@ def materialize_stage_entrypoint(live_stage: Path) -> None:
     native_bin = live_stage / KILO_NATIVE_BIN_RELATIVE
     require_safe_executable(package_bin, live_stage, "staged Kilo CLI package bin")
     require_safe_executable(native_bin, live_stage, "staged Kilo CLI native executable")
-    info = entrypoint.lstat()
-    if not stat.S_ISLNK(info.st_mode):
-        fail("staged Kilo CLI executable must be the Bun global symlink")
-    resolved = resolve_target_owned_symlink(entrypoint, live_stage, "staged Kilo CLI executable")
-    if resolved != package_bin:
-        fail("staged Kilo CLI executable does not point at the official package bin")
-    entrypoint.unlink()
+    entrypoint.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    if path_exists_no_follow(entrypoint):
+        info = entrypoint.lstat()
+        if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+            entrypoint.unlink()
+        else:
+            fail("staged Kilo CLI executable path is not replaceable")
     entrypoint.write_bytes(native_wrapper_bytes())
     entrypoint.chmod(0o700)
     require_safe_executable(entrypoint, live_stage, "staged Kilo CLI executable")
 
 
-def run_bun_install(stage_root: Path, live_stage: Path) -> None:
-    bun = find_bun_executable()
-    env = install_stage_environment(stage_root, live_stage)
+def write_lock_project(stage_root: Path) -> Path:
+    project = stage_root / "npm-lock-project"
+    project.mkdir(mode=OWNER_DIR_MODE)
+    package_json = {
+        "private": True,
+        "name": "nddev-kilo-cli-lock",
+        "version": "0.0.0",
+        "dependencies": {KILO_PACKAGE: KILO_CURRENT_VERSION},
+    }
+    path = project / "package.json"
+    path.write_bytes(canonical_json(package_json))
+    path.chmod(OWNER_FILE_MODE)
+    return project
+
+
+def generate_package_lock(stage_root: Path, live_stage: Path, npm: str, env: dict[str, str]) -> Path:
+    project = write_lock_project(stage_root)
     completed = bounded_process(
-        [bun, *BUN_INSTALL_ARGV],
+        [npm, *NPM_LOCK_ARGV],
+        cwd=project,
+        env=env,
+        timeout=PROCESS_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        fail(
+            "npm package-lock generation for Kilo CLI failed with exit "
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
+    source = project / "package-lock.json"
+    require_regular_file(source, "generated Kilo CLI package lock", max_bytes=METADATA_MAX_BYTES)
+    destination = live_stage / SOFTWARE_LOCK_RELATIVE
+    destination.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    destination.chmod(OWNER_FILE_MODE)
+    package_lock_records(live_stage)
+    return destination
+
+
+def run_npm_install(stage_root: Path, live_stage: Path) -> None:
+    npm, path_entries = find_npm_executable()
+    registry_metadata = fetch_registry_metadata()
+    verify_registry_metadata(registry_metadata)
+    env = install_stage_environment(stage_root, live_stage, path_entries=path_entries)
+    generate_package_lock(stage_root, live_stage, npm, env)
+    prefix = live_stage / SOFTWARE_PREFIX_RELATIVE
+    completed = bounded_process(
+        [npm, *NPM_INSTALL_ARGV, "--prefix", str(prefix)],
         cwd=stage_root,
         env=env,
         timeout=PROCESS_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
         fail(
-            f"bun install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}"
+            f"npm install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}"
         )
     chmod_private_tree(live_stage)
     materialize_hardlinked_regular_files(live_stage)
     materialize_stage_entrypoint(live_stage)
+    package_lock_records(live_stage)
+    installed_native_packages(live_stage)
     observed = observed_kilo_version(live_stage / "bin" / KILO_COMMAND, live_stage)
     if observed != KILO_CURRENT_VERSION:
-        fail(f"Bun produced Kilo CLI {observed}, expected {KILO_CURRENT_VERSION}")
+        fail(f"npm produced Kilo CLI {observed}, expected {KILO_CURRENT_VERSION}")
 
 
 def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
@@ -2087,7 +2635,7 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
             staging.chmod(OWNER_DIR_MODE)
             live_stage = staging / "live"
             live_stage.mkdir(mode=OWNER_DIR_MODE)
-            run_bun_install(staging, live_stage)
+            run_npm_install(staging, live_stage)
             chmod_private_tree(live_stage)
             write_stage_software_manifest(live_stage)
             replace_software_state(target, live_stage, staging)
@@ -2134,21 +2682,36 @@ def remove_cli(target: Path) -> dict[str, Any]:
         moved_old: list[Path] = []
         with target_lock(target):
             require_private_target_directory_for_software(target, allow_missing=False)
-            for relative in SOFTWARE_REPLACE_PATHS:
-                destination = target / relative
-                if path_exists_no_follow(destination):
-                    saved = hold / relative
-                    move_old_path(destination, saved)
-                    moved_old.append(relative)
-            for relative in sorted(
-                SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True
-            ):
-                if relative in preexisting_parent_paths:
-                    parent = target / relative
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        pass
+            try:
+                for relative in SOFTWARE_REPLACE_PATHS:
+                    destination = target / relative
+                    if path_exists_no_follow(destination):
+                        saved = hold / relative
+                        move_old_path(destination, saved)
+                        moved_old.append(relative)
+                for relative in sorted(
+                    SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True
+                ):
+                    if relative in preexisting_parent_paths:
+                        parent = target / relative
+                        try:
+                            parent.rmdir()
+                        except OSError:
+                            pass
+            except BaseException:
+                restore_software_paths(
+                    target,
+                    hold,
+                    empty_live,
+                    moved_old=[
+                        relative
+                        for relative in SOFTWARE_REPLACE_PATHS
+                        if path_exists_no_follow(hold / relative)
+                    ],
+                    installed_new=[],
+                    preexisting_parent_paths=preexisting_parent_paths,
+                )
+                raise
         return {
             "schema_version": 1,
             "command": "remove-cli",
@@ -2203,10 +2766,17 @@ def normalize_launch_child_args(child_args: list[str]) -> list[str]:
     return forwarded
 
 
-def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str]) -> list[str]:
-    if setup_id == "full-auto":
+def launch_command_for_profile(executable: str, profile_id: str, forwarded: list[str]) -> list[str]:
+    if profile_id == "full-auto":
         return [executable, "run", "--auto", *forwarded]
     return [executable, "run", *forwarded]
+
+
+def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str]) -> list[str]:
+    """Backward-compatible helper for callers that passed legacy setup ids."""
+    if setup_id == DEFAULT_SETUP_ID:
+        return launch_command_for_profile(executable, DEFAULT_PROFILE_ID, forwarded)
+    fail(f"legacy setup cannot be launched: {setup_id}")
 
 
 def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
@@ -2214,18 +2784,38 @@ def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) 
         fail("launch timeout must be positive")
     target = resolve_target(target, create=False)
     with target_lock(target):
-        stamp = require_clean_installed(target)
+        stamp = require_active_clean_installed(target)
         installation = require_current_software(target)
         env = clean_launch_env(target)
         executable = str(installation["executable"])
-        setup_id = str(stamp["setup_id"])
+        profile_id = stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
     forwarded = normalize_launch_child_args(child_args)
-    command = launch_command_for_setup(executable, setup_id, forwarded)
+    command = launch_command_for_profile(executable, profile_id, forwarded)
     try:
-        return subprocess.run(command, env=env, check=False, timeout=timeout_seconds).returncode
+        process = subprocess.Popen(
+            command,
+            env=env,
+            start_new_session=(os.name == "posix"),
+        )
     except FileNotFoundError:
         fail("kilo executable disappeared before launch")
+    try:
+        return process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, 15)
+        else:
+            process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+        if process.poll() is None:
+            if os.name == "posix":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+            else:
+                process.kill()
+            process.wait()
         return 124
 
 
@@ -2248,23 +2838,33 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--json", action="store_true")
 
     plan_parser = subparsers.add_parser("plan", help="plan setup changes")
-    plan_parser.add_argument("--setup", required=True, choices=setup_ids())
+    plan_parser.add_argument("--setup", default=DEFAULT_SETUP_ID, choices=setup_ids())
+    plan_parser.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_ids())
     plan_parser.add_argument("--target", required=True)
     plan_parser.add_argument("--json", action="store_true")
 
     install_parser = subparsers.add_parser(
         "install", help="install a setup into an explicit target"
     )
-    install_parser.add_argument("--setup", required=True, choices=setup_ids())
+    install_parser.add_argument("--setup", default=DEFAULT_SETUP_ID, choices=setup_ids())
+    install_parser.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_ids())
     install_parser.add_argument("--target", required=True)
     install_parser.add_argument("--json", action="store_true")
 
     switch_parser = subparsers.add_parser(
-        "switch", help="switch an installed target to another setup"
+        "switch", help="switch an installed target to another setup/profile"
     )
-    switch_parser.add_argument("--setup", required=True, choices=setup_ids())
+    switch_parser.add_argument("--setup", default=DEFAULT_SETUP_ID, choices=setup_ids())
+    switch_parser.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_ids())
     switch_parser.add_argument("--target", required=True)
     switch_parser.add_argument("--json", action="store_true")
+
+    migrate_parser = subparsers.add_parser(
+        "migrate", help="migrate legacy managed state to nddev-builder setup/profile"
+    )
+    migrate_parser.add_argument("--profile", choices=profile_ids())
+    migrate_parser.add_argument("--target", required=True)
+    migrate_parser.add_argument("--json", action="store_true")
 
     restore_parser = subparsers.add_parser("restore", help="restore one target-bound backup slot")
     restore_parser.add_argument("--backup", required=True, type=int)
@@ -2277,8 +2877,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     for command, help_text in (
         ("software-status", "inspect target-owned Kilo CLI software"),
-        ("install-cli", "install pinned Kilo CLI package with Bun"),
-        ("update-cli", "update or repair target-owned Kilo CLI package with Bun"),
+        ("install-cli", "install pinned Kilo CLI package with isolated npm"),
+        ("update-cli", "update or repair target-owned Kilo CLI package with isolated npm"),
         ("remove-cli", "remove target-owned Kilo CLI software"),
     ):
         command_parser = subparsers.add_parser(command, help=help_text)
@@ -2307,13 +2907,20 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(status_payload(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "plan":
-        print_payload(plan_payload(Path(args.target), args.setup), as_json=args.json)
+        print_payload(plan_payload(Path(args.target), args.setup, args.profile), as_json=args.json)
         return 0
     if args.command == "install":
-        print_payload(mutate_setup(Path(args.target), args.setup, "install"), as_json=args.json)
+        print_payload(
+            mutate_setup(Path(args.target), args.setup, args.profile, "install"), as_json=args.json
+        )
         return 0
     if args.command == "switch":
-        print_payload(mutate_setup(Path(args.target), args.setup, "switch"), as_json=args.json)
+        print_payload(
+            mutate_setup(Path(args.target), args.setup, args.profile, "switch"), as_json=args.json
+        )
+        return 0
+    if args.command == "migrate":
+        print_payload(migrate_setup(Path(args.target), args.profile), as_json=args.json)
         return 0
     if args.command == "restore":
         print_payload(restore_setup(Path(args.target), args.backup), as_json=args.json)

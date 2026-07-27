@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "id": "full-auto",
+  "description": "Default autonomous Kilo profile: native allow permissions, sandbox off, unrestricted network, and managed run --auto.",
+  "launch_auto": true
+}

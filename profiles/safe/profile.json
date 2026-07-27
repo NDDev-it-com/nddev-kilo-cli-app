@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Human-gated Kilo profile: native ask/deny permissions, sandbox on, and sandbox network denied.",
+  "launch_auto": false
+}

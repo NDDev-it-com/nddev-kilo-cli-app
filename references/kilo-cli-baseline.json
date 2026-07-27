@@ -1,15 +1,22 @@
 {
-  "schema_version": 1,
-  "verified_at": "2026-07-26",
+  "schema_version": 2,
+  "verified_at": "2026-07-27",
   "product": {
     "name": "Kilo Code CLI",
     "documented_command": "kilo",
     "docs_title": "Kilo Code CLI: Run the AI Coding Agent from Your Terminal",
-    "managed_install_command": "bun add --global --exact --trust @kilocode/cli@7.4.16"
+    "official_install_command": "npm install -g @kilocode/cli",
+    "managed_install_channel": "target-owned isolated npm global install"
   },
   "npm": {
     "package": "@kilocode/cli",
     "version": "7.4.16",
+    "dist_tags": {
+      "alpha": "0.0.5",
+      "next": "1.0.8",
+      "rc": "7.4.13",
+      "latest": "7.4.16"
+    },
     "bin": {
       "kilo": "bin/kilo",
       "kilocode": "bin/kilo"
@@ -20,87 +27,56 @@
     "dist": {
       "integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
       "shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
-      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz"
+      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
+      "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.16"
+    },
+    "optional_dependencies": {
+      "@kilocode/cli-darwin-arm64": "7.4.16",
+      "@kilocode/cli-darwin-x64": "7.4.16",
+      "@kilocode/cli-darwin-x64-baseline": "7.4.16",
+      "@kilocode/cli-linux-arm64": "7.4.16",
+      "@kilocode/cli-linux-arm64-musl": "7.4.16",
+      "@kilocode/cli-linux-x64": "7.4.16",
+      "@kilocode/cli-linux-x64-baseline": "7.4.16",
+      "@kilocode/cli-linux-x64-baseline-musl": "7.4.16",
+      "@kilocode/cli-linux-x64-musl": "7.4.16",
+      "@kilocode/cli-windows-arm64": "7.4.16",
+      "@kilocode/cli-windows-x64": "7.4.16",
+      "@kilocode/cli-windows-x64-baseline": "7.4.16"
     }
   },
-  "release": {
-    "repository": "https://github.com/Kilo-Org/kilocode",
-    "tag": "v7.4.16",
-    "published_at": "2026-07-24T15:55:38Z",
-    "cli_assets": [
-      {
-        "name": "kilo-darwin-arm64.zip",
-        "sha256": "09617440c98987418401c719f2884b4f5b35cac0518c8fbaf88f027ee7f6a704"
-      },
-      {
-        "name": "kilo-darwin-x64-baseline.zip",
-        "sha256": "3156636d416992ed3b45990423389013383e5f03b51a9fda49cc51da2fcda883"
-      },
-      {
-        "name": "kilo-darwin-x64.zip",
-        "sha256": "cdcec1e0aabee3712071af1772e611a7d118e0782fcc7074c66212c92ab1ccac"
-      },
-      {
-        "name": "kilo-linux-arm64-musl.tar.gz",
-        "sha256": "4aedc436782d849ed07febae2adc1fe20131fd628cf26f0c871314c299e94aad"
-      },
-      {
-        "name": "kilo-linux-arm64.tar.gz",
-        "sha256": "625653aa0cf3bc2096525b61faffc513fe089beeabf4c10b9aa94c1ec7d0e1cf"
-      },
-      {
-        "name": "kilo-linux-x64-baseline-musl.tar.gz",
-        "sha256": "da91ad9845bbdf5bcf9e5f95eec8722dcceb72efffc5c21921703ed456d636b5"
-      },
-      {
-        "name": "kilo-linux-x64-baseline.tar.gz",
-        "sha256": "004d277c6f054f963c656d0c4b515e74aef6aff6ceb823086a415b88efbffc42"
-      },
-      {
-        "name": "kilo-linux-x64-musl.tar.gz",
-        "sha256": "6416ebf76d491ba39a68b6a58678733bd8a1ed7578005e35e8a2bac5d1b3235f"
-      },
-      {
-        "name": "kilo-linux-x64.tar.gz",
-        "sha256": "dd233dbee98d19f35a62ad3fdc8bd4ed912a8300f0ddd61f432633fe148f136b"
-      },
-      {
-        "name": "kilo-windows-arm64.zip",
-        "sha256": "fddcd4ce1e76fad2d0f4d75509b08ee742f43a9b5fdb237de1adacbf3f19931c"
-      },
-      {
-        "name": "kilo-windows-x64-baseline.zip",
-        "sha256": "fb72613a136e49163df6b923a89ac924add75171f3fbb124fddc3296b89fda22"
-      },
-      {
-        "name": "kilo-windows-x64.zip",
-        "sha256": "10552edc9a50232267becee068d942ca599e18bfe9f942e1a8320c08256e30a5"
-      }
-    ]
+  "latest_release_observation": {
+    "cli_source": "https://registry.npmjs.org/@kilocode/cli",
+    "non_cli_source_not_used": "https://api.github.com/repos/Kilo-Org/kilocode/releases/latest",
+    "reason": "GitHub releases/latest can point at non-CLI artifacts such as JetBrains releases."
   },
   "native_surfaces": {
+    "config_schema": "https://app.kilo.ai/config.json",
+    "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/config.ts",
+    "config_parser": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/config/parse.ts",
     "config_file": "~/.config/kilo/kilo.jsonc",
-    "documented_compatibility_files": [
-      "~/.config/kilo/config.json",
-      "~/.config/kilo/kilo.json",
-      "kilo.jsonc"
-    ],
     "trusted_config_env": "KILO_CONFIG",
-    "permission": "permission.* with ask, allow, deny actions",
+    "permission": "permission values use ask, allow, and deny actions",
     "sandbox": "sandbox.enabled, sandbox.network, sandbox.writable_paths, sandbox.allowed_hosts",
-    "agents": "agent.<name>",
-    "skills": "skills.paths",
-    "commands": "command.<name>",
-    "mcp": "mcp.<name>",
-    "plugin_command": "kilo plugin",
+    "agents": "agent markdown files and agent.<name> config",
+    "skills": "skills.paths and local Agent Skills",
+    "commands": "command/*.md and command.<name> config",
+    "plugins": "plugin array with local file specs and plugin directories",
+    "mcp": "mcp.<name> local or remote config, intentionally absent from this setup",
+    "auth": "Kilo-owned provider auth, not managed by this module",
+    "memory": "Kilo-owned memory, not managed by this module",
     "marketplace": null
   },
   "sources": [
     "https://kilo.ai/docs/code-with-ai/platforms/cli",
-    "https://api.github.com/repos/Kilo-Org/kilocode/releases/latest",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/main/packages/opencode/package.json",
-    "https://registry.npmjs.org/@kilocode/cli/7.4.16",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/main/packages/core/src/v1/config/config.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/main/packages/opencode/src/index.ts"
+    "https://kilo.ai/docs/automate/extending/plugins",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/kilo-docs/markdoc/partials/install-cli.md",
+    "https://registry.npmjs.org/@kilocode/cli",
+    "https://registry.npmjs.org/@kilocode%2fcli/7.4.16",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/config.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/plugin/loader.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/plugin/shared.ts"
   ]
 }

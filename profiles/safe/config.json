@@ -1,0 +1,23 @@
+{
+  "permission": {
+    "agent_manager": "deny",
+    "bash": "ask",
+    "edit": "ask",
+    "external_directory": "deny",
+    "glob": "ask",
+    "grep": "ask",
+    "list": "ask",
+    "question": "ask",
+    "read": "ask",
+    "skill": "ask",
+    "task": "ask",
+    "webfetch": "ask",
+    "websearch": "ask"
+  },
+  "sandbox": {
+    "allowed_hosts": [],
+    "enabled": true,
+    "network": "deny",
+    "writable_paths": []
+  }
+}

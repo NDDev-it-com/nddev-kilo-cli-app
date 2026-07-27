@@ -1,5 +1,5 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "product_name": "nddev-kilo-cli-app",
   "github_repository": "NDDev-it-com/nddev-kilo-cli-app",
   "license": "AGPL-3.0-or-later",
@@ -10,8 +10,8 @@
     "official_source": {
       "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
       "repository": "https://github.com/Kilo-Org/kilocode",
-      "package_json": "https://raw.githubusercontent.com/Kilo-Org/kilocode/main/packages/opencode/package.json",
-      "npm": "https://registry.npmjs.org/@kilocode/cli/7.4.16"
+      "npm": "https://registry.npmjs.org/@kilocode%2fcli/7.4.16",
+      "latest_dist_tags": "https://registry.npmjs.org/@kilocode/cli"
     }
   },
   "runtime_launch": {
@@ -19,7 +19,7 @@
     "subcommand": [
       "run"
     ],
-    "auto_for_setups": [
+    "auto_for_profiles": [
       "full-auto"
     ],
     "config_env": "KILO_CONFIG",
@@ -32,6 +32,15 @@
   },
   "setup_system": {
     "setup_ids": [
+      "nddev-builder"
+    ],
+    "default_setup": "nddev-builder",
+    "permission_profiles": [
+      "full-auto",
+      "safe"
+    ],
+    "default_permission_profile": "full-auto",
+    "legacy_setup_ids": [
       "safe",
       "balanced",
       "full-auto"
@@ -42,6 +51,7 @@
       "plan",
       "install",
       "switch",
+      "migrate",
       "restore",
       "remove",
       "software-status",
@@ -59,8 +69,31 @@
     "backup_envelope": "NDDEV-KILO-CLI-BACKUP.json",
     "managed_files": [
       "xdg-config/kilo/kilo.jsonc",
+      "AGENTS.md",
       "instructions/nddev-builder.md",
-      "skills/nddev-builder/SKILL.md"
+      "skills/nddev-builder/SKILL.md",
+      "skills/nddev-builder/references/config.md",
+      "skills/nddev-builder/references/permissions-sandbox.md",
+      "skills/nddev-builder/references/agents-subagents.md",
+      "skills/nddev-builder/references/skills.md",
+      "skills/nddev-builder/references/commands.md",
+      "skills/nddev-builder/references/plugins-hooks.md",
+      "skills/nddev-builder/references/mcp-boundary.md",
+      "skills/nddev-builder/references/auth-boundary.md",
+      "skills/nddev-builder/references/memory-context.md",
+      "skills/nddev-builder/references/install-runtime.md",
+      "skills/nddev-builder/references/migration-validation.md",
+      "skills/nddev-kilo-config/SKILL.md",
+      "skills/nddev-kilo-permissions/SKILL.md",
+      "skills/nddev-kilo-agents/SKILL.md",
+      "skills/nddev-kilo-plugins/SKILL.md",
+      "skills/nddev-kilo-runtime/SKILL.md",
+      "xdg-config/kilo/agent/nddev-builder.md",
+      "xdg-config/kilo/agent/nddev-reviewer.md",
+      "xdg-config/kilo/command/nddev-builder.md",
+      "xdg-config/kilo/command/nddev-check.md",
+      "xdg-config/kilo/command/nddev-migrate.md",
+      "xdg-config/kilo/nddev-builder-plugin.js"
     ],
     "managed_config_keys": [
       "permission",
@@ -70,6 +103,7 @@
       "skills",
       "command",
       "instructions",
+      "plugin",
       "experimental"
     ]
   },
@@ -78,12 +112,14 @@
     "version": "7.4.16",
     "command": "kilo",
     "official_alias": "kilocode",
-    "install_tool": "bun",
+    "install_tool": "npm",
     "install_argv": [
-      "add",
+      "install",
       "--global",
-      "--exact",
-      "--trust",
+      "--save-exact",
+      "--audit=false",
+      "--fund=false",
+      "--registry=https://registry.npmjs.org/",
       "@kilocode/cli@7.4.16"
     ],
     "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
@@ -91,27 +127,39 @@
     "stage_version_probe_timeout_seconds": 60,
     "layout": {
       "bin": "bin/kilo",
-      "global_dir": "install/global",
+      "global_dir": "install/npm-prefix",
+      "package_lock": "software/package-lock.json",
       "manifest": "software/kilo-cli.json"
     },
+    "official_postinstall": true,
     "status_executes_binary": false,
     "stage_version_probe": true,
     "target_owned": true
   },
   "builder": {
     "enabled_by_default": true,
-    "projection": "native-agent-skill-command-config",
+    "projection": "native-agent-skill-command-plugin-config",
     "native_surfaces": [
-      "agent",
+      "AGENTS.md",
+      "agent files",
       "skills.paths",
-      "command",
+      "command files",
+      "plugin",
       "permission",
       "sandbox"
     ],
     "marketplace": null,
-    "plugin": null,
     "mcp": null,
-    "vscode_extensions": null
+    "vscode_extensions": null,
+    "plugin": {
+      "kind": "local-file",
+      "path": "xdg-config/kilo/nddev-builder-plugin.js",
+      "config_spec": "./nddev-builder-plugin.js",
+      "allowed_hooks": [
+        "experimental.session.compacting"
+      ],
+      "external_imports": false
+    }
   },
   "safety": {
     "preserve_unmanaged_config_keys": true,
@@ -123,6 +171,7 @@
     "reject_managed_hardlink": true,
     "drift_detection": true,
     "rollback_on_mutation_failure": true,
+    "legacy_launch_denial": true,
     "live_state_default": "never"
   }
 }

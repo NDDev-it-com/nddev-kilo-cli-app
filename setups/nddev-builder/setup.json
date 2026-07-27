@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "id": "nddev-builder",
+  "description": "Kilo Code CLI setup for NDDev builder content with orthogonal permission profiles.",
+  "default_permission_profile": "full-auto",
+  "available_permission_profiles": [
+    "full-auto",
+    "safe"
+  ],
+  "managed_files": [
+    "xdg-config/kilo/kilo.jsonc",
+    "AGENTS.md",
+    "instructions/nddev-builder.md",
+    "skills/nddev-builder/SKILL.md",
+    "skills/nddev-builder/references/config.md",
+    "skills/nddev-builder/references/permissions-sandbox.md",
+    "skills/nddev-builder/references/agents-subagents.md",
+    "skills/nddev-builder/references/skills.md",
+    "skills/nddev-builder/references/commands.md",
+    "skills/nddev-builder/references/plugins-hooks.md",
+    "skills/nddev-builder/references/mcp-boundary.md",
+    "skills/nddev-builder/references/auth-boundary.md",
+    "skills/nddev-builder/references/memory-context.md",
+    "skills/nddev-builder/references/install-runtime.md",
+    "skills/nddev-builder/references/migration-validation.md",
+    "skills/nddev-kilo-config/SKILL.md",
+    "skills/nddev-kilo-permissions/SKILL.md",
+    "skills/nddev-kilo-agents/SKILL.md",
+    "skills/nddev-kilo-plugins/SKILL.md",
+    "skills/nddev-kilo-runtime/SKILL.md",
+    "xdg-config/kilo/agent/nddev-builder.md",
+    "xdg-config/kilo/agent/nddev-reviewer.md",
+    "xdg-config/kilo/command/nddev-builder.md",
+    "xdg-config/kilo/command/nddev-check.md",
+    "xdg-config/kilo/command/nddev-migrate.md",
+    "xdg-config/kilo/nddev-builder-plugin.js"
+  ],
+  "managed_config_keys": [
+    "permission",
+    "sandbox",
+    "default_agent",
+    "agent",
+    "skills",
+    "command",
+    "instructions",
+    "plugin",
+    "experimental"
+  ],
+  "builder_enabled": true,
+  "builder_projection": "native-agent-skill-command-plugin-config",
+  "native_surfaces": [
+    "AGENTS.md",
+    "agent",
+    "skills.paths",
+    "command files",
+    "plugin",
+    "permission",
+    "sandbox"
+  ]
+}

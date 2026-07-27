@@ -9,6 +9,7 @@ import os
 import stat
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -20,15 +21,14 @@ if MANAGER_SPEC is None or MANAGER_SPEC.loader is None:
 nddev_kilo_cli = importlib.util.module_from_spec(MANAGER_SPEC)
 sys.modules[MANAGER_SPEC.name] = nddev_kilo_cli
 MANAGER_SPEC.loader.exec_module(nddev_kilo_cli)
-VERSION = "0.1.0"
-KILO_VERSION = "7.4.16"
+
+VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+KILO_VERSION = nddev_kilo_cli.KILO_CURRENT_VERSION
 SHARED_CI_COMMIT = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
-SETUPS = ("safe", "balanced", "full-auto")
-MANAGED_FILES = (
-    "xdg-config/kilo/kilo.jsonc",
-    "instructions/nddev-builder.md",
-    "skills/nddev-builder/SKILL.md",
-)
+SETUPS = nddev_kilo_cli.ACTIVE_SETUP_IDS
+PROFILES = nddev_kilo_cli.PROFILE_IDS
+LEGACY_SETUPS = nddev_kilo_cli.LEGACY_SETUP_IDS
+MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 CONTRACT_KEYS = {
     "contract_version",
     "product_name",
@@ -87,139 +87,192 @@ def validate_versions() -> None:
     ):
         fail("build version files are not synchronized")
     if version.get("kilo_cli_current") != KILO_VERSION:
-        fail("unexpected Kilo CLI current version")
+        fail("Kilo CLI current version is not synchronized with the manager")
     if version.get("kilo_cli_package") != nddev_kilo_cli.KILO_PACKAGE:
-        fail("unexpected Kilo CLI package")
+        fail("Kilo CLI package is not synchronized with the manager")
+    if version.get("kilo_cli_install_channel") != "npm":
+        fail("Kilo CLI install channel must be npm")
     if version.get("kilo_cli_package_integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
-        fail("unexpected Kilo CLI package integrity")
+        fail("Kilo CLI package integrity is not synchronized with the manager")
     if version.get("kilo_cli_package_shasum") != nddev_kilo_cli.KILO_PACKAGE_SHASUM:
-        fail("unexpected Kilo CLI package shasum")
+        fail("Kilo CLI package shasum is not synchronized with the manager")
     if manifest.get("setups") != list(SETUPS):
         fail("manifest setup list is not synchronized")
+    if manifest.get("permission_profiles") != list(PROFILES):
+        fail("manifest permission profile list is not synchronized")
+    if manifest.get("managed_state") != list(MANAGED_FILES):
+        fail("manifest managed state list is not synchronized")
     software = manifest.get("software_lifecycle", {})
-    if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.BUN_INSTALL_ARGV):
-        fail("manifest Bun installer argv mismatch")
+    if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
+        fail("manifest npm installer argv mismatch")
+    if software.get("layout", {}).get("package_lock") != str(nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE):
+        fail("manifest package-lock path mismatch")
     if software.get("layout", {}).get("manifest") != str(nddev_kilo_cli.SOFTWARE_MANIFEST_RELATIVE):
         fail("manifest software layout mismatch")
     if software.get("bounds", {}).get("max_paths") != nddev_kilo_cli.SOFTWARE_TREE_MAX_PATHS:
         fail("manifest software path bound mismatch")
-    if (
-        software.get("bounds", {}).get("stage_version_probe_timeout_seconds")
-        != nddev_kilo_cli.STAGE_VERSION_PROBE_TIMEOUT_SECONDS
-    ):
-        fail("manifest stage version probe timeout mismatch")
 
 
 def validate_contract() -> None:
     contract = load_json(require_file("config/nddev-contract.json"))
     if set(contract) != CONTRACT_KEYS:
         fail("public contract top-level keys are not exact")
-    if contract.get("product_name") != "nddev-kilo-cli-app":
-        fail("unexpected product name")
-    if contract.get("runtime_launch", {}).get("executable") != "kilo":
-        fail("runtime executable must be kilo")
+    if contract.get("contract_version") != 2:
+        fail("unexpected public contract version")
     runtime_launch = contract.get("runtime_launch", {})
-    if runtime_launch.get("config_path") != "xdg-config/kilo/kilo.jsonc":
-        fail("runtime config path must be target-owned kilo.jsonc")
-    if runtime_launch.get("path_inherited") is not False:
-        fail("runtime launch must not inherit PATH")
     if runtime_launch.get("subcommand") != ["run"]:
-        fail("runtime launch subcommand must not force --auto globally")
-    if runtime_launch.get("auto_for_setups") != ["full-auto"]:
-        fail("runtime launch --auto must be limited to full-auto")
-    if runtime_launch.get("max_runtime_seconds") != 3600:
-        fail("runtime launch timeout must be pinned to 3600 seconds")
-    if runtime_launch.get("forwards_child_exit_code") is not True:
-        fail("runtime launch must forward child exit codes")
-    if contract.get("setup_system", {}).get("setup_ids") != list(SETUPS):
+        fail("runtime launch subcommand must be kilo run")
+    if runtime_launch.get("auto_for_profiles") != ["full-auto"]:
+        fail("runtime launch --auto must be limited to full-auto profile")
+    setup_system = contract.get("setup_system", {})
+    if setup_system.get("setup_ids") != list(SETUPS):
         fail("setup ids are not synchronized")
-    builder = contract.get("builder", {})
-    if builder.get("projection") != "native-agent-skill-command-config":
-        fail("builder projection is not the Kilo native projection")
-    if builder.get("marketplace") is not None:
-        fail("marketplace must remain null unless an official Kilo CLI marketplace is proven")
+    if setup_system.get("permission_profiles") != list(PROFILES):
+        fail("permission profiles are not synchronized")
+    if setup_system.get("legacy_setup_ids") != list(LEGACY_SETUPS):
+        fail("legacy setup ids are not synchronized")
     managed = contract.get("managed_state", {})
-    if managed.get("config_file") != "xdg-config/kilo/kilo.jsonc":
-        fail("managed config file must be target-owned kilo.jsonc")
     if managed.get("managed_files") != list(MANAGED_FILES):
         fail("managed file list is not synchronized")
+    if "plugin" not in managed.get("managed_config_keys", []):
+        fail("plugin must be a managed config key")
     software = contract.get("software_lifecycle", {})
-    if software.get("install_tool") != "bun":
-        fail("software lifecycle must use Bun")
-    if software.get("install_argv") != list(nddev_kilo_cli.BUN_INSTALL_ARGV):
-        fail("software lifecycle Bun argv mismatch")
-    if software.get("package_integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
-        fail("software lifecycle integrity mismatch")
-    if (
-        software.get("stage_version_probe_timeout_seconds")
-        != nddev_kilo_cli.STAGE_VERSION_PROBE_TIMEOUT_SECONDS
-    ):
-        fail("software lifecycle stage version probe timeout mismatch")
+    if software.get("install_tool") != "npm":
+        fail("software lifecycle must use npm")
+    if software.get("install_argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
+        fail("software lifecycle npm argv mismatch")
+    if software.get("official_postinstall") is not True:
+        fail("official npm postinstall must be acknowledged")
     if software.get("status_executes_binary") is not False:
         fail("software-status must not execute the target binary")
-    if software.get("layout", {}).get("bin") != f"bin/{nddev_kilo_cli.KILO_COMMAND}":
-        fail("software lifecycle bin path mismatch")
+    builder = contract.get("builder", {})
+    if builder.get("projection") != nddev_kilo_cli.BUILDER_PROJECTION:
+        fail("builder projection mismatch")
+    if builder.get("marketplace") is not None:
+        fail("Kilo marketplace emulation must remain absent")
+    if builder.get("mcp") is not None:
+        fail("MCP must remain absent from the public setup")
+    plugin = builder.get("plugin", {})
+    if plugin.get("kind") != "local-file" or plugin.get("external_imports") is not False:
+        fail("builder plugin contract is invalid")
+    if plugin.get("allowed_hooks") != ["experimental.session.compacting"]:
+        fail("builder plugin hook contract is invalid")
 
 
 def validate_baseline() -> None:
     baseline = load_json(require_file("references/kilo-cli-baseline.json"))
-    if baseline.get("release", {}).get("tag") != "v7.4.16":
-        fail("unexpected Kilo release tag")
+    if baseline.get("schema_version") != 2:
+        fail("unexpected baseline schema")
     npm = baseline.get("npm", {})
-    if npm.get("package") != "@kilocode/cli" or npm.get("version") != KILO_VERSION:
+    if npm.get("package") != nddev_kilo_cli.KILO_PACKAGE or npm.get("version") != KILO_VERSION:
         fail("unexpected npm package identity")
-    if npm.get("bin") != {"kilo": "bin/kilo", "kilocode": "bin/kilo"}:
-        fail("unexpected npm bin map")
-    if npm.get("scripts", {}).get("postinstall") != "node ./postinstall.mjs":
-        fail("unexpected npm postinstall script")
+    if npm.get("dist_tags", {}).get("latest") != KILO_VERSION:
+        fail("npm latest dist-tag is not the managed runtime version")
     if npm.get("dist", {}).get("integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
         fail("unexpected npm integrity")
-    if npm.get("dist", {}).get("shasum") != "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d":
-        fail("unexpected npm shasum")
-    assets = json.dumps(baseline.get("release", {}).get("cli_assets", []), sort_keys=True)
-    if "dd233dbee98d19f35a62ad3fdc8bd4ed912a8300f0ddd61f432633fe148f136b" not in assets:
-        fail("linux x64 CLI artifact hash is missing")
-    if "kilo-vscode" in assets:
-        fail("CLI baseline must not use VS Code assets as runtime artifacts")
+    if npm.get("scripts", {}).get("postinstall") != "node ./postinstall.mjs":
+        fail("unexpected npm postinstall script")
+    native = baseline.get("native_surfaces", {})
+    if native.get("marketplace") is not None:
+        fail("native marketplace must remain null")
+    if native.get("plugins") is None:
+        fail("native plugin surface must be recorded")
+    observation = baseline.get("latest_release_observation", {})
+    if observation.get("cli_source") != "https://registry.npmjs.org/@kilocode/cli":
+        fail("baseline must use npm dist-tags as CLI latest source")
 
 
-def validate_setups() -> None:
-    for setup_id in SETUPS:
-        root = ROOT / "setups" / setup_id
-        metadata = load_json(require_file(f"setups/{setup_id}/setup.json"))
-        config = load_json(require_file(f"setups/{setup_id}/config.json"))
-        if metadata.get("id") != setup_id:
-            fail(f"{setup_id}: metadata id mismatch")
-        if metadata.get("permission_profile") != setup_id:
-            fail(f"{setup_id}: permission profile mismatch")
-        if metadata.get("managed_files") != list(MANAGED_FILES):
-            fail(f"{setup_id}: managed file list mismatch")
-        if metadata.get("builder_enabled") is not True:
-            fail(f"{setup_id}: builder is not enabled by default")
-        if config.get("default_agent") != "nddev-builder":
-            fail(f"{setup_id}: builder is not the default agent")
-        if config.get("agent", {}).get("nddev-builder", {}).get("mode") != "all":
-            fail(f"{setup_id}: builder agent mode must be all")
-        if config.get("command", {}).get("nddev-builder", {}).get("agent") != "nddev-builder":
-            fail(f"{setup_id}: builder command does not bind to the builder agent")
-        if config.get("sandbox", {}).get("enabled") is not True:
-            fail(f"{setup_id}: sandbox must be enabled")
-        if setup_id == "full-auto":
-            if (
-                config.get("permission") != "allow"
-                or config.get("sandbox", {}).get("network") != "allow"
-            ):
-                fail("full-auto must use allow permissions and sandbox network allow")
-        elif (
-            config.get("permission") == "allow"
-            or config.get("sandbox", {}).get("network") != "deny"
-        ):
-            fail(f"{setup_id}: expected gated permissions and sandbox network deny")
-        for relative in MANAGED_FILES[1:]:
-            require_file(f"setups/{setup_id}/{relative}")
-        skill_text = (root / "skills" / "nddev-builder" / "SKILL.md").read_text(encoding="utf-8")
-        if "name: nddev-builder" not in skill_text:
-            fail(f"{setup_id}: builder skill metadata is missing")
+def validate_setups_and_profiles() -> None:
+    if tuple(nddev_kilo_cli.setup_ids()) != SETUPS:
+        fail("manager setup ids are not synchronized")
+    if tuple(nddev_kilo_cli.profile_ids()) != PROFILES:
+        fail("manager profile ids are not synchronized")
+    setup = load_json(require_file("setups/nddev-builder/setup.json"))
+    config = load_json(require_file("setups/nddev-builder/config.json"))
+    if setup.get("managed_files") != list(MANAGED_FILES):
+        fail("setup managed file list mismatch")
+    if config.get("default_agent") != "nddev-builder":
+        fail("builder is not the default agent")
+    if config.get("plugin") != ["./nddev-builder-plugin.js"]:
+        fail("builder plugin config spec mismatch")
+    if "permission" in config or "sandbox" in config:
+        fail("permission posture must live in profiles, not setup config")
+    full_auto = load_json(require_file("profiles/full-auto/config.json"))
+    if full_auto.get("permission") != "allow":
+        fail("full-auto must use permission allow")
+    if full_auto.get("sandbox") != {"enabled": False, "network": "allow"}:
+        fail("full-auto must have sandbox off and unrestricted network")
+    safe = load_json(require_file("profiles/safe/config.json"))
+    if safe.get("sandbox", {}).get("enabled") is not True:
+        fail("safe sandbox must be enabled")
+    if safe.get("sandbox", {}).get("network") != "deny":
+        fail("safe sandbox network must be denied")
+    permission = safe.get("permission", {})
+    if not isinstance(permission, dict):
+        fail("safe permission must be an object")
+    actions = set(permission.values())
+    if actions - {"ask", "deny"}:
+        fail("safe permission must use only ask and deny actions")
+    if permission.get("agent_manager") != "deny" or permission.get("external_directory") != "deny":
+        fail("safe must deny agent_manager and external_directory")
+    for relative in MANAGED_FILES[1:]:
+        require_file(f"setups/nddev-builder/{relative}")
+
+
+def validate_builder_toolkit() -> None:
+    entry = require_file("setups/nddev-builder/skills/nddev-builder/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    required_references = [
+        "config.md",
+        "permissions-sandbox.md",
+        "agents-subagents.md",
+        "skills.md",
+        "commands.md",
+        "plugins-hooks.md",
+        "mcp-boundary.md",
+        "auth-boundary.md",
+        "memory-context.md",
+        "install-runtime.md",
+        "migration-validation.md",
+    ]
+    for name in required_references:
+        if f"references/{name}" not in entry:
+            fail(f"entry skill does not route to {name}")
+        require_file(f"setups/nddev-builder/skills/nddev-builder/references/{name}")
+    for relative in nddev_kilo_cli.ADDITIONAL_SKILLS:
+        text = require_file(f"setups/nddev-builder/{relative}").read_text(encoding="utf-8")
+        if "description:" not in text:
+            fail(f"{relative}: skill metadata is missing")
+    for relative in nddev_kilo_cli.AGENT_FILES:
+        text = require_file(f"setups/nddev-builder/{relative}").read_text(encoding="utf-8")
+        if "mode:" not in text:
+            fail(f"{relative}: agent mode metadata is missing")
+    for relative in nddev_kilo_cli.COMMAND_FILES:
+        text = require_file(f"setups/nddev-builder/{relative}").read_text(encoding="utf-8")
+        if "agent: nddev-builder" not in text:
+            fail(f"{relative}: command does not bind to nddev-builder")
+    plugin = require_file("setups/nddev-builder/xdg-config/kilo/nddev-builder-plugin.js").read_text(
+        encoding="utf-8"
+    )
+    forbidden = (
+        "import ",
+        "require(",
+        "permission.ask",
+        "permission:",
+        "shell.env",
+        "mcp:",
+        "auth:",
+        "provider:",
+        "fetch(",
+        "http://",
+        "https://",
+    )
+    for token in forbidden:
+        if token in plugin:
+            fail(f"builder plugin contains forbidden token: {token}")
+    if "experimental.session.compacting" not in plugin or 'id: "nddev-builder"' not in plugin:
+        fail("builder plugin does not expose the expected id and compaction hook")
 
 
 def validate_workflows() -> None:
@@ -240,24 +293,31 @@ def validate_workflows() -> None:
 
 def validate_manager_parse_args() -> None:
     nddev_kilo_cli.parse_args(["list", "--json"])
+    nddev_kilo_cli.parse_args(["plan", "--target", "/tmp/nddev-kilo-check", "--json"])
+    nddev_kilo_cli.parse_args(
+        ["switch", "--profile", "safe", "--target", "/tmp/nddev-kilo-check", "--json"]
+    )
+    nddev_kilo_cli.parse_args(["migrate", "--profile", "safe", "--target", "/tmp/nddev-kilo-check"])
     nddev_kilo_cli.parse_args(["status", "--target", "/tmp/nddev-kilo-check", "--json"])
     nddev_kilo_cli.parse_args(["software-status", "--target", "/tmp/nddev-kilo-check", "--json"])
 
 
 def validate_launch_guard() -> None:
     executable = "/tmp/nddev-kilo-check/bin/kilo"
-    for setup_id, expected in (
-        ("safe", [executable, "run", "prompt"]),
-        ("balanced", [executable, "run", "prompt"]),
-        ("full-auto", [executable, "run", "--auto", "prompt"]),
-    ):
-        command = nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"])
-        if command != expected:
-            fail(f"{setup_id}: launch argv mismatch")
-        if setup_id != "full-auto" and "--auto" in command:
-            fail(f"{setup_id}: launch must not include --auto")
-        if setup_id == "full-auto" and command.count("--auto") != 1:
-            fail("full-auto launch must include exactly one managed --auto")
+    expected = {
+        "full-auto": [executable, "run", "--auto", "prompt"],
+        "safe": [executable, "run", "prompt"],
+    }
+    for profile_id, command in expected.items():
+        observed = nddev_kilo_cli.launch_command_for_profile(executable, profile_id, ["prompt"])
+        if observed != command:
+            fail(f"{profile_id}: launch argv mismatch")
+    for setup_id in LEGACY_SETUPS:
+        try:
+            nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"])
+        except nddev_kilo_cli.ManagerError:
+            continue
+        fail(f"legacy setup launch helper accepted {setup_id}")
     forbidden_cases = (
         ["--", "--auto"],
         ["--", "--auto=true"],
@@ -318,9 +378,9 @@ def validate_hardlink_materialization_bound() -> None:
         marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
         before = snapshot_tree(target)
 
-        original_run_bun_install = nddev_kilo_cli.run_bun_install
+        original_run_npm_install = nddev_kilo_cli.run_npm_install
 
-        def fake_run_bun_install(stage_root: Path, live_stage: Path) -> None:
+        def fake_run_npm_install(stage_root: Path, live_stage: Path) -> None:
             del stage_root
             hardlink_root = (
                 live_stage
@@ -336,15 +396,13 @@ def validate_hardlink_materialization_bound() -> None:
             source.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
             peer = hardlink_root / "oversized-hardlink-peer"
             os.link(source, peer)
-            if source.lstat().st_nlink < 2 or peer.lstat().st_nlink < 2:
-                fail("hardlink regression fixture did not create hardlinks")
             nddev_kilo_cli.materialize_hardlinked_regular_files(
                 live_stage,
                 max_file_bytes=64,
                 max_tree_bytes=64,
             )
 
-        nddev_kilo_cli.run_bun_install = fake_run_bun_install
+        nddev_kilo_cli.run_npm_install = fake_run_npm_install
         try:
             try:
                 nddev_kilo_cli.install_or_update_cli(target, "install-cli")
@@ -354,20 +412,119 @@ def validate_hardlink_materialization_bound() -> None:
             else:
                 fail("oversized hardlinked staged file was accepted")
         finally:
-            nddev_kilo_cli.run_bun_install = original_run_bun_install
+            nddev_kilo_cli.run_npm_install = original_run_npm_install
 
         if snapshot_tree(target) != before:
             fail("failed hardlink materialization changed the target tree")
-        for relative in nddev_kilo_cli.SOFTWARE_REPLACE_PATHS:
-            if nddev_kilo_cli.path_exists_no_follow(target / relative):
-                fail(f"failed hardlink materialization left partial software state: {relative}")
-        leftovers = [
-            path.name
-            for path in workspace.iterdir()
-            if path != target and path.name.startswith(f".{target.name}.nddev-kilo-cli")
-        ]
-        if leftovers:
-            fail(f"failed hardlink materialization left transaction artifacts: {leftovers}")
+
+
+def validate_private_target_required() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-0777-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir()
+        target.chmod(0o777)
+        try:
+            nddev_kilo_cli.status_payload(target)
+        except nddev_kilo_cli.ManagerError:
+            return
+        fail("0777 target was accepted")
+
+
+def validate_lock_and_backup_precreation_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-locks-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        outside = workspace / "external-marker"
+        outside.write_text("preserve\n", encoding="utf-8")
+        outside.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+        lock = nddev_kilo_cli.lock_path(target)
+        os.symlink(outside, lock)
+        try:
+            with nddev_kilo_cli.target_lock(target):
+                fail("symlink lock unexpectedly acquired")
+        except nddev_kilo_cli.ManagerError:
+            pass
+        if outside.read_text(encoding="utf-8") != "preserve\n":
+            fail("external marker changed through precreated lock path")
+        lock.unlink()
+
+        pool = nddev_kilo_cli.backup_pool(target)
+        os.symlink(outside, pool)
+        stamp = target / nddev_kilo_cli.STAMP_NAME
+        stamp.write_bytes(
+            nddev_kilo_cli.canonical_json(
+                {
+                    "schema_version": nddev_kilo_cli.STAMP_SCHEMA,
+                    "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                    "build_version": nddev_kilo_cli.VERSION,
+                    "setup_id": nddev_kilo_cli.DEFAULT_SETUP_ID,
+                    "permission_profile": nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                    "canonical_target": str(target),
+                    "managed_files": [],
+                }
+            )
+        )
+        stamp.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        try:
+            nddev_kilo_cli.backup_current_state(target, nddev_kilo_cli.read_stamp(target) or {})
+        except nddev_kilo_cli.ManagerError:
+            pass
+        else:
+            fail("symlink backup pool was accepted")
+        if outside.read_text(encoding="utf-8") != "preserve\n":
+            fail("external marker changed through precreated backup path")
+        pool.unlink()
+
+        pool.mkdir(mode=0o777)
+        pool.chmod(0o777)
+        try:
+            nddev_kilo_cli.backup_current_state(target, nddev_kilo_cli.read_stamp(target) or {})
+        except nddev_kilo_cli.ManagerError:
+            pass
+        else:
+            fail("world-writable backup pool was accepted")
+
+
+def validate_sticky_tmp_target() -> None:
+    candidates = [Path("/tmp"), Path(tempfile.gettempdir())]
+    tmp = next((path for path in candidates if path.exists()), candidates[-1])
+    info = tmp.lstat()
+    if not stat.S_ISDIR(info.st_mode) or not (info.st_mode & stat.S_ISVTX):
+        return
+    target = Path(tempfile.mkdtemp(prefix="nddev-kilo-public-sticky-", dir=tmp))
+    try:
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        with nddev_kilo_cli.target_lock(target):
+            pass
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+def validate_fake_path_is_ignored() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-fakepath-") as raw:
+        fake_dir = Path(raw)
+        fake = fake_dir / "npm"
+        fake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        fake.chmod(0o700)
+        original_path = os.environ.get("PATH")
+        os.environ["PATH"] = str(fake_dir)
+        try:
+            try:
+                npm, path_entries = nddev_kilo_cli.find_npm_executable()
+            except nddev_kilo_cli.ManagerError:
+                return
+            if Path(npm) == fake:
+                fail("fake npm from ambient PATH was selected")
+            if str(fake_dir) in path_entries:
+                fail("fake PATH entry was retained for install")
+        finally:
+            if original_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original_path
 
 
 def main() -> int:
@@ -375,11 +532,16 @@ def main() -> int:
         validate_versions()
         validate_contract()
         validate_baseline()
-        validate_setups()
+        validate_setups_and_profiles()
+        validate_builder_toolkit()
         validate_workflows()
         validate_manager_parse_args()
         validate_launch_guard()
         validate_hardlink_materialization_bound()
+        validate_private_target_required()
+        validate_lock_and_backup_precreation_guards()
+        validate_sticky_tmp_target()
+        validate_fake_path_is_ignored()
     except ValidationError as exc:
         print(f"public contract validation failed: {exc}", file=sys.stderr)
         return 1

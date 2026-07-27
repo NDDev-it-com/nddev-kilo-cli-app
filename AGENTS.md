@@ -13,9 +13,11 @@ Use only current Kilo Code CLI names and documented surfaces:
 - `agent.<name>`
 - `skills.paths`
 - `command.<name>`
+- `plugin`
 - `permission.*`
 - `sandbox.*`
 
 Do not use VS Code extension surfaces as this CLI module's runtime contract.
-Do not invent marketplace or plugin formats for Kilo Code CLI; the public
-contract must keep unsupported native projections explicit and null.
+Do not invent marketplace formats for Kilo Code CLI. Use only the documented
+native plugin spec when a plugin is managed, and keep unsupported native
+projections explicit and null.

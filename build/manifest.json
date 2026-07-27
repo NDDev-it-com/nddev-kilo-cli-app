@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product_name": "nddev-kilo-cli-app",
-  "build_version": "0.1.0",
+  "build_version": "0.2.0",
   "runtime_baseline": "references/kilo-cli-baseline.json",
   "contract": "config/nddev-contract.json",
   "manager": "cli-tools/nddev_kilo_cli.py",
@@ -15,7 +15,7 @@
     "subcommand": [
       "run"
     ],
-    "auto_for_setups": [
+    "auto_for_profiles": [
       "full-auto"
     ]
   },
@@ -27,12 +27,14 @@
       "remove-cli"
     ],
     "installer": {
-      "tool": "bun",
+      "tool": "npm",
       "argv": [
-        "add",
+        "install",
         "--global",
-        "--exact",
-        "--trust",
+        "--save-exact",
+        "--audit=false",
+        "--fund=false",
+        "--registry=https://registry.npmjs.org/",
         "@kilocode/cli@7.4.16"
       ],
       "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
@@ -40,7 +42,8 @@
     },
     "layout": {
       "bin": "bin/kilo",
-      "global_dir": "install/global",
+      "global_dir": "install/npm-prefix",
+      "package_lock": "software/package-lock.json",
       "manifest": "software/kilo-cli.json"
     },
     "bounds": {
@@ -50,13 +53,38 @@
     }
   },
   "setups": [
-    "safe",
-    "balanced",
-    "full-auto"
+    "nddev-builder"
+  ],
+  "permission_profiles": [
+    "full-auto",
+    "safe"
   ],
   "managed_state": [
     "xdg-config/kilo/kilo.jsonc",
+    "AGENTS.md",
     "instructions/nddev-builder.md",
-    "skills/nddev-builder/SKILL.md"
+    "skills/nddev-builder/SKILL.md",
+    "skills/nddev-builder/references/config.md",
+    "skills/nddev-builder/references/permissions-sandbox.md",
+    "skills/nddev-builder/references/agents-subagents.md",
+    "skills/nddev-builder/references/skills.md",
+    "skills/nddev-builder/references/commands.md",
+    "skills/nddev-builder/references/plugins-hooks.md",
+    "skills/nddev-builder/references/mcp-boundary.md",
+    "skills/nddev-builder/references/auth-boundary.md",
+    "skills/nddev-builder/references/memory-context.md",
+    "skills/nddev-builder/references/install-runtime.md",
+    "skills/nddev-builder/references/migration-validation.md",
+    "skills/nddev-kilo-config/SKILL.md",
+    "skills/nddev-kilo-permissions/SKILL.md",
+    "skills/nddev-kilo-agents/SKILL.md",
+    "skills/nddev-kilo-plugins/SKILL.md",
+    "skills/nddev-kilo-runtime/SKILL.md",
+    "xdg-config/kilo/agent/nddev-builder.md",
+    "xdg-config/kilo/agent/nddev-reviewer.md",
+    "xdg-config/kilo/command/nddev-builder.md",
+    "xdg-config/kilo/command/nddev-check.md",
+    "xdg-config/kilo/command/nddev-migrate.md",
+    "xdg-config/kilo/nddev-builder-plugin.js"
   ]
 }
