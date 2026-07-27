@@ -88,6 +88,7 @@
     ],
     "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
     "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
+    "stage_version_probe_timeout_seconds": 60,
     "layout": {
       "bin": "bin/kilo",
       "global_dir": "install/global",

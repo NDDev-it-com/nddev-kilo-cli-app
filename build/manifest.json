@@ -45,7 +45,8 @@
     },
     "bounds": {
       "max_paths": 120000,
-      "max_bytes": 1073741824
+      "max_bytes": 1073741824,
+      "stage_version_probe_timeout_seconds": 60
     }
   },
   "setups": [

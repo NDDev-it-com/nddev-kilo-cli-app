@@ -103,6 +103,11 @@ def validate_versions() -> None:
         fail("manifest software layout mismatch")
     if software.get("bounds", {}).get("max_paths") != nddev_kilo_cli.SOFTWARE_TREE_MAX_PATHS:
         fail("manifest software path bound mismatch")
+    if (
+        software.get("bounds", {}).get("stage_version_probe_timeout_seconds")
+        != nddev_kilo_cli.STAGE_VERSION_PROBE_TIMEOUT_SECONDS
+    ):
+        fail("manifest stage version probe timeout mismatch")
 
 
 def validate_contract() -> None:
@@ -145,6 +150,11 @@ def validate_contract() -> None:
         fail("software lifecycle Bun argv mismatch")
     if software.get("package_integrity") != nddev_kilo_cli.KILO_PACKAGE_INTEGRITY:
         fail("software lifecycle integrity mismatch")
+    if (
+        software.get("stage_version_probe_timeout_seconds")
+        != nddev_kilo_cli.STAGE_VERSION_PROBE_TIMEOUT_SECONDS
+    ):
+        fail("software lifecycle stage version probe timeout mismatch")
     if software.get("status_executes_binary") is not False:
         fail("software-status must not execute the target binary")
     if software.get("layout", {}).get("bin") != f"bin/{nddev_kilo_cli.KILO_COMMAND}":

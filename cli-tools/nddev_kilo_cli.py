@@ -69,6 +69,7 @@ BUN_INSTALL_ARGV = ("add", "--global", "--exact", "--trust", KILO_PACKAGE_SPEC)
 CONTROLLED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 PROCESS_OUTPUT_MAX_BYTES = 256 * 1024
 PROCESS_TIMEOUT_SECONDS = 180
+STAGE_VERSION_PROBE_TIMEOUT_SECONDS = 60
 SOFTWARE_TREE_MAX_BYTES = 1024 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 120000
 SOFTWARE_GLOBAL_DIR_RELATIVE = Path("install") / "global"
@@ -1973,7 +1974,7 @@ def observed_kilo_version(executable: Path, target: Path) -> str:
         [str(executable), "--version"],
         cwd=target,
         env=launch_environment(target),
-        timeout=20,
+        timeout=STAGE_VERSION_PROBE_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
         fail(f"Kilo CLI version smoke failed with exit {completed.returncode}")
