@@ -25,6 +25,6 @@ jobs:
       package_name: nddev-kilo-cli-app
       archive_paths: >-
         README.md LICENSE VERSION CHANGELOG.md SECURITY.md AGENTS.md .gitignore
-        .gds .github build cli-tools config docs profiles references setups
+        .claude .gds .github build cli-tools config docs profiles references setups
       runtime_paths: >-
-        README.md LICENSE VERSION build cli-tools config docs profiles references setups
+        README.md LICENSE VERSION .claude build cli-tools config docs profiles references setups

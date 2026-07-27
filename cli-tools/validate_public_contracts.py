@@ -437,6 +437,12 @@ def validate_builder_toolkit() -> None:
         fail("builder plugin does not expose the expected id and compaction hook")
 
 
+def validate_claude_bridge() -> None:
+    bridge = require_file(".claude/CLAUDE.md")
+    if bridge.read_bytes() != b"@../AGENTS.md\n":
+        fail(".claude/CLAUDE.md must contain exactly '@../AGENTS.md\\n'")
+
+
 def validate_workflows() -> None:
     workflows = (
         ".github/workflows/actionlint.yml",
@@ -465,6 +471,7 @@ def validate_workflows() -> None:
         "README.md",
         "LICENSE",
         "VERSION",
+        ".claude",
         "build",
         "cli-tools",
         "config",
@@ -482,7 +489,7 @@ def validate_workflows() -> None:
 
 def release_path_is_safe(relative: str) -> bool:
     path = Path(relative)
-    return not path.is_absolute() and all(part not in {"", ".", ".."} for part in path.parts)
+    return not path.is_absolute() and all(part not in {"", ".", "..", ".git"} for part in path.parts)
 
 
 def release_required_source_files() -> set[str]:
@@ -2274,6 +2281,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_setups_and_profiles()
         validate_managed_source_exact_bytes()
         validate_builder_toolkit()
+        validate_claude_bridge()
         validate_workflows()
         validate_release_archive_exact_bytes()
         validate_manager_parse_args()
