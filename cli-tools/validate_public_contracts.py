@@ -438,9 +438,33 @@ def validate_builder_toolkit() -> None:
 
 
 def validate_claude_bridge() -> None:
-    bridge = require_file(".claude/CLAUDE.md")
+    bridge_root = ROOT / ".claude"
+    try:
+        bridge_root_info = bridge_root.lstat()
+    except FileNotFoundError:
+        fail(".claude directory is missing")
+    if stat.S_ISLNK(bridge_root_info.st_mode) or not stat.S_ISDIR(bridge_root_info.st_mode):
+        fail(".claude must be a real directory, not a symlink")
+    if sorted(path.name for path in bridge_root.iterdir()) != ["CLAUDE.md"]:
+        fail('.claude must contain exactly ["CLAUDE.md"]')
+
+    bridge = bridge_root / "CLAUDE.md"
+    try:
+        bridge_info = bridge.lstat()
+    except FileNotFoundError:
+        fail(".claude/CLAUDE.md is missing")
+    if stat.S_ISLNK(bridge_info.st_mode) or not stat.S_ISREG(bridge_info.st_mode):
+        fail(".claude/CLAUDE.md must be a real regular file, not a symlink")
     if bridge.read_bytes() != b"@../AGENTS.md\n":
         fail(".claude/CLAUDE.md must contain exactly '@../AGENTS.md\\n'")
+
+    agents = ROOT / "AGENTS.md"
+    try:
+        agents_info = agents.lstat()
+    except FileNotFoundError:
+        fail("AGENTS.md is missing")
+    if stat.S_ISLNK(agents_info.st_mode) or not stat.S_ISREG(agents_info.st_mode):
+        fail("AGENTS.md must be a real regular file, not a symlink")
 
 
 def validate_workflows() -> None:
