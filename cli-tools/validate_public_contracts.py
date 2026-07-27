@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import json
 import os
 import stat
 import sys
 import tempfile
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +105,13 @@ def validate_versions() -> None:
         fail("manifest permission profile list is not synchronized")
     if manifest.get("managed_state") != list(MANAGED_FILES):
         fail("manifest managed state list is not synchronized")
+    runtime = manifest.get("runtime", {})
+    if runtime.get("lifecycle_lock") != "held-through-child":
+        fail("manifest launch lifecycle lock contract mismatch")
+    if runtime.get("pre_child_executable_revalidation") is not True:
+        fail("manifest launch executable revalidation must be enabled")
+    if runtime.get("denies_lifecycle_mutations_while_running") is not True:
+        fail("manifest launch mutation denial contract mismatch")
     software = manifest.get("software_lifecycle", {})
     if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
         fail("manifest npm installer argv mismatch")
@@ -124,6 +134,12 @@ def validate_contract() -> None:
         fail("runtime launch subcommand must be kilo run")
     if runtime_launch.get("auto_for_profiles") != ["full-auto"]:
         fail("runtime launch --auto must be limited to full-auto profile")
+    if runtime_launch.get("lifecycle_lock") != "held-through-child":
+        fail("runtime launch must hold the target lifecycle lock through child completion")
+    if runtime_launch.get("pre_child_executable_revalidation") is not True:
+        fail("runtime launch must revalidate the executable before child start")
+    if runtime_launch.get("denies_lifecycle_mutations_while_running") is not True:
+        fail("runtime launch must deny lifecycle mutations while running")
     setup_system = contract.get("setup_system", {})
     if setup_system.get("setup_ids") != list(SETUPS):
         fail("setup ids are not synchronized")
@@ -373,6 +389,110 @@ def validate_launch_guard() -> None:
         fail(f"launch guard accepted managed child argv: {case}")
 
 
+def wait_until(label: str, predicate: Any, *, seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    fail(f"timed out waiting for {label}")
+
+
+def validate_launch_lock_scope_and_executable_revalidation() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-launch-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "install",
+        )
+
+        executable = nddev_kilo_cli.kilo_executable(target)
+        executable.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
+        started = target / "child-started"
+        stop = target / "child-stop"
+        executable.write_bytes(
+            (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                f'printf started > "{started}"\n'
+                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
+            ).encode("utf-8")
+        )
+        executable.chmod(0o700)
+        executable_sha256 = nddev_kilo_cli.sha256_bytes(executable.read_bytes())
+        installation = {
+            "installed": True,
+            "current": True,
+            "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+            "executable": str(executable),
+            "entrypoint_sha256": executable_sha256,
+        }
+        if nddev_kilo_cli.revalidate_launch_executable(target, installation) != str(executable):
+            fail("launch executable revalidation returned the wrong executable")
+        expect_manager_error(
+            "launch executable with stale digest",
+            lambda: nddev_kilo_cli.revalidate_launch_executable(
+                target,
+                {**installation, "entrypoint_sha256": "0" * 64},
+            ),
+        )
+
+        original_require_current_software = nddev_kilo_cli.require_current_software
+        result: dict[str, Any] = {}
+
+        def fake_require_current_software(observed_target: Path) -> dict[str, Any]:
+            if observed_target != target:
+                fail("launch checked software for the wrong target")
+            return dict(installation)
+
+        def run_launch() -> None:
+            try:
+                result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
+            except BaseException as exc:
+                result["error"] = exc
+
+        nddev_kilo_cli.require_current_software = fake_require_current_software
+        thread = threading.Thread(target=run_launch)
+        thread.start()
+        try:
+            wait_until("launch child start", lambda: started.exists())
+            if not nddev_kilo_cli.lock_path(target).is_dir():
+                fail("launch target lock was released while the child was running")
+            try:
+                nddev_kilo_cli.mutate_setup(
+                    target,
+                    nddev_kilo_cli.DEFAULT_SETUP_ID,
+                    "safe",
+                    "switch",
+                )
+            except nddev_kilo_cli.ManagerError as exc:
+                if "target is locked" not in str(exc):
+                    fail(f"running launch denied mutation for the wrong reason: {exc}")
+            else:
+                fail("lifecycle mutation was accepted while launch child was running")
+            stop.write_bytes(b"stop\n")
+            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            thread.join(timeout=5)
+        finally:
+            nddev_kilo_cli.require_current_software = original_require_current_software
+            if thread.is_alive():
+                stop.write_bytes(b"stop\n")
+                thread.join(timeout=10)
+        if thread.is_alive():
+            fail("launch child thread did not finish")
+        if "error" in result:
+            raise result["error"]
+        if result.get("code") != 0:
+            fail(f"launch child returned unexpected code: {result.get('code')}")
+        if nddev_kilo_cli.lock_path(target).exists():
+            fail("launch target lock was not cleaned up after child exit")
+
+
 def snapshot_tree(root: Path) -> list[tuple[str, str, int, bytes | str | None]]:
     if not root.exists() and not root.is_symlink():
         return [(".", "absent", 0, None)]
@@ -447,6 +567,87 @@ def write_public_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
     path.write_bytes(nddev_kilo_cli.canonical_json(value))
     path.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+
+def validate_remove_exhausts_managed_files() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-remove-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        unmanaged_file = target / "unmanaged.txt"
+        unmanaged_file.write_bytes(b"preserve me\n")
+        unmanaged_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        write_public_json(target / nddev_kilo_cli.CONFIG, {"unmanaged": {"preserve": True}})
+
+        nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "install",
+        )
+        desired = nddev_kilo_cli.desired_for_remove(target)
+        if set(desired) != {*MANAGED_FILES, nddev_kilo_cli.STAMP_NAME}:
+            fail("remove desired state is not built from the complete managed file set")
+        for relative in MANAGED_FILES:
+            content = desired.get(relative)
+            if relative == nddev_kilo_cli.CONFIG:
+                if content is None:
+                    fail("remove dropped parseable unmanaged config keys")
+                continue
+            if content is not None:
+                fail(f"remove did not delete builder-owned path: {relative}")
+
+        before_failure = snapshot_tree(target)
+        original_replace_managed_state = nddev_kilo_cli.replace_managed_state
+
+        def partial_remove_then_fail(
+            observed_target: Path,
+            desired_state: dict[str, bytes | None],
+            expected: dict[str, str] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            del expected, kwargs
+            for relative, content in desired_state.items():
+                if relative != nddev_kilo_cli.CONFIG and content is None:
+                    with contextlib.suppress(FileNotFoundError):
+                        (observed_target / nddev_kilo_cli.safe_relative_path(relative)).unlink()
+                    break
+            raise RuntimeError("forced remove failure")
+
+        nddev_kilo_cli.replace_managed_state = partial_remove_then_fail
+        try:
+            try:
+                nddev_kilo_cli.remove_setup(target)
+            except RuntimeError:
+                pass
+            else:
+                fail("forced remove failure was accepted")
+        finally:
+            nddev_kilo_cli.replace_managed_state = original_replace_managed_state
+        if snapshot_tree(target) != before_failure:
+            fail("failed remove did not roll back every removed managed path")
+
+        nddev_kilo_cli.remove_setup(target)
+        for relative in MANAGED_FILES:
+            path = target / nddev_kilo_cli.safe_relative_path(relative)
+            if relative == nddev_kilo_cli.CONFIG:
+                observed = load_json(path)
+                if observed != {"unmanaged": {"preserve": True}}:
+                    fail("remove did not preserve unmanaged config keys")
+                continue
+            if path.exists() or path.is_symlink():
+                fail(f"remove left builder-owned path behind: {relative}")
+        if nddev_kilo_cli.stamp_path(target).exists():
+            fail("remove left the managed stamp behind")
+        if unmanaged_file.read_bytes() != b"preserve me\n":
+            fail("remove changed an unmanaged file")
+        nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "install",
+        )
 
 
 def scoped_package_path(root: Path, package: str) -> Path:

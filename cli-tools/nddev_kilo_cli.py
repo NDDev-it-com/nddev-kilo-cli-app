@@ -1306,12 +1306,9 @@ def desired_for_remove(target: Path) -> dict[str, bytes | None]:
     unmanaged = {
         key: copy.deepcopy(value) for key, value in config.items() if key not in CONFIG_MANAGED_KEYS
     }
-    desired: dict[str, bytes | None] = {
-        CONFIG: canonical_json(unmanaged) if unmanaged else None,
-        BUILDER_INSTRUCTIONS: None,
-        BUILDER_SKILL: None,
-        STAMP_NAME: None,
-    }
+    desired: dict[str, bytes | None] = {relative: None for relative in MANAGED_FILES}
+    desired[CONFIG] = canonical_json(unmanaged) if unmanaged else None
+    desired[STAMP_NAME] = None
     return desired
 
 
@@ -2502,6 +2499,7 @@ def software_status(target: Path) -> dict[str, Any]:
         "current": current,
         "version": manifest.get("version"),
         "executable": str(executable),
+        "entrypoint_sha256": manifest.get("entrypoint_sha256"),
         "package": manifest.get("package"),
         "install_method": manifest.get("install_method"),
         "selected_native_package": manifest.get("selected_native_package"),
@@ -2952,6 +2950,28 @@ def clean_launch_env(target: Path) -> dict[str, str]:
     return launch_environment(target)
 
 
+def revalidate_launch_executable(target: Path, installation: dict[str, Any]) -> str:
+    executable = installation.get("executable")
+    expected_sha256 = installation.get("entrypoint_sha256")
+    if not isinstance(executable, str) or Path(executable) != kilo_executable(target):
+        fail("Kilo CLI executable provenance is invalid; run update-cli")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        fail("Kilo CLI executable digest provenance is missing; run update-cli")
+    resolved = resolved_executable_path(Path(executable), target, "Kilo CLI executable")
+    before = resolved.lstat()
+    observed_sha256 = digest_regular_file(
+        resolved,
+        "Kilo CLI executable",
+        {"value": 0},
+    )
+    after = resolved.lstat()
+    if identity_of(before) != identity_of(after):
+        raise ConcurrentTargetChange("Kilo CLI executable changed before launch")
+    if observed_sha256 != expected_sha256:
+        fail("Kilo CLI executable digest changed before launch; run update-cli")
+    return executable
+
+
 def forbidden_launch_option(argument: str) -> str | None:
     if argument == "--":
         return None
@@ -2999,40 +3019,43 @@ def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) 
     if timeout_seconds <= 0:
         fail("launch timeout must be positive")
     target = resolve_target(target, create=False)
+    forwarded = normalize_launch_child_args(child_args)
     with target_lock(target):
         stamp = require_active_clean_installed(target)
         installation = require_current_software(target)
         env = clean_launch_env(target)
-        executable = str(installation["executable"])
         profile_id = stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
-    forwarded = normalize_launch_child_args(child_args)
-    command = launch_command_for_profile(executable, profile_id, forwarded)
-    try:
-        process = subprocess.Popen(
-            command,
-            env=env,
-            start_new_session=(os.name == "posix"),
+        command = launch_command_for_profile(
+            revalidate_launch_executable(target, installation),
+            profile_id,
+            forwarded,
         )
-    except FileNotFoundError:
-        fail("kilo executable disappeared before launch")
-    try:
-        return process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, 15)
-        else:
-            process.kill()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=5)
-        if process.poll() is None:
+        try:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                start_new_session=(os.name == "posix"),
+            )
+        except FileNotFoundError:
+            fail("kilo executable disappeared before launch")
+        try:
+            return process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
             if os.name == "posix":
                 with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, 9)
+                    os.killpg(process.pid, 15)
             else:
                 process.kill()
-            process.wait()
-        return 124
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+            if process.poll() is None:
+                if os.name == "posix":
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, 9)
+                else:
+                    process.kill()
+                process.wait()
+            return 124
 
 
 def print_payload(payload: dict[str, Any], *, as_json: bool) -> None:

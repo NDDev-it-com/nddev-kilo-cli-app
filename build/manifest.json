@@ -17,7 +17,10 @@
     ],
     "auto_for_profiles": [
       "full-auto"
-    ]
+    ],
+    "lifecycle_lock": "held-through-child",
+    "pre_child_executable_revalidation": true,
+    "denies_lifecycle_mutations_while_running": true
   },
   "software_lifecycle": {
     "manager_commands": [

@@ -73,8 +73,11 @@ lock metadata, verify the installed native package version, and then record a
 target-owned software manifest.
 
 `launch` requires a clean active setup and current target-owned CLI software,
-then releases the target lock before executing `/absolute/kilo-target/bin/kilo
-run`. Only the `full-auto` profile receives the managed `--auto` flag.
+then holds the target lifecycle lock while `/absolute/kilo-target/bin/kilo run`
+executes and through timeout cleanup. It revalidates the selected executable
+inode and digest immediately before child start. Lifecycle mutations fail while
+launch is running. Only the `full-auto` profile receives the managed `--auto`
+flag.
 
 ## Safety
 
@@ -82,5 +85,6 @@ The manager requires an explicit absolute target, rejects target symlinks and
 managed symlink or hard-link paths, validates target-owned software symlinks,
 bounds reads and installed tree scans, records target-bound stamps, rotates ten
 target-bound backup slots, detects managed drift before mutation, denies legacy
-launches, bounds child processes, and rolls back target writes on mutation
-failure.
+launches, removes every builder-owned path from the code-owned managed file
+set, preserves parseable unmanaged config keys and unmanaged files, bounds child
+processes, and rolls back target writes on mutation failure.

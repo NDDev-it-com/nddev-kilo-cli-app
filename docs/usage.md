@@ -33,10 +33,18 @@ python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --time
 
 The child process receives isolated runtime paths and
 `KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`. The manager
-requires target-owned `bin/kilo`, forwards the child exit code, and returns
-`124` if the bounded launch timeout expires. The default `full-auto` profile
-uses `kilo run --auto`; `safe` uses `kilo run` without `--auto`.
+requires target-owned `bin/kilo`, revalidates its inode and digest immediately
+before child start, holds the target lifecycle lock until the child exits or
+timeout cleanup finishes, forwards the child exit code, and returns `124` if the
+bounded launch timeout expires. Lifecycle mutations fail while launch is
+running. The default `full-auto` profile uses `kilo run --auto`; `safe` uses
+`kilo run` without `--auto`.
 
 User child arguments that try to override managed config, home, permission,
 auto, sandbox, working scope, agent, model, session, attached files, remote
 attach, share, or permission-bypass flags are rejected.
+
+`remove` deletes every builder-owned path in the code-owned managed file set,
+removes the managed stamp, preserves parseable unmanaged config keys, and
+preserves unmanaged files. Commented unmanaged JSONC still fails closed instead
+of being rewritten.

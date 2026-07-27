@@ -28,6 +28,9 @@
     "path_inherited": false,
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
+    "lifecycle_lock": "held-through-child",
+    "pre_child_executable_revalidation": true,
+    "denies_lifecycle_mutations_while_running": true,
     "max_runtime_seconds": 3600
   },
   "setup_system": {
