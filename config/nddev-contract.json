@@ -28,7 +28,8 @@
     "runtime_directories": {
       "inside_target_only": true,
       "component_validation": "real-current-user-owned-0700",
-      "reject_symlink_components": true
+      "reject_symlink_components": true,
+      "writable_while_launch_running": true
     },
     "path_inherited": false,
     "credential_inheritance": false,
@@ -44,6 +45,8 @@
       "kind": "write-protected-verified-path",
       "portable_fd_execution": false,
       "parent_mode_while_held": "0500",
+      "protected_directory_scope": "lock-parent-and-software-launcher-artifacts-only",
+      "runtime_directories_writable_while_running": true,
       "same_uid_chmod_resistant_without_sandbox": false
     },
     "max_runtime_seconds": 3600

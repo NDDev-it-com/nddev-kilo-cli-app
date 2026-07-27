@@ -36,9 +36,11 @@ The child process receives isolated runtime paths and
 requires target-owned `bin/kilo`, validates each runtime HOME/TMPDIR/XDG
 directory as a real target-owned 0700 directory without symlink components,
 holds a persistent target-internal `fcntl.flock` lock file until the child exits
-or timeout cleanup finishes, and keeps the lock parent plus verified
-wrapper/native/resource parent directories traversable but non-writable while
-the child runs. It revalidates wrapper and native executable inode and digest
+or timeout cleanup finishes, and keeps only the dedicated lock parent plus
+verified immutable wrapper/native/resource artifact directories traversable but
+non-writable while the child runs. The managed target root, runtime
+HOME/TMPDIR/XDG directories, and Kilo config/session directory stay writable for
+runtime state. It revalidates wrapper and native executable inode and digest
 immediately before child start, forwards the child exit code, and returns `124`
 if the bounded launch timeout expires. This is a write-protected verified-path
 handoff under the no-sandbox same-UID boundary, not portable fd execution, and

@@ -127,6 +127,8 @@ def validate_versions() -> None:
         "kind": "write-protected-verified-path",
         "portable_fd_execution": False,
         "parent_mode_while_held": "0500",
+        "protected_directory_scope": "lock-parent-and-software-launcher-artifacts-only",
+        "runtime_directories_writable_while_running": True,
         "same_uid_chmod_resistant_without_sandbox": False,
     }:
         fail("manifest executable handoff contract mismatch")
@@ -134,6 +136,7 @@ def validate_versions() -> None:
         "inside_target_only": True,
         "component_validation": "real-current-user-owned-0700",
         "reject_symlink_components": True,
+        "writable_while_launch_running": True,
     }
     if runtime.get("runtime_directories") != expected_runtime_directories:
         fail("manifest runtime directory isolation contract mismatch")
@@ -191,6 +194,8 @@ def validate_contract() -> None:
         "kind": "write-protected-verified-path",
         "portable_fd_execution": False,
         "parent_mode_while_held": "0500",
+        "protected_directory_scope": "lock-parent-and-software-launcher-artifacts-only",
+        "runtime_directories_writable_while_running": True,
         "same_uid_chmod_resistant_without_sandbox": False,
     }:
         fail("runtime launch executable handoff contract mismatch")
@@ -198,6 +203,7 @@ def validate_contract() -> None:
         "inside_target_only": True,
         "component_validation": "real-current-user-owned-0700",
         "reject_symlink_components": True,
+        "writable_while_launch_running": True,
     }:
         fail("runtime launch directory isolation contract mismatch")
     setup_system = contract.get("setup_system", {})
@@ -593,6 +599,27 @@ def fake_current_software(
     return fake_require_current_software
 
 
+def assert_launch_handoff_scope_is_immutable_only(
+    target: Path,
+    executable: Path,
+    native: Path,
+    installation: dict[str, Any],
+) -> None:
+    protected = set(nddev_kilo_cli.launch_handoff_directories(target, installation))
+    required = {nddev_kilo_cli.lock_path(target), executable.parent, native.parent}
+    if not required.issubset(protected):
+        fail("launch handoff did not protect the required immutable directories")
+    mutable_paths = {
+        target,
+        *nddev_kilo_cli.target_runtime_paths(target).values(),
+        (target / nddev_kilo_cli.CONFIG).parent,
+    }
+    for mutable in mutable_paths:
+        for directory in protected:
+            if directory == mutable or directory in mutable.parents:
+                fail(f"launch handoff protected a mutable runtime directory: {directory}")
+
+
 def validate_launch_lock_scope_and_executable_revalidation() -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-launch-") as raw:
         workspace = Path(raw)
@@ -785,15 +812,37 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
         target = target.resolve(strict=False)
         started = target / "child-started"
         stop = target / "child-stop"
+        runtime_paths = nddev_kilo_cli.target_runtime_paths(target)
+        runtime_writes = {
+            "HOME": runtime_paths["HOME"] / "nddev-runtime-home",
+            "TMPDIR": runtime_paths["TMPDIR"] / "nddev-runtime-tmp",
+            "XDG_CONFIG_HOME": runtime_paths["XDG_CONFIG_HOME"] / "nddev-runtime-config",
+            "XDG_DATA_HOME": runtime_paths["XDG_DATA_HOME"] / "nddev-runtime-data",
+            "XDG_STATE_HOME": runtime_paths["XDG_STATE_HOME"] / "nddev-runtime-state",
+            "XDG_CACHE_HOME": runtime_paths["XDG_CACHE_HOME"] / "nddev-runtime-cache",
+            "KILO_CONFIG_PARENT": (target / nddev_kilo_cli.CONFIG).parent
+            / "nddev-runtime-session",
+        }
+        runtime_ready = runtime_paths["TMPDIR"] / "nddev-runtime-ready"
         executable, native, installation = fake_launch_installation(
             target,
             (
                 "#!/bin/sh\n"
                 "set -eu\n"
+                'config_dir=${KILO_CONFIG%/*}\n'
+                'printf home > "$HOME/nddev-runtime-home"\n'
+                'printf tmp > "$TMPDIR/nddev-runtime-tmp"\n'
+                'printf config > "$XDG_CONFIG_HOME/nddev-runtime-config"\n'
+                'printf data > "$XDG_DATA_HOME/nddev-runtime-data"\n'
+                'printf state > "$XDG_STATE_HOME/nddev-runtime-state"\n'
+                'printf cache > "$XDG_CACHE_HOME/nddev-runtime-cache"\n'
+                'printf session > "$config_dir/nddev-runtime-session"\n'
+                'printf ready > "$TMPDIR/nddev-runtime-ready"\n'
                 f'printf started > "{started}"\n'
                 f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
             ).encode("utf-8"),
         )
+        assert_launch_handoff_scope_is_immutable_only(target, executable, native, installation)
         original_require_current_software = nddev_kilo_cli.require_current_software
         launch_result: dict[str, Any] = {}
 
@@ -809,14 +858,23 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
         try:
             wait_until(
                 "handoff launch child start",
-                lambda: started.exists() or bool(launch_result.get("error")),
+                lambda: runtime_ready.exists()
+                or bool(launch_result.get("error"))
+                or not thread.is_alive(),
             )
             if "error" in launch_result:
                 raise launch_result["error"]
+            if not thread.is_alive() and not runtime_ready.exists():
+                fail(f"handoff child exited before runtime writes with code: {launch_result.get('code')}")
+            for label, path in runtime_writes.items():
+                if not path.is_file():
+                    fail(f"launch child could not write runtime state in {label}")
             if private_directory_mode(executable.parent) != 0o500:
                 fail("launch wrapper parent remained writable while child was running")
             if private_directory_mode(native.parent) != 0o500:
                 fail("launch native binary parent remained writable while child was running")
+            if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o500:
+                fail("launch lock parent remained writable while child was running")
             for protected in (executable, native):
                 before = protected.read_bytes()
                 try:
@@ -836,6 +894,23 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
                     fail(f"ordinary replace succeeded for launch-protected path: {protected}")
                 if protected.read_bytes() != before:
                     fail(f"launch-protected path changed during handoff: {protected}")
+            try:
+                nddev_kilo_cli.lock_file_path(target).unlink()
+            except OSError:
+                pass
+            else:
+                fail("ordinary unlink succeeded for persistent lock file")
+            lock_replacement = target / "replacement-lock"
+            lock_replacement.write_bytes(b"replacement\n")
+            lock_replacement.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            try:
+                os.replace(lock_replacement, nddev_kilo_cli.lock_file_path(target))
+            except OSError:
+                pass
+            else:
+                fail("ordinary replace succeeded for persistent lock file")
+            if not nddev_kilo_cli.lock_file_path(target).is_file():
+                fail("persistent lock file changed during launch handoff")
             stop.write_bytes(b"stop\n")
             stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
             thread.join(timeout=5)
