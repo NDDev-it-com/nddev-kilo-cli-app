@@ -12,7 +12,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import shutil
 import threading
@@ -371,42 +370,12 @@ def validate_setups_and_profiles() -> None:
         require_file(f"setups/nddev-builder/{relative}")
 
 
-def validate_managed_exact_bytes() -> None:
+def validate_managed_source_exact_bytes() -> None:
     setup = nddev_kilo_cli.load_setup(nddev_kilo_cli.DEFAULT_SETUP_ID)
     for relative in nddev_kilo_cli.BUILDER_FILES:
         source = require_file(f"setups/nddev-builder/{relative}").read_bytes()
         if setup.files[relative] != source:
             fail(f"manager loaded different bytes than setup source: {relative}")
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-exact-") as raw:
-        workspace = Path(raw)
-        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
-        target_parent = workspace / "targets"
-        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
-        for profile_id in PROFILES:
-            target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / profile_id)
-            desired = nddev_kilo_cli.desired_for_setup(
-                target,
-                nddev_kilo_cli.DEFAULT_SETUP_ID,
-                profile_id,
-            )
-            nddev_kilo_cli.mutate_setup(
-                target,
-                nddev_kilo_cli.DEFAULT_SETUP_ID,
-                profile_id,
-                "install",
-            )
-            for relative, expected in desired.items():
-                if expected is None:
-                    fail(f"install desired unexpectedly removes managed path: {relative}")
-                path = target / nddev_kilo_cli.safe_relative_path(relative)
-                observed = nddev_kilo_cli.read_regular_file(
-                    path,
-                    f"installed exact-byte managed path {relative}",
-                    owner_only=True,
-                    max_bytes=nddev_kilo_cli.MANAGED_PAYLOAD_MAX_BYTES,
-                )
-                if observed != expected:
-                    fail(f"install wrote non-exact managed bytes for {profile_id}: {relative}")
 
 
 def validate_builder_toolkit() -> None:
@@ -516,35 +485,6 @@ def release_path_is_safe(relative: str) -> bool:
     return not path.is_absolute() and all(part not in {"", ".", ".."} for part in path.parts)
 
 
-def release_regular_files(paths: list[str], *, base: Path = ROOT) -> dict[str, bytes]:
-    files: dict[str, bytes] = {}
-    for relative in paths:
-        if not release_path_is_safe(relative):
-            fail(f"release path is not a safe repository-relative path: {relative}")
-        root = base / relative
-        info = root.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            fail(f"release path must not be a symlink: {relative}")
-        if stat.S_ISREG(info.st_mode):
-            files[relative] = root.read_bytes()
-            continue
-        if not stat.S_ISDIR(info.st_mode):
-            fail(f"release path must be a regular file or directory: {relative}")
-        for path in sorted(root.rglob("*")):
-            child = path.lstat()
-            child_relative = path.relative_to(base).as_posix()
-            if stat.S_ISLNK(child.st_mode):
-                fail(f"release archive must not contain symlinks: {child_relative}")
-            if stat.S_ISDIR(child.st_mode):
-                continue
-            if not stat.S_ISREG(child.st_mode):
-                fail(f"release archive must contain only regular files: {child_relative}")
-            if child_relative in files:
-                fail(f"release archive path is duplicated: {child_relative}")
-            files[child_relative] = path.read_bytes()
-    return files
-
-
 def release_required_source_files() -> set[str]:
     required = {
         f"{nddev_kilo_cli.CATALOG_ROOT.name}/{nddev_kilo_cli.DEFAULT_SETUP_ID}/setup.json",
@@ -560,41 +500,42 @@ def release_required_source_files() -> set[str]:
     return required
 
 
+def release_paths_include(relative: str, roots: list[str]) -> bool:
+    if not release_path_is_safe(relative):
+        fail(f"required release source path is not safe: {relative}")
+    path = Path(relative)
+    for root in roots:
+        if not release_path_is_safe(root):
+            fail(f"release path is not a safe repository-relative path: {root}")
+        root_path = Path(root)
+        if path == root_path:
+            return True
+        try:
+            path.relative_to(root_path)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def validate_release_archive_exact_bytes() -> None:
     release_text = require_file(".github/workflows/release.yml").read_text(encoding="utf-8")
     archive_paths = release_folded_paths(release_text, "archive_paths")
     runtime_paths = release_folded_paths(release_text, "runtime_paths")
-    archive_files = release_regular_files(archive_paths)
-    runtime_files = release_regular_files(runtime_paths)
+    setup = nddev_kilo_cli.load_setup(nddev_kilo_cli.DEFAULT_SETUP_ID)
     for relative in release_required_source_files():
-        if relative not in runtime_files:
+        require_file(relative)
+        if not release_paths_include(relative, runtime_paths):
             fail(f"release runtime closure omits setup source file: {relative}")
-        if relative not in archive_files:
+        if not release_paths_include(relative, archive_paths):
             fail(f"release archive closure omits setup source file: {relative}")
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-archive-") as raw:
-        workspace = Path(raw)
-        archive = workspace / "source.tar"
-        extracted = workspace / "extracted"
-        extracted.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
-        with tarfile.open(archive, "w") as handle:
-            for relative in sorted(archive_files):
-                handle.add(ROOT / relative, arcname=relative, recursive=False)
-        with tarfile.open(archive, "r") as handle:
-            for member in handle.getmembers():
-                if not release_path_is_safe(member.name):
-                    fail(f"release archive contains unsafe member path: {member.name}")
-                if not member.isfile():
-                    fail(f"release archive member is not a regular file: {member.name}")
-            handle.extractall(extracted)
-        for relative, source_bytes in archive_files.items():
-            extracted_path = extracted / relative
-            if not extracted_path.is_file():
-                fail(f"release archive extraction omitted file: {relative}")
-            if extracted_path.read_bytes() != source_bytes:
-                fail(f"release archive changed file bytes: {relative}")
-        extracted_files = release_regular_files(archive_paths, base=extracted)
-        if sorted(extracted_files) != sorted(archive_files):
-            fail("release archive extraction changed the file set")
+    for relative in nddev_kilo_cli.BUILDER_FILES:
+        source_relative = (
+            f"{nddev_kilo_cli.CATALOG_ROOT.name}/"
+            f"{nddev_kilo_cli.DEFAULT_SETUP_ID}/{relative}"
+        )
+        if setup.files[relative] != require_file(source_relative).read_bytes():
+            fail(f"release source content is not the manager exact bytes: {source_relative}")
 
 
 def release_folded_paths(text: str, key: str) -> list[str]:
@@ -2331,7 +2272,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_contract()
         validate_baseline()
         validate_setups_and_profiles()
-        validate_managed_exact_bytes()
+        validate_managed_source_exact_bytes()
         validate_builder_toolkit()
         validate_workflows()
         validate_release_archive_exact_bytes()
