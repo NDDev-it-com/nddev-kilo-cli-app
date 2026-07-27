@@ -299,7 +299,13 @@ def require_directory(path: Path, label: str) -> os.stat_result:
     return info
 
 
-def require_regular_file(path: Path, label: str, *, owner_only: bool = False) -> os.stat_result:
+def require_regular_file(
+    path: Path,
+    label: str,
+    *,
+    owner_only: bool = False,
+    max_bytes: int | None = None,
+) -> os.stat_result:
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -310,6 +316,8 @@ def require_regular_file(path: Path, label: str, *, owner_only: bool = False) ->
         fail(f"{label} must not have hard-link aliases")
     if owner_only and not is_owner_only_file(info):
         fail(f"{label} must be owned by the current user with mode 0600")
+    if max_bytes is not None and info.st_size > max_bytes:
+        fail(f"{label} exceeds the {max_bytes}-byte size limit")
     return info
 
 
@@ -320,9 +328,7 @@ def read_regular_file(
     owner_only: bool = False,
     max_bytes: int = MANAGED_PAYLOAD_MAX_BYTES,
 ) -> bytes:
-    before = require_regular_file(path, label, owner_only=owner_only)
-    if before.st_size > max_bytes:
-        fail(f"{label} exceeds the {max_bytes}-byte size limit")
+    before = require_regular_file(path, label, owner_only=owner_only, max_bytes=max_bytes)
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -350,7 +356,7 @@ def read_regular_file(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    final = require_regular_file(path, label, owner_only=owner_only)
+    final = require_regular_file(path, label, owner_only=owner_only, max_bytes=max_bytes)
     if identity_of(final) != identity_of(before) or identity_of(after) != identity_of(before):
         raise ConcurrentTargetChange(f"{label} changed while it was read")
     return b"".join(chunks)
@@ -1217,8 +1223,140 @@ def chmod_private_tree(root: Path) -> None:
                 path.chmod(OWNER_FILE_MODE)
 
 
-def materialize_hardlinked_regular_files(root: Path) -> None:
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts)):
+def staged_tree_paths_for_materialization(root: Path, *, max_paths: int) -> list[Path]:
+    paths: list[Path] = []
+    for path in root.rglob("*"):
+        paths.append(path)
+        if len(paths) > max_paths:
+            fail(f"staged software tree exceeds the {max_paths}-path limit before copying")
+    return sorted(paths, key=lambda item: len(item.parts))
+
+
+def validate_staged_tree_bounds_for_materialization(
+    paths: list[Path],
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+) -> None:
+    total_bytes = 0
+    for path in paths:
+        if path.is_symlink():
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if info.st_size > max_file_bytes:
+            fail(f"staged software file exceeds the {max_file_bytes}-byte limit: {path}")
+        total_bytes += info.st_size
+        if total_bytes > max_tree_bytes:
+            fail(
+                f"staged software tree exceeds the {max_tree_bytes}-byte limit before copying: {path}"
+            )
+
+
+def materialize_hardlinked_regular_file(
+    path: Path,
+    info: os.stat_result,
+    *,
+    byte_counter: dict[str, int],
+    max_file_bytes: int,
+    max_tree_bytes: int,
+) -> None:
+    if info.st_size > max_file_bytes:
+        fail(f"staged software file exceeds the {max_file_bytes}-byte limit: {path}")
+    if byte_counter["value"] + info.st_size > max_tree_bytes:
+        fail(f"staged software tree exceeds the {max_tree_bytes}-byte limit before copying: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    temporary = path.with_name(f".{path.name}.nddev-copy.{os.getpid()}.{time.time_ns()}")
+    target_descriptor = -1
+    copied = 0
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            raise ConcurrentTargetChange(f"staged software file changed while opened: {path}")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink == 1:
+            raise ConcurrentTargetChange(f"staged software hardlink changed while opened: {path}")
+        if hasattr(os, "geteuid") and owner_of(opened) != os.geteuid():
+            fail(f"staged software file must be owned by the current user: {path}")
+        mode = stat.S_IMODE(opened.st_mode)
+        if mode not in {OWNER_FILE_MODE, 0o700}:
+            fail(f"staged software file must be private before materializing hardlink: {path}")
+        if opened.st_size > max_file_bytes:
+            fail(f"staged software file exceeds the {max_file_bytes}-byte limit: {path}")
+        if byte_counter["value"] + opened.st_size > max_tree_bytes:
+            fail(
+                f"staged software tree exceeds the {max_tree_bytes}-byte limit before copying: {path}"
+            )
+        target_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            OWNER_FILE_MODE,
+        )
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > max_file_bytes:
+                fail(
+                    f"staged software file exceeds the {max_file_bytes}-byte limit while copying: {path}"
+                )
+            byte_counter["value"] += len(chunk)
+            if byte_counter["value"] > max_tree_bytes:
+                fail(
+                    f"staged software tree exceeds the {max_tree_bytes}-byte limit while copying: {path}"
+                )
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(target_descriptor, chunk[offset:])
+                if written <= 0:
+                    fail(f"staged software copy made no forward progress: {path}")
+                offset += written
+        os.close(target_descriptor)
+        target_descriptor = -1
+        after = os.fstat(descriptor)
+        if identity_of(after) != identity_of(opened) or after.st_size != opened.st_size:
+            raise ConcurrentTargetChange(
+                f"staged software file changed while it was copied: {path}"
+            )
+        if copied != opened.st_size:
+            raise ConcurrentTargetChange(f"staged software file changed size while copied: {path}")
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+        require_regular_file(
+            path, f"materialized staged software file {path}", max_bytes=max_file_bytes
+        )
+        if path.lstat().st_nlink != 1:
+            fail(f"staged software hardlink materialization failed: {path}")
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        os.close(descriptor)
+
+
+def materialize_hardlinked_regular_files(
+    root: Path,
+    *,
+    max_file_bytes: int = SOFTWARE_TREE_MAX_BYTES,
+    max_tree_bytes: int = SOFTWARE_TREE_MAX_BYTES,
+) -> None:
+    paths = staged_tree_paths_for_materialization(root, max_paths=SOFTWARE_TREE_MAX_PATHS)
+    validate_staged_tree_bounds_for_materialization(
+        paths,
+        max_file_bytes=max_file_bytes,
+        max_tree_bytes=max_tree_bytes,
+    )
+    byte_counter = {"value": 0}
+    for path in paths:
         if path.is_symlink():
             continue
         info = path.lstat()
@@ -1229,32 +1367,13 @@ def materialize_hardlinked_regular_files(root: Path) -> None:
         mode = stat.S_IMODE(info.st_mode)
         if mode not in {OWNER_FILE_MODE, 0o700}:
             fail(f"staged software file must be private before materializing hardlink: {path}")
-        flags = os.O_RDONLY
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags)
-        temporary = path.with_name(f".{path.name}.nddev-copy.{os.getpid()}.{time.time_ns()}")
-        try:
-            opened = os.fstat(descriptor)
-            if identity_of(opened) != identity_of(info):
-                raise ConcurrentTargetChange(f"staged software file changed while opened: {path}")
-            with os.fdopen(descriptor, "rb") as source, temporary.open("xb") as target_file:
-                shutil.copyfileobj(source, target_file, length=1024 * 1024)
-            descriptor = -1
-            temporary.chmod(mode)
-            os.replace(temporary, path)
-            require_regular_file(path, f"materialized staged software file {path}")
-            if path.lstat().st_nlink != 1:
-                fail(f"staged software hardlink materialization failed: {path}")
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
-            raise
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+        materialize_hardlinked_regular_file(
+            path,
+            info,
+            byte_counter=byte_counter,
+            max_file_bytes=max_file_bytes,
+            max_tree_bytes=max_tree_bytes,
+        )
 
 
 def resolve_target_owned_symlink(path: Path, root: Path, label: str) -> Path:
@@ -1531,7 +1650,12 @@ def compute_software_tree_digest(root: Path) -> dict[str, Any]:
             {"value": 0},
         ),
         "package_manifest_sha256": digest_regular_file(
-            root / SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "package.json",
+            root
+            / SOFTWARE_GLOBAL_DIR_RELATIVE
+            / "node_modules"
+            / "@kilocode"
+            / "cli"
+            / "package.json",
             "Kilo CLI package manifest",
             {"value": 0},
         ),
@@ -1569,10 +1693,14 @@ def write_stage_software_manifest(live_stage: Path) -> None:
 
 def software_presence(target: Path) -> dict[str, Any]:
     replace_paths_present = [
-        str(relative) for relative in SOFTWARE_REPLACE_PATHS if path_exists_no_follow(target / relative)
+        str(relative)
+        for relative in SOFTWARE_REPLACE_PATHS
+        if path_exists_no_follow(target / relative)
     ]
     owned_parent_paths_present = [
-        str(relative) for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(target / relative)
+        str(relative)
+        for relative in SOFTWARE_PARENT_PATHS
+        if path_exists_no_follow(target / relative)
     ]
     if not replace_paths_present and not owned_parent_paths_present:
         state = "absent"
@@ -1822,7 +1950,9 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
             fail("installed Kilo CLI did not validate as the pinned Bun package")
     except BaseException:
         moved_old = [
-            relative for relative in SOFTWARE_REPLACE_PATHS if path_exists_no_follow(hold / relative)
+            relative
+            for relative in SOFTWARE_REPLACE_PATHS
+            if path_exists_no_follow(hold / relative)
         ]
         restore_software_paths(
             target,
@@ -1881,7 +2011,9 @@ def run_bun_install(stage_root: Path, live_stage: Path) -> None:
         timeout=PROCESS_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
-        fail(f"bun install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}")
+        fail(
+            f"bun install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}"
+        )
     chmod_private_tree(live_stage)
     materialize_hardlinked_regular_files(live_stage)
     materialize_stage_entrypoint(live_stage)
@@ -1985,14 +2117,18 @@ def remove_cli(target: Path) -> dict[str, Any]:
             "changed": False,
         }
     validate_existing_software_surface(target)
-    staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove."))
+    staging = Path(
+        tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove.")
+    )
     try:
         empty_live = staging / "live"
         empty_live.mkdir(mode=OWNER_DIR_MODE)
         hold = staging / "hold"
         hold.mkdir(mode=OWNER_DIR_MODE)
         preexisting_parent_paths = {
-            relative for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(target / relative)
+            relative
+            for relative in SOFTWARE_PARENT_PATHS
+            if path_exists_no_follow(target / relative)
         }
         moved_old: list[Path] = []
         with target_lock(target):
@@ -2003,7 +2139,9 @@ def remove_cli(target: Path) -> dict[str, Any]:
                     saved = hold / relative
                     move_old_path(destination, saved)
                     moved_old.append(relative)
-            for relative in sorted(SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True):
+            for relative in sorted(
+                SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True
+            ):
                 if relative in preexisting_parent_paths:
                     parent = target / relative
                     try:
@@ -2183,7 +2321,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_setup(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "software-status":
-        print_payload(software_status(resolve_target(Path(args.target), create=False)), as_json=args.json)
+        print_payload(
+            software_status(resolve_target(Path(args.target), create=False)), as_json=args.json
+        )
         return 0
     if args.command in {"install-cli", "update-cli"}:
         print_payload(
@@ -2192,7 +2332,9 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "remove-cli":
-        print_payload(remove_cli(resolve_target(Path(args.target), create=False)), as_json=args.json)
+        print_payload(
+            remove_cli(resolve_target(Path(args.target), create=False)), as_json=args.json
+        )
         return 0
     if args.command == "launch":
         return launch(Path(args.target), args.child_args, timeout_seconds=args.timeout_seconds)

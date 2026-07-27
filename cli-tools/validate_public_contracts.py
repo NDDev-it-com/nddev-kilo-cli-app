@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -275,6 +278,88 @@ def validate_launch_guard() -> None:
         fail(f"launch guard accepted managed child argv: {case}")
 
 
+def snapshot_tree(root: Path) -> list[tuple[str, str, int, bytes | str | None]]:
+    if not root.exists() and not root.is_symlink():
+        return [(".", "absent", 0, None)]
+    records: list[tuple[str, str, int, bytes | str | None]] = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            records.append((relative, "symlink", mode, os.readlink(path)))
+        elif stat.S_ISDIR(info.st_mode):
+            records.append((relative, "directory", mode, None))
+        elif stat.S_ISREG(info.st_mode):
+            records.append((relative, "file", mode, path.read_bytes()))
+        else:
+            records.append((relative, "other", mode, None))
+    return records
+
+
+def validate_hardlink_materialization_bound() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bound-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        marker = target / "unmanaged-marker"
+        marker.write_bytes(b"before\n")
+        marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = snapshot_tree(target)
+
+        original_run_bun_install = nddev_kilo_cli.run_bun_install
+
+        def fake_run_bun_install(stage_root: Path, live_stage: Path) -> None:
+            del stage_root
+            hardlink_root = (
+                live_stage
+                / nddev_kilo_cli.SOFTWARE_GLOBAL_DIR_RELATIVE
+                / "node_modules"
+                / "@kilocode"
+                / "cli"
+                / "bin"
+            )
+            hardlink_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+            source = hardlink_root / "oversized-hardlink-source"
+            source.write_bytes(b"x" * 65)
+            source.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            peer = hardlink_root / "oversized-hardlink-peer"
+            os.link(source, peer)
+            if source.lstat().st_nlink < 2 or peer.lstat().st_nlink < 2:
+                fail("hardlink regression fixture did not create hardlinks")
+            nddev_kilo_cli.materialize_hardlinked_regular_files(
+                live_stage,
+                max_file_bytes=64,
+                max_tree_bytes=64,
+            )
+
+        nddev_kilo_cli.run_bun_install = fake_run_bun_install
+        try:
+            try:
+                nddev_kilo_cli.install_or_update_cli(target, "install-cli")
+            except nddev_kilo_cli.ManagerError as exc:
+                if "64-byte limit" not in str(exc):
+                    fail(f"hardlink materialization failed for the wrong reason: {exc}")
+            else:
+                fail("oversized hardlinked staged file was accepted")
+        finally:
+            nddev_kilo_cli.run_bun_install = original_run_bun_install
+
+        if snapshot_tree(target) != before:
+            fail("failed hardlink materialization changed the target tree")
+        for relative in nddev_kilo_cli.SOFTWARE_REPLACE_PATHS:
+            if nddev_kilo_cli.path_exists_no_follow(target / relative):
+                fail(f"failed hardlink materialization left partial software state: {relative}")
+        leftovers = [
+            path.name
+            for path in workspace.iterdir()
+            if path != target and path.name.startswith(f".{target.name}.nddev-kilo-cli")
+        ]
+        if leftovers:
+            fail(f"failed hardlink materialization left transaction artifacts: {leftovers}")
+
+
 def main() -> int:
     try:
         validate_versions()
@@ -284,6 +369,7 @@ def main() -> int:
         validate_workflows()
         validate_manager_parse_args()
         validate_launch_guard()
+        validate_hardlink_materialization_bound()
     except ValidationError as exc:
         print(f"public contract validation failed: {exc}", file=sys.stderr)
         return 1
