@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -28,6 +29,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows is intentionally unsupported.
+    fcntl = None  # type: ignore[assignment]
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "setups"
@@ -159,6 +165,9 @@ SOFTWARE_GLOBAL_DIR_RELATIVE = SOFTWARE_PREFIX_RELATIVE / "lib"
 SOFTWARE_LOCK_RELATIVE = Path("software") / "package-lock.json"
 BACKUP_POOL_RELATIVE = Path(".nddev-kilo-cli-backups")
 LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
+LOCK_FILE_NAME = "lock"
+LOCK_OWNER_NAME = "owner.json"
+LOCK_HELD_PARENT_MODE = 0o500
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
@@ -332,13 +341,14 @@ def group_or_world_writable(info: os.stat_result) -> bool:
 
 
 def chmod_directory_no_follow(path: Path, mode: int, label: str) -> os.stat_result:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail(f"{label} mode changes require O_NOFOLLOW support: {path}")
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags |= os.O_NOFOLLOW
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -872,8 +882,162 @@ def lock_path(target: Path) -> Path:
     return target / LOCK_RELATIVE
 
 
+def lock_file_path(target: Path) -> Path:
+    return lock_path(target) / LOCK_FILE_NAME
+
+
+def lock_owner_path(target: Path) -> Path:
+    return lock_path(target) / LOCK_OWNER_NAME
+
+
+def restore_stale_launch_protection_modes(target: Path) -> None:
+    candidates = {target / relative for relative in SOFTWARE_PARENT_PATHS}
+    install_root = target / SOFTWARE_PREFIX_RELATIVE
+    if path_exists_no_follow(install_root):
+        candidates.add(install_root)
+        for path in install_root.rglob("*"):
+            if len(candidates) > SOFTWARE_TREE_MAX_PATHS:
+                fail("stale launch protection recovery exceeded the software path limit")
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                candidates.add(path)
+    for path in sorted(candidates, key=lambda item: len(item.parts)):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        if stat.S_IMODE(info.st_mode) != LOCK_HELD_PARENT_MODE:
+            continue
+        if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+            fail(f"stale launch-protected directory must be owned by the current user: {path}")
+        chmod_directory_no_follow(path, OWNER_DIR_MODE, "stale launch-protected directory")
+
+
+def require_lock_directory(lock: Path) -> os.stat_result:
+    info = require_directory(lock, "target lock parent")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode not in {OWNER_DIR_MODE, LOCK_HELD_PARENT_MODE}:
+        fail("target lock parent must be private to the current user with mode 0700 or 0500")
+    if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+        fail("target lock parent must be owned by the current user")
+    return info
+
+
+def ensure_lock_directory(target: Path) -> None:
+    lock = lock_path(target)
+    try:
+        info = lock.lstat()
+    except FileNotFoundError:
+        lock.mkdir(mode=OWNER_DIR_MODE)
+        final = chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+        if not is_owner_private_directory(final):
+            fail("target lock parent must be private to the current user with mode 0700")
+        return
+    if stat.S_ISLNK(info.st_mode):
+        fail("target lock parent must not be a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("target lock parent must be a real directory")
+    require_lock_directory(lock)
+
+
+def ensure_lock_file(target: Path) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("target lifecycle lock file requires O_NOFOLLOW support")
+    lock = lock_path(target)
+    lock_file = lock_file_path(target)
+    ensure_lock_directory(target)
+    try:
+        info = lock_file.lstat()
+    except FileNotFoundError:
+        lock_info = require_lock_directory(lock)
+        if stat.S_IMODE(lock_info.st_mode) != OWNER_DIR_MODE:
+            chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        return descriptor
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("target lock file must be a regular file")
+    if info.st_nlink != 1:
+        fail("target lock file must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("target lock file must be owned by the current user with mode 0600")
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_file, flags)
+    opened = os.fstat(descriptor)
+    if identity_of(opened) != identity_of(info):
+        os.close(descriptor)
+        raise ConcurrentTargetChange("target lock file changed while it was opened")
+    return descriptor
+
+
+def write_lock_owner(target: Path, *, held: bool) -> None:
+    lock = lock_path(target)
+    owner = lock_owner_path(target)
+    lock_info = require_lock_directory(lock)
+    if stat.S_IMODE(lock_info.st_mode) != OWNER_DIR_MODE:
+        chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+    atomic_write(
+        target,
+        str(owner.relative_to(target)),
+        canonical_json(
+            {
+                "schema_version": 2,
+                "pid": os.getpid(),
+                "target": str(target),
+                "lock_file": str(lock_file_path(target).relative_to(target)),
+                "held": held,
+            }
+        ),
+    )
+
+
+def cleanup_lock_artifacts_for_created_target(target: Path, transaction: DirectoryTransaction) -> None:
+    if target not in transaction.created:
+        return
+    lock = lock_path(target)
+    try:
+        info = lock.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return
+    if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+        return
+    with contextlib.suppress(OSError):
+        chmod_directory_no_follow(lock, OWNER_DIR_MODE, "created target lock parent")
+    for path in (lock_owner_path(target), lock_file_path(target)):
+        try:
+            child_info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(child_info.st_mode) or not stat.S_ISREG(child_info.st_mode):
+            continue
+        if hasattr(os, "geteuid") and owner_of(child_info) != os.geteuid():
+            continue
+        with contextlib.suppress(OSError):
+            path.unlink()
+    with contextlib.suppress(OSError):
+        lock.rmdir()
+
+
 @contextlib.contextmanager
 def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[DirectoryTransaction]:
+    if fcntl is None:
+        fail("target lifecycle locks require fcntl.flock on this platform")
     transaction = DirectoryTransaction([])
     if create_parent:
         ensure_directory_chain(target.parent, transaction, "canonical target parent")
@@ -883,23 +1047,34 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
         if not ensure_private_directory(target, create=False, transaction=transaction):
             fail("target is missing")
     lock = lock_path(target)
-    owner = lock / "owner.json"
+    descriptor = -1
+    acquired = False
     try:
-        lock.mkdir(mode=OWNER_DIR_MODE)
-        lock.chmod(OWNER_DIR_MODE)
-        owner.write_bytes(
-            canonical_json({"schema_version": 1, "pid": os.getpid(), "target": str(target)})
-        )
-        owner.chmod(OWNER_FILE_MODE)
-    except FileExistsError:
-        transaction.cleanup()
-        fail(f"target is locked: {lock}")
+        descriptor = ensure_lock_file(target)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            os.close(descriptor)
+            descriptor = -1
+            fail(f"target is locked: {lock_file_path(target)}")
+        acquired = True
+        lock_file_info = os.fstat(descriptor)
+        current_lock_file = lock_file_path(target).lstat()
+        if identity_of(lock_file_info) != identity_of(current_lock_file):
+            raise ConcurrentTargetChange("target lock file changed after it was locked")
+        write_lock_owner(target, held=True)
+        restore_stale_launch_protection_modes(target)
+        chmod_directory_no_follow(lock, LOCK_HELD_PARENT_MODE, "target lock parent")
     except BaseException:
-        with contextlib.suppress(OSError):
-            if path_exists_no_follow(owner) and not owner.is_symlink():
-                owner.unlink()
-            lock.rmdir()
+        cleanup_lock_artifacts_for_created_target(target, transaction)
         transaction.cleanup()
+        if descriptor >= 0:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
         raise
     failed = False
     try:
@@ -909,13 +1084,17 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
         raise
     finally:
         try:
-            owner = lock / "owner.json"
-            if path_exists_no_follow(owner) and not owner.is_symlink():
-                owner.unlink()
-            lock.rmdir()
+            if acquired and descriptor >= 0:
+                chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+                write_lock_owner(target, held=False)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError as exc:
             raise ManagerError(f"target lock cleanup failed: {lock}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if failed:
+            cleanup_lock_artifacts_for_created_target(target, transaction)
             transaction.cleanup()
 
 
@@ -1759,6 +1938,75 @@ def launch_environment(target: Path) -> dict[str, str]:
         env[key] = str(path)
     env["KILO_CONFIG"] = str((target / CONFIG).resolve(strict=False))
     return env
+
+
+@dataclass
+class LaunchDirectoryProtection:
+    modes: list[tuple[Path, int]]
+
+    def restore(self) -> None:
+        for path, mode in reversed(self.modes):
+            chmod_directory_no_follow(path, mode, "launch-protected directory")
+
+
+def append_directory_chain(target: Path, relative: Path, directories: list[Path]) -> None:
+    for parent in reversed(relative.parents):
+        if parent == Path("."):
+            continue
+        directories.append(target / parent)
+
+
+def launch_handoff_directories(target: Path, installation: dict[str, Any]) -> list[Path]:
+    native = installation.get("native_executable")
+    if not isinstance(native, str) or Path(native).is_absolute():
+        fail("Kilo CLI native executable provenance is invalid; run update-cli")
+    native_relative = safe_relative_path(native)
+    directories: list[Path] = [lock_path(target)]
+    append_directory_chain(target, Path("bin") / KILO_COMMAND, directories)
+    append_directory_chain(target, native_relative, directories)
+    resources = installation.get("runtime_resource_contract")
+    if isinstance(resources, dict):
+        for value in resources.values():
+            if not isinstance(value, dict) or value.get("present") is not True:
+                continue
+            path = value.get("path")
+            if not isinstance(path, str):
+                continue
+            resource_relative = safe_relative_path(path)
+            append_directory_chain(target, resource_relative / "resource-placeholder", directories)
+            directories.append(target / resource_relative)
+    unique: dict[Path, None] = {}
+    for directory in directories:
+        unique.setdefault(directory, None)
+    return sorted(unique, key=lambda item: len(item.relative_to(target).parts))
+
+
+def protect_launch_handoff_paths(
+    target: Path, installation: dict[str, Any]
+) -> LaunchDirectoryProtection:
+    protected: list[tuple[Path, int]] = []
+    try:
+        for directory in launch_handoff_directories(target, installation):
+            info = require_directory(directory, "launch handoff directory")
+            mode = stat.S_IMODE(info.st_mode)
+            if mode not in {OWNER_DIR_MODE, LOCK_HELD_PARENT_MODE}:
+                fail(
+                    "launch handoff directory must be private to the current user "
+                    f"with mode 0700 or 0500: {directory}"
+                )
+            if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+                fail(f"launch handoff directory must be owned by the current user: {directory}")
+            protected.append((directory, mode))
+            if mode != LOCK_HELD_PARENT_MODE:
+                chmod_directory_no_follow(
+                    directory,
+                    LOCK_HELD_PARENT_MODE,
+                    "launch handoff directory",
+                )
+        return LaunchDirectoryProtection(protected)
+    except BaseException:
+        LaunchDirectoryProtection(protected).restore()
+        raise
 
 
 def reject_unsafe_tool_ancestors(path: Path) -> None:
@@ -3047,7 +3295,6 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
     if command == "update-cli":
         if preflight["software_state"] == "absent":
             fail("Kilo CLI is not installed at the selected target; use install-cli")
-        validate_existing_software_surface(target)
         if preflight["installed"] and preflight["current"]:
             return {
                 "schema_version": 1,
@@ -3129,7 +3376,6 @@ def remove_cli(target: Path) -> dict[str, Any]:
             "target": str(target),
             "changed": False,
         }
-    validate_existing_software_surface(target)
     staging = Path(
         tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove.")
     )
@@ -3146,6 +3392,7 @@ def remove_cli(target: Path) -> dict[str, Any]:
         moved_old: list[Path] = []
         with target_lock(target):
             require_private_target_directory_for_software(target, allow_missing=False)
+            validate_existing_software_surface(target)
             try:
                 for relative in SOFTWARE_REPLACE_PATHS:
                     destination = target / relative
@@ -3294,37 +3541,41 @@ def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) 
         installation = require_current_software(target)
         env = clean_launch_env(target)
         profile_id = stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
-        command = launch_command_for_profile(
-            revalidate_launch_executable(target, installation),
-            profile_id,
-            forwarded,
-        )
+        protection = protect_launch_handoff_paths(target, installation)
         try:
-            process = subprocess.Popen(
-                command,
-                env=env,
-                start_new_session=(os.name == "posix"),
+            command = launch_command_for_profile(
+                revalidate_launch_executable(target, installation),
+                profile_id,
+                forwarded,
             )
-        except FileNotFoundError:
-            fail("kilo executable disappeared before launch")
-        try:
-            return process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            if os.name == "posix":
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, 15)
-            else:
-                process.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=5)
-            if process.poll() is None:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    env=env,
+                    start_new_session=(os.name == "posix"),
+                )
+            except FileNotFoundError:
+                fail("kilo executable disappeared before launch")
+            try:
+                return process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
                 if os.name == "posix":
                     with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, 9)
+                        os.killpg(process.pid, 15)
                 else:
                     process.kill()
-                process.wait()
-            return 124
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+                if process.poll() is None:
+                    if os.name == "posix":
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, 9)
+                    else:
+                        process.kill()
+                    process.wait()
+                return 124
+        finally:
+            protection.restore()
 
 
 def print_payload(payload: dict[str, Any], *, as_json: bool) -> None:

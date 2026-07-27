@@ -75,12 +75,17 @@ its `bin/kilo`, writes a target-owned wrapper, and records wrapper, native
 binary, and resource digests in the software manifest.
 
 `launch` requires a clean active setup and current target-owned CLI software,
-then holds the target lifecycle lock while `/absolute/kilo-target/bin/kilo run`
-executes and through timeout cleanup. It validates runtime HOME/TMPDIR/XDG
-directories as real target-owned 0700 directories, rejects symlink components,
-and revalidates wrapper and native executable inode and digest immediately
-before child start. Lifecycle mutations fail while launch is running. Only the
-`full-auto` profile receives the managed `--auto` flag.
+then holds a persistent target-internal `fcntl.flock` lock file while
+`/absolute/kilo-target/bin/kilo run` executes and through timeout cleanup. It
+keeps the lock parent and verified wrapper/native/resource parent directories
+traversable but non-writable while the child runs, validates runtime
+HOME/TMPDIR/XDG directories as real target-owned 0700 directories, rejects
+symlink components, and revalidates wrapper and native executable inode and
+digest immediately before child start. This is a write-protected verified-path
+handoff under the no-sandbox same-UID boundary; it is not portable fd execution
+and does not claim resistance to deliberate same-UID chmod. Lifecycle mutations
+fail while launch is running. Only the `full-auto` profile receives the managed
+`--auto` flag.
 
 ## Safety
 

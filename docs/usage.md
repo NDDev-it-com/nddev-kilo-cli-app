@@ -35,12 +35,16 @@ The child process receives isolated runtime paths and
 `KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`. The manager
 requires target-owned `bin/kilo`, validates each runtime HOME/TMPDIR/XDG
 directory as a real target-owned 0700 directory without symlink components,
-revalidates wrapper and native executable inode and digest immediately before
-child start, holds the target lifecycle lock until the child exits or timeout
-cleanup finishes, forwards the child exit code, and returns `124` if the
-bounded launch timeout expires. Lifecycle mutations fail while launch is
-running. The default `full-auto` profile uses `kilo run --auto`; `safe` uses
-`kilo run` without `--auto`.
+holds a persistent target-internal `fcntl.flock` lock file until the child exits
+or timeout cleanup finishes, and keeps the lock parent plus verified
+wrapper/native/resource parent directories traversable but non-writable while
+the child runs. It revalidates wrapper and native executable inode and digest
+immediately before child start, forwards the child exit code, and returns `124`
+if the bounded launch timeout expires. This is a write-protected verified-path
+handoff under the no-sandbox same-UID boundary, not portable fd execution, and
+it does not claim resistance to deliberate same-UID chmod. Lifecycle mutations
+fail while launch is running. The default `full-auto` profile uses
+`kilo run --auto`; `safe` uses `kilo run` without `--auto`.
 
 User child arguments that try to override managed config, home, permission,
 auto, sandbox, working scope, agent, model, session, attached files, remote

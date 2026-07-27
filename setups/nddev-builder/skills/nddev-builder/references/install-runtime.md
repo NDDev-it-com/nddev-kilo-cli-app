@@ -16,6 +16,8 @@ The manager must:
 - Never use Bun for Kilo CLI installation.
 - Never install into a live global npm prefix.
 
-Runtime launch uses the target-owned `bin/kilo`, not `PATH` discovery. Runtime
-HOME/TMPDIR/XDG directories must stay real target-owned 0700 directories without
-symlink components.
+Runtime launch uses the target-owned `bin/kilo`, not `PATH` discovery. The
+manager owns the exact lock, executable handoff, runtime directory, manifest,
+and status contract in `cli-tools/nddev_kilo_cli.py`,
+`build/manifest.json`, and `config/nddev-contract.json`. Do not copy the
+current runtime pins or package matrix into skill prose.

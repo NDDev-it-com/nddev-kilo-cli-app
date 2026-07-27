@@ -107,12 +107,29 @@ def validate_versions() -> None:
     if manifest.get("managed_state") != list(MANAGED_FILES):
         fail("manifest managed state list is not synchronized")
     runtime = manifest.get("runtime", {})
-    if runtime.get("lifecycle_lock") != "held-through-child":
+    if runtime.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("manifest launch lifecycle lock contract mismatch")
+    if runtime.get("lock_file") != str(
+        nddev_kilo_cli.lock_file_path(Path("/target")).relative_to("/target")
+    ):
+        fail("manifest launch lock file contract mismatch")
+    if runtime.get("lock_file_mode") != "0600":
+        fail("manifest launch lock file mode mismatch")
+    if runtime.get("lock_parent_mode_while_held") != "0500":
+        fail("manifest launch lock parent mode mismatch")
+    if runtime.get("lock_nonblocking_flock") is not True:
+        fail("manifest launch lock must use nonblocking flock")
     if runtime.get("pre_child_executable_revalidation") is not True:
         fail("manifest launch executable revalidation must be enabled")
     if runtime.get("denies_lifecycle_mutations_while_running") is not True:
         fail("manifest launch mutation denial contract mismatch")
+    if runtime.get("executable_handoff") != {
+        "kind": "write-protected-verified-path",
+        "portable_fd_execution": False,
+        "parent_mode_while_held": "0500",
+        "same_uid_chmod_resistant_without_sandbox": False,
+    }:
+        fail("manifest executable handoff contract mismatch")
     expected_runtime_directories = {
         "inside_target_only": True,
         "component_validation": "real-current-user-owned-0700",
@@ -153,12 +170,30 @@ def validate_contract() -> None:
         fail("runtime launch subcommand must be kilo run")
     if runtime_launch.get("auto_for_profiles") != ["full-auto"]:
         fail("runtime launch --auto must be limited to full-auto profile")
-    if runtime_launch.get("lifecycle_lock") != "held-through-child":
+    if runtime_launch.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("runtime launch must hold the target lifecycle lock through child completion")
+    if runtime_launch.get("lock_file") != str(
+        nddev_kilo_cli.lock_file_path(Path("/target")).relative_to("/target")
+    ):
+        fail("runtime launch lock file contract mismatch")
+    if runtime_launch.get("lock_file_mode") != "0600":
+        fail("runtime launch lock file mode mismatch")
+    if runtime_launch.get("lock_parent_mode_while_held") != "0500":
+        fail("runtime launch lock parent mode mismatch")
+    if runtime_launch.get("lock_nonblocking_flock") is not True:
+        fail("runtime launch must use nonblocking flock")
     if runtime_launch.get("pre_child_executable_revalidation") is not True:
         fail("runtime launch must revalidate the executable before child start")
     if runtime_launch.get("denies_lifecycle_mutations_while_running") is not True:
         fail("runtime launch must deny lifecycle mutations while running")
+    handoff = runtime_launch.get("executable_handoff")
+    if handoff != {
+        "kind": "write-protected-verified-path",
+        "portable_fd_execution": False,
+        "parent_mode_while_held": "0500",
+        "same_uid_chmod_resistant_without_sandbox": False,
+    }:
+        fail("runtime launch executable handoff contract mismatch")
     if runtime_launch.get("runtime_directories") != {
         "inside_target_only": True,
         "component_validation": "real-current-user-owned-0700",
@@ -500,6 +535,64 @@ def wait_until(label: str, predicate: Any, *, seconds: float = 5.0) -> None:
     fail(f"timed out waiting for {label}")
 
 
+def private_directory_mode(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def fake_launch_installation(
+    target: Path,
+    executable_content: bytes,
+    *,
+    native_content: bytes = b"fake-native\n",
+) -> tuple[Path, Path, dict[str, Any]]:
+    nddev_kilo_cli.mutate_setup(
+        target,
+        nddev_kilo_cli.DEFAULT_SETUP_ID,
+        nddev_kilo_cli.DEFAULT_PROFILE_ID,
+        "install",
+    )
+    nddev_kilo_cli.ensure_target_private_subdirectory(target, Path("bin"), "fake launch bin")
+    executable = nddev_kilo_cli.kilo_executable(target)
+    executable.write_bytes(executable_content)
+    executable.chmod(0o700)
+    native_relative = nddev_kilo_cli.native_package_binary_relative(
+        "@kilocode/cli-linux-x64-baseline"
+    )
+    nddev_kilo_cli.ensure_target_private_subdirectory(
+        target,
+        native_relative.parent,
+        "fake native package bin",
+    )
+    native = target / native_relative
+    native.write_bytes(native_content)
+    native.chmod(0o700)
+    return (
+        executable,
+        native,
+        {
+            "installed": True,
+            "current": True,
+            "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+            "executable": str(executable),
+            "entrypoint_sha256": nddev_kilo_cli.sha256_bytes(executable.read_bytes()),
+            "native_executable": str(native_relative),
+            "native_executable_sha256": nddev_kilo_cli.sha256_bytes(native.read_bytes()),
+        },
+    )
+
+
+def fake_current_software(
+    canonical_target: Path,
+    installation: dict[str, Any],
+) -> Any:
+    def fake_require_current_software(observed_target: Path) -> dict[str, Any]:
+        if observed_target != canonical_target:
+            fail("launch checked software for the wrong target")
+        return dict(installation)
+
+    return fake_require_current_software
+
+
 def validate_launch_lock_scope_and_executable_revalidation() -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-launch-") as raw:
         workspace = Path(raw)
@@ -508,44 +601,17 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
         target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
         target = target.resolve(strict=False)
         canonical_target = target
-        nddev_kilo_cli.mutate_setup(
-            target,
-            nddev_kilo_cli.DEFAULT_SETUP_ID,
-            nddev_kilo_cli.DEFAULT_PROFILE_ID,
-            "install",
-        )
-
-        executable = nddev_kilo_cli.kilo_executable(target)
-        executable.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
         started = target / "child-started"
         stop = target / "child-stop"
-        executable.write_bytes(
+        executable, _native, installation = fake_launch_installation(
+            target,
             (
                 "#!/bin/sh\n"
                 "set -eu\n"
                 f'printf started > "{started}"\n'
                 f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
-            ).encode("utf-8")
+            ).encode("utf-8"),
         )
-        executable.chmod(0o700)
-        executable_sha256 = nddev_kilo_cli.sha256_bytes(executable.read_bytes())
-        native_relative = nddev_kilo_cli.native_package_binary_relative(
-            "@kilocode/cli-linux-x64-baseline"
-        )
-        native = target / native_relative
-        native.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
-        native.write_bytes(b"fake-native\n")
-        native.chmod(0o700)
-        native_sha256 = nddev_kilo_cli.sha256_bytes(native.read_bytes())
-        installation = {
-            "installed": True,
-            "current": True,
-            "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
-            "executable": str(executable),
-            "entrypoint_sha256": executable_sha256,
-            "native_executable": str(native_relative),
-            "native_executable_sha256": native_sha256,
-        }
         if nddev_kilo_cli.revalidate_launch_executable(target, installation) != str(executable):
             fail("launch executable revalidation returned the wrong executable")
         expect_manager_error(
@@ -566,18 +632,16 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
         original_require_current_software = nddev_kilo_cli.require_current_software
         result: dict[str, Any] = {}
 
-        def fake_require_current_software(observed_target: Path) -> dict[str, Any]:
-            if observed_target != canonical_target:
-                fail("launch checked software for the wrong target")
-            return dict(installation)
-
         def run_launch() -> None:
             try:
                 result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
             except BaseException as exc:
                 result["error"] = exc
 
-        nddev_kilo_cli.require_current_software = fake_require_current_software
+        nddev_kilo_cli.require_current_software = fake_current_software(
+            canonical_target,
+            installation,
+        )
         thread = threading.Thread(target=run_launch)
         thread.start()
         try:
@@ -591,6 +655,10 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
                 fail(f"launch child exited before start marker with code: {result.get('code')}")
             if not nddev_kilo_cli.lock_path(target).is_dir():
                 fail("launch target lock was released while the child was running")
+            if not nddev_kilo_cli.lock_file_path(target).is_file():
+                fail("launch target lock file disappeared while the child was running")
+            if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o500:
+                fail("launch target lock parent remained writable while the child was running")
             try:
                 nddev_kilo_cli.mutate_setup(
                     target,
@@ -617,9 +685,207 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
             raise result["error"]
         if result.get("code") != 0:
             fail(f"launch child returned unexpected code: {result.get('code')}")
-        if nddev_kilo_cli.lock_path(target).exists():
-            fail("launch target lock was not cleaned up after child exit")
+        if not nddev_kilo_cli.lock_file_path(target).is_file():
+            fail("persistent launch target lock file was removed after child exit")
+        if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
+            fail("launch target lock parent was not restored after child exit")
 
+
+def validate_child_cannot_unlink_persistent_lock() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-flock-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        started = target / "child-started"
+        result_path = target / "child-lock-result"
+        stop = target / "child-stop"
+        executable, _native, installation = fake_launch_installation(
+            target,
+            (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                f'printf started > "{started}"\n'
+                f'if /bin/rm -f "{nddev_kilo_cli.lock_file_path(target)}" 2>/dev/null; then\n'
+                f'  if [ -e "{nddev_kilo_cli.lock_file_path(target)}" ]; then\n'
+                f'    printf denied > "{result_path}"\n'
+                "  else\n"
+                f'    printf removed > "{result_path}"\n'
+                "  fi\n"
+                "else\n"
+                f'  printf denied > "{result_path}"\n'
+                "fi\n"
+                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
+            ).encode("utf-8"),
+        )
+        del executable
+        original_require_current_software = nddev_kilo_cli.require_current_software
+        launch_result: dict[str, Any] = {}
+
+        def run_launch() -> None:
+            try:
+                launch_result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
+            except BaseException as exc:
+                launch_result["error"] = exc
+
+        nddev_kilo_cli.require_current_software = fake_current_software(target, installation)
+        thread = threading.Thread(target=run_launch)
+        thread.start()
+        try:
+            wait_until(
+                "child lock unlink attempt",
+                lambda: result_path.exists() or bool(launch_result.get("error")),
+            )
+            if "error" in launch_result:
+                raise launch_result["error"]
+            if result_path.read_text(encoding="utf-8") != "denied":
+                fail("launch child removed the persistent lifecycle lock file")
+            if not nddev_kilo_cli.lock_file_path(target).is_file():
+                fail("persistent lifecycle lock file is missing while launch is running")
+            try:
+                nddev_kilo_cli.mutate_setup(
+                    target,
+                    nddev_kilo_cli.DEFAULT_SETUP_ID,
+                    "safe",
+                    "switch",
+                )
+            except nddev_kilo_cli.ManagerError as exc:
+                if "target is locked" not in str(exc):
+                    fail(f"persistent flock denied mutation for the wrong reason: {exc}")
+            else:
+                fail("lifecycle mutation was accepted after child lock unlink attempt")
+            stop.write_bytes(b"stop\n")
+            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            thread.join(timeout=5)
+        finally:
+            nddev_kilo_cli.require_current_software = original_require_current_software
+            if thread.is_alive():
+                stop.write_bytes(b"stop\n")
+                thread.join(timeout=10)
+        if thread.is_alive():
+            fail("launch child thread did not finish after lock unlink regression")
+        if "error" in launch_result:
+            raise launch_result["error"]
+        if launch_result.get("code") != 0:
+            fail(
+                "lock unlink regression child returned unexpected code: "
+                f"{launch_result.get('code')}"
+            )
+        if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
+            fail("persistent lock parent mode was not restored after child exit")
+
+
+def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-handoff-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        started = target / "child-started"
+        stop = target / "child-stop"
+        executable, native, installation = fake_launch_installation(
+            target,
+            (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                f'printf started > "{started}"\n'
+                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
+            ).encode("utf-8"),
+        )
+        original_require_current_software = nddev_kilo_cli.require_current_software
+        launch_result: dict[str, Any] = {}
+
+        def run_launch() -> None:
+            try:
+                launch_result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
+            except BaseException as exc:
+                launch_result["error"] = exc
+
+        nddev_kilo_cli.require_current_software = fake_current_software(target, installation)
+        thread = threading.Thread(target=run_launch)
+        thread.start()
+        try:
+            wait_until(
+                "handoff launch child start",
+                lambda: started.exists() or bool(launch_result.get("error")),
+            )
+            if "error" in launch_result:
+                raise launch_result["error"]
+            if private_directory_mode(executable.parent) != 0o500:
+                fail("launch wrapper parent remained writable while child was running")
+            if private_directory_mode(native.parent) != 0o500:
+                fail("launch native binary parent remained writable while child was running")
+            for protected in (executable, native):
+                before = protected.read_bytes()
+                try:
+                    protected.unlink()
+                except OSError:
+                    pass
+                else:
+                    fail(f"ordinary unlink succeeded for launch-protected path: {protected}")
+                replacement = target / f"replacement-{protected.name}"
+                replacement.write_bytes(b"replacement\n")
+                replacement.chmod(0o700)
+                try:
+                    os.replace(replacement, protected)
+                except OSError:
+                    pass
+                else:
+                    fail(f"ordinary replace succeeded for launch-protected path: {protected}")
+                if protected.read_bytes() != before:
+                    fail(f"launch-protected path changed during handoff: {protected}")
+            stop.write_bytes(b"stop\n")
+            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            thread.join(timeout=5)
+        finally:
+            nddev_kilo_cli.require_current_software = original_require_current_software
+            if thread.is_alive():
+                stop.write_bytes(b"stop\n")
+                thread.join(timeout=10)
+        if thread.is_alive():
+            fail("launch child thread did not finish after handoff regression")
+        if "error" in launch_result:
+            raise launch_result["error"]
+        if launch_result.get("code") != 0:
+            fail(
+                "handoff regression child returned unexpected code: "
+                f"{launch_result.get('code')}"
+            )
+        if private_directory_mode(executable.parent) != 0o700:
+            fail("launch wrapper parent mode was not restored after child exit")
+        if private_directory_mode(native.parent) != 0o700:
+            fail("launch native binary parent mode was not restored after child exit")
+
+
+def validate_stale_launch_protection_recovery() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-stale-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        nddev_kilo_cli.ensure_target_private_subdirectory(target, Path("bin"), "stale bin")
+        install_root = target / nddev_kilo_cli.SOFTWARE_PREFIX_RELATIVE
+        nddev_kilo_cli.ensure_target_private_subdirectory(
+            target,
+            nddev_kilo_cli.SOFTWARE_PREFIX_RELATIVE,
+            "stale install root",
+        )
+        chmod_targets = [target / "bin", install_root]
+        for directory in chmod_targets:
+            nddev_kilo_cli.chmod_directory_no_follow(
+                directory,
+                nddev_kilo_cli.LOCK_HELD_PARENT_MODE,
+                "stale launch-protected test directory",
+            )
+        with nddev_kilo_cli.target_lock(target):
+            for directory in chmod_targets:
+                if private_directory_mode(directory) != nddev_kilo_cli.OWNER_DIR_MODE:
+                    fail("target lock did not recover stale launch-protected directory mode")
+        for directory in chmod_targets:
+            if private_directory_mode(directory) != nddev_kilo_cli.OWNER_DIR_MODE:
+                fail("stale launch-protected directory mode was not restored after lock")
 
 def validate_runtime_paths_reject_symlinks_before_child() -> None:
     original_require_active_clean_installed = nddev_kilo_cli.require_active_clean_installed
@@ -717,6 +983,17 @@ def snapshot_tree(root: Path) -> list[tuple[str, str, int, bytes | str | None]]:
     return records
 
 
+def without_lifecycle_lock(
+    records: list[tuple[str, str, int, bytes | str | None]],
+) -> list[tuple[str, str, int, bytes | str | None]]:
+    lock_root = nddev_kilo_cli.LOCK_RELATIVE.as_posix()
+    return [
+        record
+        for record in records
+        if record[0] != lock_root and not record[0].startswith(f"{lock_root}/")
+    ]
+
+
 def validate_hardlink_materialization_bound() -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bound-") as raw:
         workspace = Path(raw)
@@ -764,7 +1041,7 @@ def validate_hardlink_materialization_bound() -> None:
         finally:
             nddev_kilo_cli.run_npm_install = original_run_npm_install
 
-        if snapshot_tree(target) != before:
+        if without_lifecycle_lock(snapshot_tree(target)) != without_lifecycle_lock(before):
             fail("failed hardlink materialization changed the target tree")
 
 
@@ -1212,6 +1489,10 @@ def validate_lock_and_backup_precreation_guards() -> None:
         outside.write_text("preserve\n", encoding="utf-8")
         outside.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
 
+        def acquire_target_lock() -> None:
+            with nddev_kilo_cli.target_lock(target):
+                pass
+
         lock = nddev_kilo_cli.lock_path(target)
         os.symlink(outside, lock)
         try:
@@ -1222,6 +1503,35 @@ def validate_lock_and_backup_precreation_guards() -> None:
         if outside.read_text(encoding="utf-8") != "preserve\n":
             fail("external marker changed through precreated lock path")
         lock.unlink()
+
+        lock.mkdir(mode=0o777)
+        lock.chmod(0o777)
+        expect_manager_error(
+            "world-writable lock parent",
+            acquire_target_lock,
+        )
+        shutil.rmtree(lock)
+
+        lock.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        os.symlink(outside, nddev_kilo_cli.lock_file_path(target))
+        expect_manager_error(
+            "symlink lock file",
+            acquire_target_lock,
+        )
+        if outside.read_text(encoding="utf-8") != "preserve\n":
+            fail("external marker changed through precreated lock file")
+        nddev_kilo_cli.lock_file_path(target).unlink()
+        lock.rmdir()
+
+        lock.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        nddev_kilo_cli.lock_file_path(target).write_bytes(b"unsafe\n")
+        nddev_kilo_cli.lock_file_path(target).chmod(0o644)
+        expect_manager_error(
+            "world-readable lock file",
+            acquire_target_lock,
+        )
+        nddev_kilo_cli.lock_file_path(target).unlink()
+        lock.rmdir()
 
         pool = nddev_kilo_cli.backup_pool(target)
         os.symlink(outside, pool)
@@ -1310,6 +1620,9 @@ def main() -> int:
         validate_manager_parse_args()
         validate_launch_guard()
         validate_launch_lock_scope_and_executable_revalidation()
+        validate_child_cannot_unlink_persistent_lock()
+        validate_launch_handoff_denies_ordinary_replace_unlink()
+        validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
         validate_hardlink_materialization_bound()
         validate_package_lock_regressions()

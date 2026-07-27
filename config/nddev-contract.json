@@ -33,9 +33,19 @@
     "path_inherited": false,
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
-    "lifecycle_lock": "held-through-child",
+    "lifecycle_lock": "persistent-flock-held-through-child",
+    "lock_file": ".nddev-kilo-cli.lock/lock",
+    "lock_file_mode": "0600",
+    "lock_parent_mode_while_held": "0500",
+    "lock_nonblocking_flock": true,
     "pre_child_executable_revalidation": true,
     "denies_lifecycle_mutations_while_running": true,
+    "executable_handoff": {
+      "kind": "write-protected-verified-path",
+      "portable_fd_execution": false,
+      "parent_mode_while_held": "0500",
+      "same_uid_chmod_resistant_without_sandbox": false
+    },
     "max_runtime_seconds": 3600
   },
   "setup_system": {
