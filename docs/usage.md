@@ -1,12 +1,14 @@
 # Kilo Code CLI Setup Manager
 
 `nddev-kilo-cli-app` manages one public Kilo setup, `nddev-builder`, in an
-explicit target directory. Permission posture is selected with `full-auto` or
-`safe` profiles.
+explicit target directory. Permission posture is selected with manager profiles;
+query the current setup/profile contract with `list --json`.
 
-Managed setup files include the target Kilo config, `AGENTS.md`, builder
-instructions, a progressive Agent Skill toolkit, native agent and command
-markdown files, and a target-local local-file plugin.
+Managed setup content includes Kilo-native instructions, a progressive Agent
+Skill toolkit, agents, commands, and a target-local local-file plugin. The exact
+file inventory and native config paths are owned by
+`setups/nddev-builder/setup.json` and `cli-tools/nddev_kilo_cli.py`; use
+`plan --json` and `status --json` for the current machine-readable view.
 
 Lifecycle commands:
 
@@ -31,34 +33,25 @@ Use `launch` only against an already managed target:
 python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "inspect this repository"
 ```
 
-The child process receives isolated runtime paths and
-`KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`. The manager
-requires target-owned `bin/kilo`, validates each runtime HOME/TMPDIR/XDG
-directory as a real target-owned 0700 directory without symlink components,
-holds an external fixed-system-temp product/UID bootstrap `fcntl.flock` first,
-then holds the persistent target-internal lock until the child exits or timeout
-cleanup finishes. The external lock is keyed to the canonical target, remains
-outside the child runtime subtree, is not exposed in the child environment, and
-is specified in `config/nddev-contract.json`.
+Launch provides an isolated manager-controlled runtime for the child process,
+requires current target-owned CLI software, holds lifecycle locks through child
+completion or timeout cleanup, forwards the child exit code, and returns the
+documented timeout code when the bounded launch expires. It also keeps the
+runtime state Kilo needs writable while denying concurrent lifecycle mutations.
 
-While the child runs, the manager keeps only the dedicated target-internal lock
-parent plus verified immutable wrapper/native/resource artifact directories
-traversable but non-writable. The managed target root, runtime HOME/TMPDIR/XDG
-directories, and Kilo config/session directory stay writable for runtime state.
-It revalidates wrapper and native executable inode and digest immediately before
-child start, forwards the child exit code, and returns `124` if the bounded
-launch timeout expires. This is a write-protected verified-path handoff under
-the no-sandbox same-UID boundary, not portable fd execution, and it does not
-claim resistance to deliberate same-UID chmod or deliberate same-UID tampering
-with the external bootstrap root. Lifecycle mutations fail while launch is
-running. The default `full-auto` profile uses `kilo run --auto`; `safe` uses
-`kilo run` without `--auto`.
+Exact runtime environment variables, directory layout, lock structure, lock
+ordering, executable handoff, child argument filtering, timeout behavior, and
+profile-to-native-mode mapping are owned by `cli-tools/nddev_kilo_cli.py`,
+`profiles/`, and `config/nddev-contract.json`. Inspect live target state with
+`status --json` and installed CLI provenance with `software-status --json`.
 
-User child arguments that try to override managed config, home, permission,
-auto, sandbox, working scope, agent, model, session, attached files, remote
-attach, share, or permission-bypass flags are rejected.
+The launch boundary is a manager-verified path handoff under a no-sandbox
+same-UID threat model. It does not claim portable file-descriptor execution or
+resistance to deliberate same-UID tampering outside the manager-enforced
+filesystem boundary.
 
-`remove` deletes every builder-owned path in the code-owned managed file set,
-removes the managed stamp, preserves parseable unmanaged config keys, and
-preserves unmanaged files. Commented unmanaged JSONC still fails closed instead
-of being rewritten.
+`remove` returns a managed target toward unmanaged state by removing
+builder-owned artifacts and preserving non-managed state where the manager can
+parse it. The exact managed-file set, config preservation rules, and fail-closed
+JSONC boundary are owned by `cli-tools/nddev_kilo_cli.py` and
+`setups/nddev-builder/setup.json`.

@@ -3,8 +3,8 @@
 NDDev Kilo Code CLI setup manager.
 
 This module installs the public `nddev-builder` Kilo setup into an explicit
-isolated target. Permission posture is selected separately with profiles:
-`full-auto` is the default, and `safe` is available for human-gated work.
+isolated target. Permission posture is selected separately with manager
+profiles; query the current setup and profile contract with `list --json`.
 
 The manager never defaults to the caller's live `~/.config/kilo`, live npm
 prefix, live npm config, provider credentials, or auth stores.
@@ -14,41 +14,35 @@ prefix, live npm config, provider credentials, or auth stores.
 - Product docs: <https://kilo.ai/docs/code-with-ai/platforms/cli>
 - Official source: <https://github.com/Kilo-Org/kilocode>
 - Official install channel: `npm install -g @kilocode/cli`
-- Managed CLI package: `@kilocode/cli@7.4.16`
 - Runtime command used by this module: `kilo`
-- Managed config file inside a target: `xdg-config/kilo/kilo.jsonc`
 
-The npm package also exposes the official `kilocode` bin alias, but this module
-uses the documented `kilo` command.
+The managed package version, native package matrix, registry integrity, runtime
+config location, and launch binary selection are source-owned by
+`references/kilo-cli-baseline.json`, `config/nddev-contract.json`, and
+`cli-tools/nddev_kilo_cli.py`. Use `software-status --json` and
+`status --json` for target-specific state.
 
 ## Setup And Profiles
 
-- Setup: `nddev-builder`
-- Default profile: `full-auto`
-- Safe profile: `safe`
-- Legacy setup ids: `safe`, `balanced`, and `full-auto` may be read for
-  status, migration, restore, or removal, but never launched.
-
-`full-auto` uses native `permission: "allow"`, sandbox off, unrestricted
-network, and managed `kilo run --auto`.
-
-`safe` uses native ask/deny permissions, sandbox on, sandbox network denied, and
-no `--auto`.
+This public module currently ships the `nddev-builder` setup. The exact active
+setup ids, profile ids, legacy classifications, native permission modes,
+sandbox/network controls, and launch argv are owned by
+`cli-tools/nddev_kilo_cli.py`, `profiles/`, and `config/nddev-contract.json`;
+inspect them through `list --json` before switching or migrating a target.
 
 ## Builder Content
 
-The setup ships target-local native Kilo surfaces:
+The setup ships target-local native Kilo builder content: AGENTS instructions,
+builder guidance, a progressive Agent Skill toolkit, native agents, commands,
+and a local-file plugin. The exact installed file inventory and plugin path are
+owned by `setups/nddev-builder/setup.json` and `cli-tools/nddev_kilo_cli.py`;
+use `plan --json` or `status --json` to inspect what a target would receive or
+currently contains.
 
-- `AGENTS.md`
-- `instructions/nddev-builder.md`
-- Agent markdown files under `xdg-config/kilo/agent/`
-- Command markdown files under `xdg-config/kilo/command/`
-- `skills.paths` pointing at a progressive-disclosure Skill toolkit
-- A local file plugin at `xdg-config/kilo/nddev-builder-plugin.js`
-
-The plugin has no imports and only adds deterministic builder context during
-native compaction. It does not mutate permissions, sandbox, auth, provider,
-network, MCP, or tool behavior.
+The plugin's supported purpose and boundaries are owned by the setup source and
+the public contract. It is intended only for deterministic builder context
+during native compaction and must not become a hidden permission, sandbox, auth,
+provider, network, MCP, or tool-behavior control plane.
 
 ## Usage
 
@@ -67,40 +61,35 @@ python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "implement the task"
 ```
 
-`install-cli` and `update-cli` run an isolated exact npm global install into the
-target-owned prefix with lifecycle scripts disabled. The manager records Kilo's
-official postinstall as a forbidden installer-side boundary, verifies registry
-and lock metadata, binds a deterministic selected native package directly to
-its `bin/kilo`, writes a target-owned wrapper, and records wrapper, native
-binary, and resource digests in the software manifest.
+`install-cli` and `update-cli` maintain target-owned CLI software through the
+manager's pinned official-channel install boundary. The volatile package pin,
+registry proof, script policy, native package selection, wrapper/resource
+contract, and drift checks are owned by `references/kilo-cli-baseline.json`,
+`config/nddev-contract.json`, and `cli-tools/nddev_kilo_cli.py`; inspect the
+current installed provenance with `software-status --json`.
 
-`launch` requires a clean active setup and current target-owned CLI software,
-then takes an external fixed-system-temp product/UID bootstrap `fcntl.flock`
-keyed to the canonical target before taking the persistent target-internal
-lock. Both locks are held while `/absolute/kilo-target/bin/kilo run` executes
-and through timeout cleanup, with the internal lock released before the
-external lock. The external lock path is not exposed to the child; the exact
-shape is recorded in `config/nddev-contract.json`.
+`launch` requires a clean managed setup and current target-owned CLI software.
+It holds lifecycle locks through child completion or timeout cleanup, preserves
+the runtime writability Kilo needs, and denies concurrent lifecycle mutations
+while the child is running. Exact lock structure, lock ordering, runtime
+environment, executable handoff, child argument filtering, and timeout behavior
+are owned by `cli-tools/nddev_kilo_cli.py` and summarized in
+`config/nddev-contract.json`; inspect target state with `status --json` and
+`software-status --json`.
 
-During launch, the manager keeps only the dedicated target-internal lock parent
-and verified immutable wrapper/native/resource artifact directories traversable
-but non-writable. The managed target root, runtime HOME/TMPDIR/XDG directories,
-and Kilo config/session directory stay writable for the launched CLI. Runtime
-paths are still validated as real target-owned 0700 directories without symlink
-components, and wrapper plus native executable inode and digest are revalidated
-immediately before child start. This is a write-protected verified-path handoff
-under the no-sandbox same-UID boundary; it is not portable fd execution and does
-not claim resistance to deliberate same-UID chmod or deliberate same-UID
-tampering with the external bootstrap root. Lifecycle mutations fail while
-launch is running. Only the `full-auto` profile receives the managed `--auto`
-flag.
+The launch boundary is a manager-verified path handoff under a no-sandbox
+same-UID threat model. It does not claim portable file-descriptor execution or
+resistance to deliberate same-UID tampering outside the manager-enforced
+filesystem boundary.
 
 ## Safety
 
-The manager requires an explicit absolute target, rejects target symlinks and
-managed symlink or hard-link paths, validates target-owned software symlinks,
-bounds reads and installed tree scans, records target-bound stamps, rotates ten
-target-bound backup slots, detects managed drift before mutation, denies legacy
-launches, removes every builder-owned path from the code-owned managed file
-set, preserves parseable unmanaged config keys and unmanaged files, bounds child
-processes, and rolls back target writes on mutation failure.
+The manager requires an explicit absolute target, isolates auth and provider
+state from live user configuration, bounds reads and installed tree scans,
+records target-bound ownership, backs up and rolls back mutations, detects drift
+before writes, denies unmanaged or legacy launches, and preserves unmanaged
+state according to the code-owned parser and managed-file set. Exact path lists,
+backup layout, ownership checks, removal behavior, and migration rules are
+owned by `cli-tools/nddev_kilo_cli.py`, `setups/nddev-builder/setup.json`, and
+`config/nddev-contract.json`; use `plan --json` and `status --json` for the
+current machine-readable view.
