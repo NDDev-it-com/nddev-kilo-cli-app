@@ -1358,6 +1358,11 @@ def validate_remove_exhausts_managed_files() -> None:
         unmanaged_file = target / "unmanaged.txt"
         unmanaged_file.write_bytes(b"preserve me\n")
         unmanaged_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        nddev_kilo_cli.ensure_target_private_subdirectory(
+            target,
+            nddev_kilo_cli.safe_relative_path(nddev_kilo_cli.CONFIG).parent,
+            "remove validation managed config parent",
+        )
         write_public_json(target / nddev_kilo_cli.CONFIG, {"unmanaged": {"preserve": True}})
 
         nddev_kilo_cli.mutate_setup(
@@ -2321,6 +2326,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
         validate_hardlink_materialization_bound()
+        validate_remove_exhausts_managed_files()
         validate_package_lock_regressions()
         validate_native_selection_and_wrapper_regressions()
         validate_npm_install_ignores_lifecycle_scripts()
