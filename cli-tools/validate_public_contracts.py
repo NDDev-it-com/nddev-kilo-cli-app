@@ -392,6 +392,9 @@ def validate_builder_toolkit() -> None:
             fail(f"entry skill does not route to {name}")
         require_file(f"setups/nddev-builder/skills/nddev-builder/references/{name}")
     for relative in nddev_kilo_cli.ADDITIONAL_SKILLS:
+        focused_route = "../" + str(Path(relative).parent.name) + "/SKILL.md"
+        if focused_route not in entry:
+            fail(f"entry skill does not route to focused skill {relative}")
         text = require_file(f"setups/nddev-builder/{relative}").read_text(encoding="utf-8")
         if "description:" not in text:
             fail(f"{relative}: skill metadata is missing")

@@ -24,6 +24,18 @@ focused reference or additional skill needed for the current artifact family.
 | Official npm install and runtime launch | `references/install-runtime.md` |
 | Legacy migration and validation | `references/migration-validation.md` |
 
+## Focused Skills
+
+Use these local skills when the task is narrower than the full toolkit:
+
+| Need | Open |
+|---|---|
+| Config, discovery paths, regular-file adapters, and MCP boundaries | `../nddev-kilo-config/SKILL.md` |
+| Permission profiles, sandbox posture, and launch guard review | `../nddev-kilo-permissions/SKILL.md` |
+| Agent and subagent files | `../nddev-kilo-agents/SKILL.md` |
+| Local plugin and hook implementation | `../nddev-kilo-plugins/SKILL.md` |
+| Install, runtime launch, migration, and validator behavior | `../nddev-kilo-runtime/SKILL.md` |
+
 ## Working Rules
 
 - Keep public runtime code, setup payloads, contracts, release metadata, and
