@@ -20,7 +20,12 @@
     ],
     "lifecycle_lock": "held-through-child",
     "pre_child_executable_revalidation": true,
-    "denies_lifecycle_mutations_while_running": true
+    "denies_lifecycle_mutations_while_running": true,
+    "runtime_directories": {
+      "inside_target_only": true,
+      "component_validation": "real-current-user-owned-0700",
+      "reject_symlink_components": true
+    }
   },
   "software_lifecycle": {
     "manager_commands": [
@@ -34,6 +39,7 @@
       "argv": [
         "install",
         "--global",
+        "--ignore-scripts",
         "--save-exact",
         "--audit=false",
         "--fund=false",
@@ -41,18 +47,21 @@
         "@kilocode/cli@7.4.16"
       ],
       "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
-      "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d"
+      "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
+      "lifecycle_scripts": "disabled",
+      "nested_npm_fallback_allowed": false
     },
     "layout": {
       "bin": "bin/kilo",
       "global_dir": "install/npm-prefix",
       "package_lock": "software/package-lock.json",
-      "manifest": "software/kilo-cli.json"
+      "manifest": "software/kilo-cli.json",
+      "entrypoint_kind": "target-owned-native-wrapper",
+      "native_executable_policy": "selected-native-package-bin-kilo"
     },
     "bounds": {
       "max_paths": 120000,
-      "max_bytes": 1073741824,
-      "stage_version_probe_timeout_seconds": 60
+      "max_bytes": 1073741824
     }
   },
   "setups": [

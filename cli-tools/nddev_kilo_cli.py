@@ -127,6 +127,7 @@ KILO_PACKAGE_SHASUM = "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d"
 NPM_INSTALL_ARGV = (
     "install",
     "--global",
+    "--ignore-scripts",
     "--save-exact",
     "--audit=false",
     "--fund=false",
@@ -151,7 +152,6 @@ TRUSTED_NPM_CANDIDATES = (
 )
 PROCESS_OUTPUT_MAX_BYTES = 256 * 1024
 PROCESS_TIMEOUT_SECONDS = 180
-STAGE_VERSION_PROBE_TIMEOUT_SECONDS = 60
 SOFTWARE_TREE_MAX_BYTES = 1024 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 120000
 SOFTWARE_PREFIX_RELATIVE = Path("install") / "npm-prefix"
@@ -162,9 +162,16 @@ LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
-KILO_NATIVE_BIN_RELATIVE = (
-    SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / ".kilo"
+VENDOR_POSTINSTALL_BINARY_RELATIVE = KILO_PACKAGE_BIN_RELATIVE.parent / ".kilo"
+VENDOR_POSTINSTALL_RESOURCE_RELATIVES = (
+    VENDOR_POSTINSTALL_BINARY_RELATIVE,
+    KILO_PACKAGE_BIN_RELATIVE.parent / "tree-sitter",
+    KILO_PACKAGE_BIN_RELATIVE.parent / "console",
+    KILO_PACKAGE_BIN_RELATIVE.parent / "bwrap",
+    KILO_PACKAGE_BIN_RELATIVE.parent / "licenses",
+    KILO_PACKAGE_BIN_RELATIVE.parent / "kilo-sandbox-mutation-worker.js",
 )
+NATIVE_TREE_SITTER_ENV = "KILO_TREE_SITTER_WASM_DIR"
 SOFTWARE_MANIFEST_RELATIVE = Path("software") / "kilo-cli.json"
 SOFTWARE_REPLACE_PATHS = (
     Path("bin") / KILO_COMMAND,
@@ -322,6 +329,31 @@ def is_sticky_directory(info: os.stat_result) -> bool:
 
 def group_or_world_writable(info: os.stat_result) -> bool:
     return bool(stat.S_IMODE(info.st_mode) & 0o022)
+
+
+def chmod_directory_no_follow(path: Path, mode: int, label: str) -> os.stat_result:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ManagerError(f"{label} must be a real directory: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
+            fail(f"{label} must be a real directory: {path}")
+        os.fchmod(descriptor, mode)
+        final = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(final):
+            raise ConcurrentTargetChange(f"{label} changed while its mode was set: {path}")
+        return final
+    finally:
+        os.close(descriptor)
 
 
 def require_safe_target_ancestor(path: Path, label: str) -> None:
@@ -628,6 +660,48 @@ def expected_native_records_for_host() -> dict[str, dict[str, Any]]:
             f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
         )
     return matches
+
+
+def native_package_preference_order(host: dict[str, str | None]) -> tuple[str, ...]:
+    os_name = host["os"]
+    cpu = host["cpu"]
+    libc = host["libc"]
+    if os_name == "darwin":
+        if cpu == "arm64":
+            return ("@kilocode/cli-darwin-arm64",)
+        if cpu == "x64":
+            return ("@kilocode/cli-darwin-x64-baseline", "@kilocode/cli-darwin-x64")
+    if os_name == "linux":
+        if cpu == "arm64":
+            if libc == "musl":
+                return ("@kilocode/cli-linux-arm64-musl", "@kilocode/cli-linux-arm64")
+            return ("@kilocode/cli-linux-arm64",)
+        if cpu == "x64":
+            if libc == "musl":
+                return (
+                    "@kilocode/cli-linux-x64-baseline-musl",
+                    "@kilocode/cli-linux-x64-musl",
+                )
+            return ("@kilocode/cli-linux-x64-baseline", "@kilocode/cli-linux-x64")
+    fail(
+        "Kilo CLI native package installation is supported only on macOS and Ubuntu-compatible Linux"
+    )
+
+
+def selected_native_package_name_for_host(host: dict[str, str | None]) -> str:
+    supported, _unsupported = native_package_matrix()
+    for package in native_package_preference_order(host):
+        if package in supported:
+            return package
+    fail(
+        "Kilo CLI baseline has no selected native package for "
+        f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
+    )
+
+
+def native_package_binary_relative(package: str) -> Path:
+    scope, name = package.split("/", 1)
+    return SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / scope / name / "bin" / KILO_COMMAND
 
 
 def setup_ids() -> list[str]:
@@ -1059,8 +1133,19 @@ def cleanup_empty_parents(target: Path, relative: str) -> None:
 
 def ensure_parent(target: Path, relative: str) -> Path:
     reject_relative_symlink_ancestors(target, relative)
-    path = target / safe_relative_path(relative)
-    path.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    relative_path = safe_relative_path(relative)
+    path = target / relative_path
+    parent_relative = relative_path.parent
+    if parent_relative == Path("."):
+        target_info = require_directory(target, "target")
+        if not is_owner_private_directory(target_info):
+            fail("target must be private to the current user with mode 0700")
+    else:
+        ensure_target_private_subdirectory(
+            target,
+            parent_relative,
+            f"managed parent {path.parent}",
+        )
     reject_relative_symlink_ancestors(target, relative)
     return path
 
@@ -1559,7 +1644,7 @@ def install_stage_environment(
         directory.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
         directory.chmod(OWNER_DIR_MODE)
     npm_userconfig.write_text(
-        f"registry={NPM_REGISTRY}\naudit=false\nfund=false\n",
+        f"registry={NPM_REGISTRY}\naudit=false\nfund=false\nignore-scripts=true\n",
         encoding="utf-8",
     )
     npm_userconfig.chmod(OWNER_FILE_MODE)
@@ -1580,18 +1665,32 @@ def install_stage_environment(
             "npm_config_userconfig": str(npm_userconfig),
             "npm_config_globalconfig": str(npm_globalconfig),
             "npm_config_update_notifier": "false",
+            "npm_config_ignore_scripts": "true",
             "npm_config_audit": "false",
             "npm_config_fund": "false",
             "NPM_CONFIG_CACHE": str(npm_cache),
             "NPM_CONFIG_PREFIX": str(npm_prefix),
             "NPM_CONFIG_USERCONFIG": str(npm_userconfig),
             "NPM_CONFIG_GLOBALCONFIG": str(npm_globalconfig),
+            "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         }
     )
     return env
 
 
-def native_wrapper_bytes() -> bytes:
+def native_wrapper_bytes(native_relative: Path, runtime_resources: dict[str, Any]) -> bytes:
+    tree_sitter = runtime_resources.get("tree_sitter")
+    tree_sitter_block = ""
+    if isinstance(tree_sitter, dict) and tree_sitter.get("present") is True:
+        tree_sitter_path = tree_sitter.get("path")
+        if not isinstance(tree_sitter_path, str):
+            fail("Kilo CLI tree-sitter resource contract is invalid")
+        tree_sitter_block = (
+            f'tree_sitter_dir="$self_dir/../{tree_sitter_path}"\n'
+            'if [ -f "$tree_sitter_dir/tree-sitter.wasm" ]; then\n'
+            f"  export {NATIVE_TREE_SITTER_ENV}=\"$tree_sitter_dir\"\n"
+            "fi\n"
+        )
     return (
         "#!/bin/sh\n"
         "set -eu\n"
@@ -1599,30 +1698,62 @@ def native_wrapper_bytes() -> bytes:
         "  */*) self_dir=${0%/*} ;;\n"
         "  *) self_dir=. ;;\n"
         "esac\n"
-        'package_bin_dir="$self_dir/../install/npm-prefix/lib/node_modules/@kilocode/cli/bin"\n'
-        'if [ -f "$package_bin_dir/tree-sitter/tree-sitter.wasm" ]; then\n'
-        '  export KILO_TREE_SITTER_WASM_DIR="$package_bin_dir/tree-sitter"\n'
-        "fi\n"
-        'exec "$package_bin_dir/.kilo" "$@"\n'
+        f'native_bin="$self_dir/../{native_relative}"\n'
+        f"{tree_sitter_block}"
+        'exec "$native_bin" "$@"\n'
     ).encode("utf-8")
 
 
-def target_runtime_paths(target: Path) -> dict[str, Path]:
+def target_runtime_relative_paths() -> dict[str, Path]:
     return {
-        "HOME": target / "home",
-        "TMPDIR": target / "tmp",
-        "XDG_CONFIG_HOME": target / "xdg-config",
-        "XDG_DATA_HOME": target / "xdg-data",
-        "XDG_STATE_HOME": target / "xdg-state",
-        "XDG_CACHE_HOME": target / "xdg-cache",
+        "HOME": Path("home"),
+        "TMPDIR": Path("tmp"),
+        "XDG_CONFIG_HOME": Path("xdg-config"),
+        "XDG_DATA_HOME": Path("xdg-data"),
+        "XDG_STATE_HOME": Path("xdg-state"),
+        "XDG_CACHE_HOME": Path("xdg-cache"),
+    }
+
+
+def target_runtime_paths(target: Path) -> dict[str, Path]:
+    return {name: target / relative for name, relative in target_runtime_relative_paths().items()}
+
+
+def ensure_target_private_subdirectory(target: Path, relative: Path, label: str) -> Path:
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        fail(f"{label} path is not target-relative")
+    target_info = require_directory(target, "target")
+    if not is_owner_private_directory(target_info):
+        fail("target must be private to the current user with mode 0700")
+    current = target
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=OWNER_DIR_MODE)
+            final = chmod_directory_no_follow(current, OWNER_DIR_MODE, label)
+            if not is_owner_private_directory(final):
+                fail(f"{label} must be private to the current user with mode 0700: {current}")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"{label} must not contain symlink components: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a real directory: {current}")
+        if not is_owner_private_directory(info):
+            fail(f"{label} must be private to the current user with mode 0700: {current}")
+    return current
+
+
+def ensure_runtime_directories(target: Path) -> dict[str, Path]:
+    return {
+        name: ensure_target_private_subdirectory(target, relative, f"runtime {name}")
+        for name, relative in target_runtime_relative_paths().items()
     }
 
 
 def launch_environment(target: Path) -> dict[str, str]:
-    paths = target_runtime_paths(target)
-    for path in paths.values():
-        path.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
-        path.chmod(OWNER_DIR_MODE)
+    paths = ensure_runtime_directories(target)
     env = safe_child_base_environment(include_path=False)
     for key, path in paths.items():
         env[key] = str(path)
@@ -2092,7 +2223,7 @@ def verify_registry_metadata(metadata: dict[str, Any]) -> None:
         fail("npm registry metadata shasum does not match the pinned baseline")
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
-        fail("npm registry metadata postinstall contract is invalid")
+        fail("npm registry metadata vendor lifecycle script baseline changed")
     supported, unsupported = native_package_matrix()
     expected_native = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
     optional = metadata.get("optionalDependencies")
@@ -2164,6 +2295,108 @@ def native_package_binary_digest(root: Path, package_path: Path) -> str:
     return digest_regular_file(binary, f"Kilo native package binary {package_path.name}", {"value": 0})
 
 
+def optional_directory_entry_contract(
+    root: Path,
+    directory: Path,
+    entrypoint: str,
+    label: str,
+) -> dict[str, Any]:
+    if not path_exists_no_follow(directory):
+        return {"present": False}
+    info = require_directory(directory, label)
+    if not is_owner_private_directory(info):
+        fail(f"{label} must be private to the current user with mode 0700")
+    entry = directory / entrypoint
+    digest = digest_regular_file(entry, f"{label} entrypoint", {"value": 0})
+    return {
+        "present": True,
+        "path": str(directory.relative_to(root)),
+        "entrypoint": str(entry.relative_to(root)),
+        "entrypoint_sha256": digest,
+    }
+
+
+def optional_directory_contract(root: Path, directory: Path, label: str) -> dict[str, Any]:
+    if not path_exists_no_follow(directory):
+        return {"present": False}
+    info = require_directory(directory, label)
+    if not is_owner_private_directory(info):
+        fail(f"{label} must be private to the current user with mode 0700")
+    return {
+        "present": True,
+        "path": str(directory.relative_to(root)),
+    }
+
+
+def optional_file_contract(
+    root: Path,
+    path: Path,
+    label: str,
+    *,
+    executable: bool = False,
+) -> dict[str, Any]:
+    if not path_exists_no_follow(path):
+        return {"present": False}
+    if executable:
+        require_safe_executable(path, root, label)
+    digest = digest_regular_file(path, label, {"value": 0})
+    return {
+        "present": True,
+        "path": str(path.relative_to(root)),
+        "sha256": digest,
+    }
+
+
+def runtime_resource_contract(root: Path, package_path: Path) -> dict[str, Any]:
+    bin_root = package_path / "bin"
+    bin_info = require_directory(bin_root, f"Kilo native package bin {package_path.name}")
+    if not is_owner_private_directory(bin_info):
+        fail(f"Kilo native package bin {package_path.name} must be private to the current user")
+    tree_sitter = optional_directory_entry_contract(
+        root,
+        bin_root / "tree-sitter",
+        "tree-sitter.wasm",
+        f"Kilo native package tree-sitter resources {package_path.name}",
+    )
+    if tree_sitter.get("present") is True:
+        tree_sitter["env"] = NATIVE_TREE_SITTER_ENV
+    else:
+        tree_sitter = {"present": False, "env": NATIVE_TREE_SITTER_ENV}
+    return {
+        "schema_version": 1,
+        "root": str(bin_root.relative_to(root)),
+        "tree_sitter": tree_sitter,
+        "console": optional_directory_entry_contract(
+            root,
+            bin_root / "console",
+            "index.html",
+            f"Kilo native package console resources {package_path.name}",
+        ),
+        "bwrap": optional_file_contract(
+            root,
+            bin_root / "bwrap",
+            f"Kilo native package bwrap resource {package_path.name}",
+            executable=True,
+        ),
+        "licenses": optional_directory_contract(
+            root,
+            bin_root / "licenses",
+            f"Kilo native package license resources {package_path.name}",
+        ),
+        "sandbox_mutation_worker": optional_file_contract(
+            root,
+            bin_root / "kilo-sandbox-mutation-worker.js",
+            f"Kilo native package sandbox worker resource {package_path.name}",
+        ),
+    }
+
+
+def validate_vendor_postinstall_not_materialized(root: Path) -> None:
+    for relative in VENDOR_POSTINSTALL_RESOURCE_RELATIVES:
+        if path_exists_no_follow(root / relative):
+            fail(f"vendor postinstall artifact is present despite ignore-scripts: {relative}")
+
+
 def installed_native_packages(root: Path) -> dict[str, Any]:
     supported, unsupported = native_package_matrix()
     allowed_for_host = expected_native_records_for_host()
@@ -2221,36 +2454,33 @@ def installed_native_packages(root: Path) -> dict[str, Any]:
                 "cpu": list(baseline_record["cpu"]),
                 "libc": baseline_record.get("libc"),
                 "path": str(manifest.parent.relative_to(root)),
+                "binary": str(native_package_binary_relative(name)),
                 "tarball": dist["tarball"],
                 "integrity": dist["integrity"],
                 "binary_sha256": native_package_binary_digest(root, package_path),
+                "runtime_resources": runtime_resource_contract(root, package_path),
             }
         )
     if not records:
-        fail("Kilo CLI postinstall did not leave an installed native package")
+        fail("Kilo CLI npm install did not leave an installed native package")
     allowed_names = set(allowed_for_host)
     candidates = [record for record in records if record["name"] in allowed_names]
     if not candidates:
         fail(
-            "Kilo CLI postinstall did not install a native package allowed for "
+            "Kilo CLI npm install did not install a native package allowed for "
             f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
         )
-    selected_digest = digest_regular_file(
-        root / KILO_NATIVE_BIN_RELATIVE,
-        "Kilo CLI native executable",
-        {"value": 0},
-    )
-    selected = [record for record in candidates if record["binary_sha256"] == selected_digest]
-    if len(selected) != 1:
-        fail(
-            "Kilo CLI postinstall selected native binary cannot be bound to exactly one "
-            "baseline package"
-        )
+    installed_by_name = {record["name"]: record for record in candidates}
+    selected_name = selected_native_package_name_for_host(host)
+    selected = installed_by_name.get(selected_name)
+    if selected is None:
+        fail(f"selected Kilo native package is not installed: {selected_name}")
     return {
         "host": host,
         "allowed_packages": sorted(allowed_names),
         "installed": sorted(records, key=lambda item: item["name"]),
-        "selected": selected[0],
+        "selection_order": list(native_package_preference_order(host)),
+        "selected": selected,
     }
 
 
@@ -2276,7 +2506,7 @@ def package_metadata(root: Path) -> dict[str, Any]:
         fail("Kilo CLI package bin map is invalid")
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
-        fail("Kilo CLI package postinstall contract is invalid")
+        fail("Kilo CLI package vendor lifecycle script baseline changed")
     optional = metadata.get("optionalDependencies")
     supported, unsupported = native_package_matrix()
     expected_optional = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
@@ -2337,8 +2567,19 @@ def compute_software_tree_digest(root: Path) -> dict[str, Any]:
         )
     require_safe_executable(root / "bin" / KILO_COMMAND, root, "Kilo CLI executable")
     metadata = package_metadata(root)
+    validate_vendor_postinstall_not_materialized(root)
     lock = package_lock_records(root)
     native_provenance = installed_native_packages(root)
+    selected = native_provenance["selected"]
+    wrapper_sha256 = digest_regular_file(
+        resolved_executable_path(
+            root / "bin" / KILO_COMMAND,
+            root,
+            "Kilo CLI executable",
+        ),
+        "Kilo CLI executable",
+        {"value": 0},
+    )
     return {
         "tree_digest": sha256_bytes(canonical_json(records)),
         "tree_bytes": byte_counter["value"],
@@ -2347,22 +2588,19 @@ def compute_software_tree_digest(root: Path) -> dict[str, Any]:
         "version": metadata["version"],
         "native_package_provenance": native_provenance,
         "native_packages": native_provenance["installed"],
-        "selected_native_package": native_provenance["selected"]["name"],
+        "selected_native_package": selected["name"],
+        "selected_native_package_path": selected["path"],
+        "native_executable": selected["binary"],
+        "native_executable_sha256": selected["binary_sha256"],
+        "runtime_resource_contract": selected["runtime_resources"],
         "package_lock_sha256": digest_regular_file(
             package_lock_path(root),
             "Kilo CLI package lock",
             {"value": 0},
         ),
         "package_lock_version": lock.get("lockfileVersion"),
-        "entrypoint_sha256": digest_regular_file(
-            resolved_executable_path(
-                root / "bin" / KILO_COMMAND,
-                root,
-                "Kilo CLI executable",
-            ),
-            "Kilo CLI executable",
-            {"value": 0},
-        ),
+        "entrypoint_sha256": wrapper_sha256,
+        "wrapper_sha256": wrapper_sha256,
         "package_manifest_sha256": digest_regular_file(
             root
             / SOFTWARE_GLOBAL_DIR_RELATIVE
@@ -2381,17 +2619,24 @@ def software_manifest_identity() -> dict[str, Any]:
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "package": KILO_PACKAGE,
-        "install_method": "npm-global-exact-isolated",
+        "install_method": "npm-global-exact-isolated-ignore-scripts",
         "package_version": KILO_CURRENT_VERSION,
         "package_integrity": KILO_PACKAGE_INTEGRITY,
         "package_shasum": KILO_PACKAGE_SHASUM,
         "npm_registry": NPM_REGISTRY,
         "npm_install_argv": list(NPM_INSTALL_ARGV),
         "npm_lock_argv": list(NPM_LOCK_ARGV),
+        "lifecycle_scripts": "disabled",
+        "vendor_postinstall": {
+            "present": True,
+            "script": "node ./postinstall.mjs",
+            "executed": False,
+            "nested_npm_fallback_allowed": False,
+        },
         "executable": f"bin/{KILO_COMMAND}",
         "entrypoint_kind": "target-owned-native-wrapper",
-        "package_bin": str(KILO_PACKAGE_BIN_RELATIVE),
-        "native_executable": str(KILO_NATIVE_BIN_RELATIVE),
+        "vendor_package_bin": str(KILO_PACKAGE_BIN_RELATIVE),
+        "native_executable_policy": "selected-native-package-bin-kilo",
         "install_root": str(SOFTWARE_PREFIX_RELATIVE),
         "package_lock": str(SOFTWARE_LOCK_RELATIVE),
     }
@@ -2500,9 +2745,15 @@ def software_status(target: Path) -> dict[str, Any]:
         "version": manifest.get("version"),
         "executable": str(executable),
         "entrypoint_sha256": manifest.get("entrypoint_sha256"),
+        "wrapper_sha256": manifest.get("wrapper_sha256"),
+        "native_executable": manifest.get("native_executable"),
+        "native_executable_sha256": manifest.get("native_executable_sha256"),
         "package": manifest.get("package"),
         "install_method": manifest.get("install_method"),
+        "lifecycle_scripts": manifest.get("lifecycle_scripts"),
         "selected_native_package": manifest.get("selected_native_package"),
+        "selected_native_package_path": manifest.get("selected_native_package_path"),
+        "runtime_resource_contract": manifest.get("runtime_resource_contract"),
         **presence,
     }
     if validation_error is not None:
@@ -2686,27 +2937,15 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
         shutil.rmtree(hold, ignore_errors=True)
 
 
-def observed_kilo_version(executable: Path, target: Path) -> str:
-    require_safe_executable(executable, target, "staged Kilo CLI executable")
-    completed = bounded_process(
-        [str(executable), "--version"],
-        cwd=target,
-        env=launch_environment(target),
-        timeout=STAGE_VERSION_PROBE_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        fail(f"Kilo CLI version smoke failed with exit {completed.returncode}")
-    text = "\n".join((completed.stdout, completed.stderr)).strip()
-    if KILO_CURRENT_VERSION not in text:
-        fail(f"Kilo CLI returned an invalid version string: {text!r}")
-    return KILO_CURRENT_VERSION
-
-
-def materialize_stage_entrypoint(live_stage: Path) -> None:
+def materialize_stage_entrypoint(live_stage: Path, native_provenance: dict[str, Any]) -> None:
     entrypoint = live_stage / "bin" / KILO_COMMAND
-    package_bin = live_stage / KILO_PACKAGE_BIN_RELATIVE
-    native_bin = live_stage / KILO_NATIVE_BIN_RELATIVE
-    require_safe_executable(package_bin, live_stage, "staged Kilo CLI package bin")
+    selected = native_provenance.get("selected")
+    if not isinstance(selected, dict):
+        fail("Kilo CLI native package selection is invalid")
+    native_relative = selected.get("binary")
+    if not isinstance(native_relative, str):
+        fail("Kilo CLI native package binary selection is invalid")
+    native_bin = live_stage / safe_relative_path(native_relative)
     require_safe_executable(native_bin, live_stage, "staged Kilo CLI native executable")
     entrypoint.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
     if path_exists_no_follow(entrypoint):
@@ -2715,7 +2954,10 @@ def materialize_stage_entrypoint(live_stage: Path) -> None:
             entrypoint.unlink()
         else:
             fail("staged Kilo CLI executable path is not replaceable")
-    entrypoint.write_bytes(native_wrapper_bytes())
+    runtime_resources = selected.get("runtime_resources")
+    if not isinstance(runtime_resources, dict):
+        fail("Kilo CLI native package resource contract is invalid")
+    entrypoint.write_bytes(native_wrapper_bytes(Path(native_relative), runtime_resources))
     entrypoint.chmod(0o700)
     require_safe_executable(entrypoint, live_stage, "staged Kilo CLI executable")
 
@@ -2775,14 +3017,13 @@ def run_npm_install(stage_root: Path, live_stage: Path) -> None:
         fail(
             f"npm install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}"
         )
+    validate_vendor_postinstall_not_materialized(live_stage)
     chmod_private_tree(live_stage)
     materialize_hardlinked_regular_files(live_stage)
-    materialize_stage_entrypoint(live_stage)
+    native_provenance = installed_native_packages(live_stage)
+    materialize_stage_entrypoint(live_stage, native_provenance)
     package_lock_records(live_stage)
     installed_native_packages(live_stage)
-    observed = observed_kilo_version(live_stage / "bin" / KILO_COMMAND, live_stage)
-    if observed != KILO_CURRENT_VERSION:
-        fail(f"npm produced Kilo CLI {observed}, expected {KILO_CURRENT_VERSION}")
 
 
 def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
@@ -2815,6 +3056,9 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
                 "changed": False,
                 "version": preflight["version"],
                 "executable": preflight["executable"],
+                "selected_native_package": preflight.get("selected_native_package"),
+                "native_executable": preflight.get("native_executable"),
+                "wrapper_sha256": preflight.get("wrapper_sha256"),
             }
     staging: Path | None = None
     with target_lock(target, create_parent=(command == "install-cli")) as transaction:
@@ -2842,6 +3086,9 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
                         "changed": False,
                         "version": status["version"],
                         "executable": status["executable"],
+                        "selected_native_package": status.get("selected_native_package"),
+                        "native_executable": status.get("native_executable"),
+                        "wrapper_sha256": status.get("wrapper_sha256"),
                     }
             staging = Path(
                 tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-stage.")
@@ -2867,6 +3114,9 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
         "changed": True,
         "version": installation["version"],
         "executable": installation["executable"],
+        "selected_native_package": installation.get("selected_native_package"),
+        "native_executable": installation.get("native_executable"),
+        "wrapper_sha256": installation.get("wrapper_sha256"),
     }
 
 
@@ -2969,6 +3219,25 @@ def revalidate_launch_executable(target: Path, installation: dict[str, Any]) -> 
         raise ConcurrentTargetChange("Kilo CLI executable changed before launch")
     if observed_sha256 != expected_sha256:
         fail("Kilo CLI executable digest changed before launch; run update-cli")
+    native = installation.get("native_executable")
+    native_sha256 = installation.get("native_executable_sha256")
+    if not isinstance(native, str) or Path(native).is_absolute():
+        fail("Kilo CLI native executable provenance is invalid; run update-cli")
+    if not isinstance(native_sha256, str) or not native_sha256:
+        fail("Kilo CLI native executable digest provenance is missing; run update-cli")
+    native_path = target / safe_relative_path(native)
+    native_resolved = resolved_executable_path(native_path, target, "Kilo CLI native executable")
+    native_before = native_resolved.lstat()
+    observed_native_sha256 = digest_regular_file(
+        native_resolved,
+        "Kilo CLI native executable",
+        {"value": 0},
+    )
+    native_after = native_resolved.lstat()
+    if identity_of(native_before) != identity_of(native_after):
+        raise ConcurrentTargetChange("Kilo CLI native executable changed before launch")
+    if observed_native_sha256 != native_sha256:
+        fail("Kilo CLI native executable digest changed before launch; run update-cli")
     return executable
 
 

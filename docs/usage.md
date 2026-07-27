@@ -33,9 +33,11 @@ python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --time
 
 The child process receives isolated runtime paths and
 `KILO_CONFIG=/absolute/kilo-target/xdg-config/kilo/kilo.jsonc`. The manager
-requires target-owned `bin/kilo`, revalidates its inode and digest immediately
-before child start, holds the target lifecycle lock until the child exits or
-timeout cleanup finishes, forwards the child exit code, and returns `124` if the
+requires target-owned `bin/kilo`, validates each runtime HOME/TMPDIR/XDG
+directory as a real target-owned 0700 directory without symlink components,
+revalidates wrapper and native executable inode and digest immediately before
+child start, holds the target lifecycle lock until the child exits or timeout
+cleanup finishes, forwards the child exit code, and returns `124` if the
 bounded launch timeout expires. Lifecycle mutations fail while launch is
 running. The default `full-auto` profile uses `kilo run --auto`; `safe` uses
 `kilo run` without `--auto`.

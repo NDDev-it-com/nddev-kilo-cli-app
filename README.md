@@ -68,16 +68,19 @@ python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --time
 ```
 
 `install-cli` and `update-cli` run an isolated exact npm global install into the
-target-owned prefix, allow Kilo's official npm postinstall, verify registry and
-lock metadata, verify the installed native package version, and then record a
-target-owned software manifest.
+target-owned prefix with lifecycle scripts disabled. The manager records Kilo's
+official postinstall as a forbidden installer-side boundary, verifies registry
+and lock metadata, binds a deterministic selected native package directly to
+its `bin/kilo`, writes a target-owned wrapper, and records wrapper, native
+binary, and resource digests in the software manifest.
 
 `launch` requires a clean active setup and current target-owned CLI software,
 then holds the target lifecycle lock while `/absolute/kilo-target/bin/kilo run`
-executes and through timeout cleanup. It revalidates the selected executable
-inode and digest immediately before child start. Lifecycle mutations fail while
-launch is running. Only the `full-auto` profile receives the managed `--auto`
-flag.
+executes and through timeout cleanup. It validates runtime HOME/TMPDIR/XDG
+directories as real target-owned 0700 directories, rejects symlink components,
+and revalidates wrapper and native executable inode and digest immediately
+before child start. Lifecycle mutations fail while launch is running. Only the
+`full-auto` profile receives the managed `--auto` flag.
 
 ## Safety
 

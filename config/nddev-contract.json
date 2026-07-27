@@ -25,6 +25,11 @@
     "config_env": "KILO_CONFIG",
     "config_path": "xdg-config/kilo/kilo.jsonc",
     "isolated_child_home": true,
+    "runtime_directories": {
+      "inside_target_only": true,
+      "component_validation": "real-current-user-owned-0700",
+      "reject_symlink_components": true
+    },
     "path_inherited": false,
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
@@ -119,6 +124,7 @@
     "install_argv": [
       "install",
       "--global",
+      "--ignore-scripts",
       "--save-exact",
       "--audit=false",
       "--fund=false",
@@ -127,16 +133,23 @@
     ],
     "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
     "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
-    "stage_version_probe_timeout_seconds": 60,
+    "lifecycle_scripts": "disabled",
+    "official_postinstall": {
+      "present": true,
+      "script": "node ./postinstall.mjs",
+      "executed": false,
+      "nested_npm_fallback_allowed": false
+    },
     "layout": {
       "bin": "bin/kilo",
       "global_dir": "install/npm-prefix",
       "package_lock": "software/package-lock.json",
       "manifest": "software/kilo-cli.json"
     },
-    "official_postinstall": true,
     "status_executes_binary": false,
-    "stage_version_probe": true,
+    "install_executes_target_binary": false,
+    "entrypoint_kind": "target-owned-native-wrapper",
+    "native_executable_policy": "selected-native-package-bin-kilo",
     "target_owned": true
   },
   "builder": {

@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import shutil
@@ -112,15 +113,33 @@ def validate_versions() -> None:
         fail("manifest launch executable revalidation must be enabled")
     if runtime.get("denies_lifecycle_mutations_while_running") is not True:
         fail("manifest launch mutation denial contract mismatch")
+    expected_runtime_directories = {
+        "inside_target_only": True,
+        "component_validation": "real-current-user-owned-0700",
+        "reject_symlink_components": True,
+    }
+    if runtime.get("runtime_directories") != expected_runtime_directories:
+        fail("manifest runtime directory isolation contract mismatch")
     software = manifest.get("software_lifecycle", {})
     if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
         fail("manifest npm installer argv mismatch")
+    installer = software.get("installer", {})
+    if installer.get("lifecycle_scripts") != "disabled":
+        fail("manifest installer lifecycle scripts must be disabled")
+    if installer.get("nested_npm_fallback_allowed") is not False:
+        fail("manifest installer must deny nested npm fallback")
     if software.get("layout", {}).get("package_lock") != str(nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE):
         fail("manifest package-lock path mismatch")
     if software.get("layout", {}).get("manifest") != str(nddev_kilo_cli.SOFTWARE_MANIFEST_RELATIVE):
         fail("manifest software layout mismatch")
+    if software.get("layout", {}).get("entrypoint_kind") != "target-owned-native-wrapper":
+        fail("manifest entrypoint kind mismatch")
+    if software.get("layout", {}).get("native_executable_policy") != "selected-native-package-bin-kilo":
+        fail("manifest native executable policy mismatch")
     if software.get("bounds", {}).get("max_paths") != nddev_kilo_cli.SOFTWARE_TREE_MAX_PATHS:
         fail("manifest software path bound mismatch")
+    if "stage_version_probe_timeout_seconds" in software.get("bounds", {}):
+        fail("manifest must not declare an install-time target binary probe")
 
 
 def validate_contract() -> None:
@@ -140,6 +159,12 @@ def validate_contract() -> None:
         fail("runtime launch must revalidate the executable before child start")
     if runtime_launch.get("denies_lifecycle_mutations_while_running") is not True:
         fail("runtime launch must deny lifecycle mutations while running")
+    if runtime_launch.get("runtime_directories") != {
+        "inside_target_only": True,
+        "component_validation": "real-current-user-owned-0700",
+        "reject_symlink_components": True,
+    }:
+        fail("runtime launch directory isolation contract mismatch")
     setup_system = contract.get("setup_system", {})
     if setup_system.get("setup_ids") != list(SETUPS):
         fail("setup ids are not synchronized")
@@ -157,10 +182,29 @@ def validate_contract() -> None:
         fail("software lifecycle must use npm")
     if software.get("install_argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
         fail("software lifecycle npm argv mismatch")
-    if software.get("official_postinstall") is not True:
-        fail("official npm postinstall must be acknowledged")
+    if "--ignore-scripts" not in software.get("install_argv", []):
+        fail("software lifecycle install argv must disable lifecycle scripts")
+    postinstall = software.get("official_postinstall")
+    if not isinstance(postinstall, dict):
+        fail("official npm postinstall must be recorded as structured evidence")
+    if (
+        postinstall.get("script") != "node ./postinstall.mjs"
+        or postinstall.get("executed") is not False
+        or postinstall.get("nested_npm_fallback_allowed") is not False
+    ):
+        fail("official npm postinstall boundary is invalid")
+    if software.get("lifecycle_scripts") != "disabled":
+        fail("software lifecycle scripts must be disabled")
     if software.get("status_executes_binary") is not False:
         fail("software-status must not execute the target binary")
+    if software.get("install_executes_target_binary") is not False:
+        fail("install must not execute target software")
+    if "stage_version_probe" in software or "stage_version_probe_timeout_seconds" in software:
+        fail("software lifecycle must not declare an install-time target binary probe")
+    if software.get("entrypoint_kind") != "target-owned-native-wrapper":
+        fail("software lifecycle entrypoint kind mismatch")
+    if software.get("native_executable_policy") != "selected-native-package-bin-kilo":
+        fail("software lifecycle native executable policy mismatch")
     builder = contract.get("builder", {})
     if builder.get("projection") != nddev_kilo_cli.BUILDER_PROJECTION:
         fail("builder projection mismatch")
@@ -188,6 +232,22 @@ def validate_baseline() -> None:
         fail("unexpected npm integrity")
     if npm.get("scripts", {}).get("postinstall") != "node ./postinstall.mjs":
         fail("unexpected npm postinstall script")
+    postinstall = npm.get("postinstall_analysis", {})
+    if postinstall.get("source") != "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz":
+        fail("postinstall analysis must point at the official npm tarball")
+    if postinstall.get("managed_policy") != (
+        "install with --ignore-scripts and bind directly to the selected native package bin/kilo"
+    ):
+        fail("postinstall analysis managed policy mismatch")
+    for key in (
+        "executes_node_code",
+        "executes_native_binary",
+        "copies_and_removes_files",
+        "uses_sysctl_or_ldd",
+        "nested_npm_install_fallback",
+    ):
+        if postinstall.get(key) is not True:
+            fail(f"postinstall analysis missing official behavior: {key}")
     native_surfaces = baseline.get("native_surfaces", {})
     if native_surfaces.get("marketplace") is not None:
         fail("native marketplace must remain null")
@@ -330,6 +390,48 @@ def validate_workflows() -> None:
         text = require_file(relative).read_text(encoding="utf-8")
         if SHARED_CI_COMMIT not in text:
             fail(f"{relative}: shared CI workflow is not pinned to the expected immutable commit")
+    release = require_file(".github/workflows/release.yml")
+    release_text = release.read_text(encoding="utf-8")
+    archive_paths = release_folded_paths(release_text, "archive_paths")
+    runtime_paths = release_folded_paths(release_text, "runtime_paths")
+    for label, paths in (("archive_paths", archive_paths), ("runtime_paths", runtime_paths)):
+        if not paths:
+            fail(f"release workflow omits {label}")
+        for relative in paths:
+            if not (ROOT / relative).exists():
+                fail(f"release workflow {label} declares a missing root: {relative}")
+    required_runtime_roots = {
+        "README.md",
+        "LICENSE",
+        "VERSION",
+        "build",
+        "cli-tools",
+        "config",
+        "docs",
+        nddev_kilo_cli.PROFILE_ROOT.name,
+        "references",
+        nddev_kilo_cli.CATALOG_ROOT.name,
+    }
+    for root in sorted(required_runtime_roots):
+        if root not in runtime_paths:
+            fail(f"release runtime_paths omit required runtime root: {root}")
+        if root not in archive_paths:
+            fail(f"release archive_paths omit required runtime root: {root}")
+
+
+def release_folded_paths(text: str, key: str) -> list[str]:
+    lines = text.splitlines()
+    marker = f"      {key}: >-"
+    for index, line in enumerate(lines):
+        if line != marker:
+            continue
+        values: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.startswith("        "):
+                break
+            values.extend(candidate.split())
+        return values
+    return []
 
 
 def validate_manager_parse_args() -> None:
@@ -404,6 +506,8 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
         workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
         target = workspace / "target"
         target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        canonical_target = target
         nddev_kilo_cli.mutate_setup(
             target,
             nddev_kilo_cli.DEFAULT_SETUP_ID,
@@ -425,12 +529,22 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
         )
         executable.chmod(0o700)
         executable_sha256 = nddev_kilo_cli.sha256_bytes(executable.read_bytes())
+        native_relative = nddev_kilo_cli.native_package_binary_relative(
+            "@kilocode/cli-linux-x64-baseline"
+        )
+        native = target / native_relative
+        native.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
+        native.write_bytes(b"fake-native\n")
+        native.chmod(0o700)
+        native_sha256 = nddev_kilo_cli.sha256_bytes(native.read_bytes())
         installation = {
             "installed": True,
             "current": True,
             "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
             "executable": str(executable),
             "entrypoint_sha256": executable_sha256,
+            "native_executable": str(native_relative),
+            "native_executable_sha256": native_sha256,
         }
         if nddev_kilo_cli.revalidate_launch_executable(target, installation) != str(executable):
             fail("launch executable revalidation returned the wrong executable")
@@ -441,12 +555,19 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
                 {**installation, "entrypoint_sha256": "0" * 64},
             ),
         )
+        expect_manager_error(
+            "launch native executable with stale digest",
+            lambda: nddev_kilo_cli.revalidate_launch_executable(
+                target,
+                {**installation, "native_executable_sha256": "0" * 64},
+            ),
+        )
 
         original_require_current_software = nddev_kilo_cli.require_current_software
         result: dict[str, Any] = {}
 
         def fake_require_current_software(observed_target: Path) -> dict[str, Any]:
-            if observed_target != target:
+            if observed_target != canonical_target:
                 fail("launch checked software for the wrong target")
             return dict(installation)
 
@@ -460,7 +581,14 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
         thread = threading.Thread(target=run_launch)
         thread.start()
         try:
-            wait_until("launch child start", lambda: started.exists())
+            wait_until(
+                "launch child start",
+                lambda: started.exists() or bool(result.get("error")) or not thread.is_alive(),
+            )
+            if "error" in result:
+                raise result["error"]
+            if not thread.is_alive() and not started.exists():
+                fail(f"launch child exited before start marker with code: {result.get('code')}")
             if not nddev_kilo_cli.lock_path(target).is_dir():
                 fail("launch target lock was released while the child was running")
             try:
@@ -491,6 +619,83 @@ def validate_launch_lock_scope_and_executable_revalidation() -> None:
             fail(f"launch child returned unexpected code: {result.get('code')}")
         if nddev_kilo_cli.lock_path(target).exists():
             fail("launch target lock was not cleaned up after child exit")
+
+
+def validate_runtime_paths_reject_symlinks_before_child() -> None:
+    original_require_active_clean_installed = nddev_kilo_cli.require_active_clean_installed
+    original_require_current_software = nddev_kilo_cli.require_current_software
+    for env_name, relative in nddev_kilo_cli.target_runtime_relative_paths().items():
+        prefixes = [Path(*relative.parts[:index]) for index in range(1, len(relative.parts) + 1)]
+        for prefix in prefixes:
+            with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-runtime-") as raw:
+                workspace = Path(raw)
+                workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                target = workspace / "target"
+                target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                target = target.resolve(strict=False)
+                canonical_target = target
+                outside = workspace / "outside"
+                outside.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                started = workspace / "child-started"
+                executable = nddev_kilo_cli.kilo_executable(target)
+                executable.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+                executable.write_bytes(
+                    (
+                        "#!/bin/sh\n"
+                        "set -eu\n"
+                        f'printf started > "{started}"\n'
+                    ).encode("utf-8")
+                )
+                executable.chmod(0o700)
+                native_relative = nddev_kilo_cli.native_package_binary_relative(
+                    "@kilocode/cli-linux-x64-baseline"
+                )
+                native = target / native_relative
+                native.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+                native.write_bytes(b"fake-native\n")
+                native.chmod(0o700)
+                link = target / prefix
+                link.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
+                os.symlink(outside, link)
+
+                def fake_require_active_clean_installed(observed_target: Path) -> dict[str, Any]:
+                    if observed_target != canonical_target:
+                        fail("runtime path regression checked the wrong target stamp")
+                    return {
+                        "schema_version": nddev_kilo_cli.STAMP_SCHEMA,
+                        "setup_id": nddev_kilo_cli.DEFAULT_SETUP_ID,
+                        "permission_profile": nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                    }
+
+                def fake_require_current_software(observed_target: Path) -> dict[str, Any]:
+                    if observed_target != canonical_target:
+                        fail("runtime path regression checked the wrong target software")
+                    return {
+                        "installed": True,
+                        "current": True,
+                        "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+                        "executable": str(executable),
+                        "entrypoint_sha256": nddev_kilo_cli.sha256_bytes(executable.read_bytes()),
+                        "native_executable": str(native_relative),
+                        "native_executable_sha256": nddev_kilo_cli.sha256_bytes(native.read_bytes()),
+                    }
+
+                nddev_kilo_cli.require_active_clean_installed = fake_require_active_clean_installed
+                nddev_kilo_cli.require_current_software = fake_require_current_software
+                try:
+                    try:
+                        nddev_kilo_cli.launch(target, [], timeout_seconds=1)
+                    except nddev_kilo_cli.ManagerError:
+                        pass
+                    else:
+                        fail(f"runtime {env_name} symlink component was accepted: {prefix}")
+                finally:
+                    nddev_kilo_cli.require_active_clean_installed = (
+                        original_require_active_clean_installed
+                    )
+                    nddev_kilo_cli.require_current_software = original_require_current_software
+                if started.exists():
+                    fail(f"launch child started despite runtime {env_name} symlink: {prefix}")
 
 
 def snapshot_tree(root: Path) -> list[tuple[str, str, int, bytes | str | None]]:
@@ -755,7 +960,42 @@ def validate_package_lock_regressions() -> None:
         )
 
 
-def write_fake_native_package(root: Path, package: str, record: dict[str, Any], binary: bytes) -> None:
+def write_fake_cli_package(root: Path) -> None:
+    package_root = (
+        root
+        / nddev_kilo_cli.SOFTWARE_GLOBAL_DIR_RELATIVE
+        / "node_modules"
+        / "@kilocode"
+        / "cli"
+    )
+    bin_root = package_root / "bin"
+    bin_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+    write_public_json(
+        package_root / "package.json",
+        {
+            "name": nddev_kilo_cli.KILO_PACKAGE,
+            "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+            "bin": {
+                "kilo": "./bin/kilo",
+                "kilocode": "./bin/kilo",
+            },
+            "scripts": {"postinstall": "node ./postinstall.mjs"},
+            "optionalDependencies": expected_optional_native_versions(),
+        },
+    )
+    package_bin = bin_root / nddev_kilo_cli.KILO_COMMAND
+    package_bin.write_bytes(b"vendor package bin, not executed by nddev\n")
+    package_bin.chmod(0o700)
+
+
+def write_fake_native_package(
+    root: Path,
+    package: str,
+    record: dict[str, Any],
+    binary: bytes,
+    *,
+    tree_sitter: bool = False,
+) -> None:
     package_root = scoped_package_path(root, package)
     bin_root = package_root / "bin"
     bin_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
@@ -771,6 +1011,162 @@ def write_fake_native_package(root: Path, package: str, record: dict[str, Any], 
     native = bin_root / nddev_kilo_cli.KILO_COMMAND
     native.write_bytes(binary)
     native.chmod(0o700)
+    if tree_sitter:
+        tree_sitter_root = bin_root / "tree-sitter"
+        tree_sitter_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        wasm = tree_sitter_root / "tree-sitter.wasm"
+        wasm.write_bytes(b"fake wasm\n")
+        wasm.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+
+def with_host_platform(host: dict[str, str | None], fn: Any) -> Any:
+    original_host_native_platform = nddev_kilo_cli.host_native_platform
+    nddev_kilo_cli.host_native_platform = lambda: dict(host)
+    try:
+        return fn()
+    finally:
+        nddev_kilo_cli.host_native_platform = original_host_native_platform
+
+
+def validate_native_selection_and_wrapper_regressions() -> None:
+    cases = (
+        ({"os": "darwin", "cpu": "arm64", "libc": None}, "@kilocode/cli-darwin-arm64"),
+        ({"os": "darwin", "cpu": "x64", "libc": None}, "@kilocode/cli-darwin-x64-baseline"),
+        ({"os": "linux", "cpu": "arm64", "libc": None}, "@kilocode/cli-linux-arm64"),
+        ({"os": "linux", "cpu": "arm64", "libc": "musl"}, "@kilocode/cli-linux-arm64-musl"),
+        ({"os": "linux", "cpu": "x64", "libc": None}, "@kilocode/cli-linux-x64-baseline"),
+        (
+            {"os": "linux", "cpu": "x64", "libc": "musl"},
+            "@kilocode/cli-linux-x64-baseline-musl",
+        ),
+    )
+    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    for host, expected in cases:
+        with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-select-") as raw:
+            root = Path(raw)
+            root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            write_public_json(
+                root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE,
+                valid_package_lock((expected,)),
+            )
+            binary = f"native for {expected}\n".encode("utf-8")
+            write_fake_native_package(
+                root,
+                expected,
+                supported[expected],
+                binary,
+                tree_sitter=(host["os"] == "linux" and host["cpu"] == "x64"),
+            )
+
+            def inspect_selection() -> None:
+                if nddev_kilo_cli.selected_native_package_name_for_host(host) != expected:
+                    fail(f"selected native package mismatch for {host}")
+                provenance = nddev_kilo_cli.installed_native_packages(root)
+                selected = provenance["selected"]
+                if selected["name"] != expected:
+                    fail(f"installed native package selection mismatch for {host}")
+                if selected["binary"] != str(nddev_kilo_cli.native_package_binary_relative(expected)):
+                    fail(f"selected native binary path mismatch for {host}")
+                nddev_kilo_cli.materialize_stage_entrypoint(root, provenance)
+                wrapper = (root / "bin" / nddev_kilo_cli.KILO_COMMAND).read_text(
+                    encoding="utf-8"
+                )
+                if ".kilo" in wrapper:
+                    fail("native wrapper depends on vendor postinstall .kilo")
+                if selected["binary"] not in wrapper:
+                    fail("native wrapper does not execute the selected package binary")
+                resources = selected["runtime_resources"]
+                if resources.get("tree_sitter", {}).get("present") is True:
+                    if nddev_kilo_cli.NATIVE_TREE_SITTER_ENV not in wrapper:
+                        fail("native wrapper omits valid tree-sitter resource env")
+
+            with_host_platform(host, inspect_selection)
+
+
+def validate_npm_install_ignores_lifecycle_scripts() -> None:
+    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    host = nddev_kilo_cli.host_native_platform()
+    selected = nddev_kilo_cli.selected_native_package_name_for_host(host)
+    commands: list[tuple[list[str], dict[str, str], Path]] = []
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-npm-") as raw:
+        stage_root = Path(raw)
+        stage_root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        live_stage = stage_root / "live"
+        live_stage.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+
+        def fake_find_npm_executable() -> tuple[str, tuple[str, ...]]:
+            return "/usr/bin/npm", ("/usr/bin",)
+
+        def fake_fetch_registry_metadata() -> dict[str, Any]:
+            baseline = nddev_kilo_cli.baseline()
+            npm = baseline["npm"]
+            return {
+                "name": nddev_kilo_cli.KILO_PACKAGE,
+                "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+                "dist": npm["dist"],
+                "scripts": npm["scripts"],
+                "optionalDependencies": expected_optional_native_versions(),
+            }
+
+        def fake_bounded_process(
+            command: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str],
+            timeout: int,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout
+            commands.append((list(command), dict(env), cwd))
+            if "--ignore-scripts" not in command:
+                fail("npm command omitted --ignore-scripts")
+            if env.get("NPM_CONFIG_IGNORE_SCRIPTS") != "true":
+                fail("npm command omitted NPM_CONFIG_IGNORE_SCRIPTS=true")
+            if env.get("npm_config_ignore_scripts") != "true":
+                fail("npm command omitted npm_config_ignore_scripts=true")
+            if "--package-lock-only" in command:
+                write_public_json(cwd / "package-lock.json", valid_package_lock((selected,)))
+            elif "--global" in command:
+                write_fake_cli_package(live_stage)
+                write_fake_native_package(
+                    live_stage,
+                    selected,
+                    supported[selected],
+                    b"fake selected native\n",
+                    tree_sitter=True,
+                )
+            else:
+                fail(f"unexpected npm command in script-free install: {command}")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        original_find_npm_executable = nddev_kilo_cli.find_npm_executable
+        original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
+        original_bounded_process = nddev_kilo_cli.bounded_process
+        nddev_kilo_cli.find_npm_executable = fake_find_npm_executable
+        nddev_kilo_cli.fetch_registry_metadata = fake_fetch_registry_metadata
+        nddev_kilo_cli.bounded_process = fake_bounded_process
+        try:
+            nddev_kilo_cli.run_npm_install(stage_root, live_stage)
+        finally:
+            nddev_kilo_cli.find_npm_executable = original_find_npm_executable
+            nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
+            nddev_kilo_cli.bounded_process = original_bounded_process
+
+        if len(commands) != 2:
+            fail("script-free install executed an unexpected number of npm commands")
+        for command, _env, _cwd in commands:
+            if "--no-save" in command:
+                fail("script-free install attempted vendor nested npm fallback")
+        npmrc = (stage_root / "npmrc").read_text(encoding="utf-8")
+        if "ignore-scripts=true" not in npmrc:
+            fail("sanitized npmrc does not disable lifecycle scripts")
+        for relative in nddev_kilo_cli.VENDOR_POSTINSTALL_RESOURCE_RELATIVES:
+            if (live_stage / relative).exists() or (live_stage / relative).is_symlink():
+                fail(f"vendor postinstall artifact was materialized: {relative}")
+        wrapper = (live_stage / "bin" / nddev_kilo_cli.KILO_COMMAND).read_text(encoding="utf-8")
+        if ".kilo" in wrapper:
+            fail("script-free install wrapper depends on vendor postinstall .kilo")
+        if str(nddev_kilo_cli.native_package_binary_relative(selected)) not in wrapper:
+            fail("script-free install wrapper does not use the selected native package")
 
 
 def validate_wrong_platform_native_regression() -> None:
@@ -787,10 +1183,6 @@ def validate_wrong_platform_native_regression() -> None:
             root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE,
             valid_package_lock((wrong,)),
         )
-        native_root = root / nddev_kilo_cli.KILO_NATIVE_BIN_RELATIVE
-        native_root.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
-        native_root.write_bytes(binary)
-        native_root.chmod(0o700)
         write_fake_native_package(root, wrong, supported[wrong], binary)
         expect_manager_error(
             "wrong-platform installed native package",
@@ -917,8 +1309,12 @@ def main() -> int:
         validate_workflows()
         validate_manager_parse_args()
         validate_launch_guard()
+        validate_launch_lock_scope_and_executable_revalidation()
+        validate_runtime_paths_reject_symlinks_before_child()
         validate_hardlink_materialization_bound()
         validate_package_lock_regressions()
+        validate_native_selection_and_wrapper_regressions()
+        validate_npm_install_ignores_lifecycle_scripts()
         validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()
