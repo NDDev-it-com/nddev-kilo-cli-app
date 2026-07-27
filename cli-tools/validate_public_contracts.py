@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER_PATH = ROOT / "cli-tools" / "nddev_kilo_cli.py"
 MANAGER_SPEC = importlib.util.spec_from_file_location("nddev_kilo_cli", MANAGER_PATH)
