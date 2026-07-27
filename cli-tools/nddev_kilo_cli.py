@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -31,6 +32,7 @@ from typing import Any, NoReturn
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "setups"
 PROFILE_ROOT = ROOT / "profiles"
+BASELINE_PATH = ROOT / "references" / "kilo-cli-baseline.json"
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-kilo-cli-app"
 STAMP_NAME = "NDDEV-KILO-CLI-SETUP.json"
@@ -512,6 +514,120 @@ def read_json_file(
         read_regular_file(path, label, owner_only=owner_only, max_bytes=max_bytes),
         label,
     )
+
+
+def baseline() -> dict[str, Any]:
+    value = read_json_file(BASELINE_PATH, "Kilo CLI baseline", max_bytes=METADATA_MAX_BYTES)
+    if value.get("schema_version") != 2:
+        fail("Kilo CLI baseline schema is unsupported")
+    npm = value.get("npm")
+    if not isinstance(npm, dict):
+        fail("Kilo CLI baseline omits npm records")
+    if npm.get("package") != KILO_PACKAGE or npm.get("version") != KILO_CURRENT_VERSION:
+        fail("Kilo CLI baseline package identity is not synchronized")
+    return value
+
+
+def native_package_matrix() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    native = baseline().get("npm", {}).get("native_packages")
+    if not isinstance(native, dict):
+        fail("Kilo CLI baseline omits native package records")
+    supported = native.get("supported")
+    unsupported = native.get("unsupported")
+    if not isinstance(supported, dict) or not isinstance(unsupported, dict):
+        fail("Kilo CLI baseline native package records are invalid")
+    return supported, unsupported
+
+
+def package_name_from_lock_path(path: str) -> str | None:
+    prefix = "node_modules/"
+    if not path.startswith(prefix):
+        return None
+    return path[len(prefix) :]
+
+
+def native_record_dist(record: dict[str, Any], package: str) -> dict[str, str]:
+    dist = record.get("dist")
+    if not isinstance(dist, dict):
+        fail(f"Kilo CLI baseline native package omits dist: {package}")
+    integrity = dist.get("integrity")
+    shasum = dist.get("shasum")
+    tarball = dist.get("tarball")
+    if not all(isinstance(value, str) and value for value in (integrity, shasum, tarball)):
+        fail(f"Kilo CLI baseline native package dist is incomplete: {package}")
+    return {"integrity": integrity, "shasum": shasum, "tarball": tarball}
+
+
+def normalize_os_name(value: str | None = None) -> str:
+    raw = (value or platform.system()).lower()
+    if raw == "darwin":
+        return "darwin"
+    if raw == "linux":
+        return "linux"
+    if raw in {"windows", "win32", "cygwin"}:
+        return "win32"
+    return raw
+
+
+def normalize_arch(value: str | None = None) -> str:
+    raw = (value or platform.machine()).lower()
+    if raw in {"x86_64", "amd64"}:
+        return "x64"
+    if raw in {"aarch64", "arm64"}:
+        return "arm64"
+    return raw
+
+
+def detect_linux_libc() -> str | None:
+    if normalize_os_name() != "linux":
+        return None
+    if Path("/etc/alpine-release").exists():
+        return "musl"
+    libc_name, _libc_version = platform.libc_ver()
+    if libc_name.lower() == "musl":
+        return "musl"
+    return None
+
+
+def host_native_platform() -> dict[str, str | None]:
+    return {
+        "os": normalize_os_name(),
+        "cpu": normalize_arch(),
+        "libc": detect_linux_libc(),
+    }
+
+
+def native_record_matches_platform(record: dict[str, Any], host: dict[str, str | None]) -> bool:
+    os_values = record.get("os")
+    cpu_values = record.get("cpu")
+    libc_values = record.get("libc")
+    if os_values != [host["os"]] or cpu_values != [host["cpu"]]:
+        return False
+    if host["os"] == "linux":
+        if host["libc"] == "musl":
+            return libc_values == ["musl"]
+        return libc_values is None
+    return libc_values is None
+
+
+def expected_native_records_for_host() -> dict[str, dict[str, Any]]:
+    supported, _unsupported = native_package_matrix()
+    host = host_native_platform()
+    if host["os"] not in {"darwin", "linux"} or host["cpu"] not in {"x64", "arm64"}:
+        fail(
+            "Kilo CLI native package installation is supported only on macOS and Ubuntu-compatible Linux"
+        )
+    matches = {
+        package: record
+        for package, record in supported.items()
+        if isinstance(record, dict) and native_record_matches_platform(record, host)
+    }
+    if not matches:
+        fail(
+            "Kilo CLI baseline has no supported native package for "
+            f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
+        )
+    return matches
 
 
 def setup_ids() -> list[str]:
@@ -1980,6 +2096,11 @@ def verify_registry_metadata(metadata: dict[str, Any]) -> None:
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
         fail("npm registry metadata postinstall contract is invalid")
+    supported, unsupported = native_package_matrix()
+    expected_native = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    optional = metadata.get("optionalDependencies")
+    if optional != expected_native:
+        fail("npm registry metadata native optional dependency map is not synchronized")
 
 
 def package_lock_path(root: Path) -> Path:
@@ -1991,25 +2112,69 @@ def package_lock_records(root: Path) -> dict[str, Any]:
     packages = lock.get("packages")
     if not isinstance(packages, dict):
         fail("Kilo CLI package lock omits package records")
+    supported, unsupported = native_package_matrix()
+    expected_records: dict[str, dict[str, Any]] = {
+        KILO_PACKAGE: {
+            "version": KILO_CURRENT_VERSION,
+            "dist": {
+                "integrity": KILO_PACKAGE_INTEGRITY,
+                "shasum": KILO_PACKAGE_SHASUM,
+                "tarball": f"https://registry.npmjs.org/@kilocode/cli/-/cli-{KILO_CURRENT_VERSION}.tgz",
+            },
+        },
+        **supported,
+        **unsupported,
+    }
+    for path, record in packages.items():
+        if path == "":
+            continue
+        if not isinstance(record, dict):
+            fail(f"Kilo CLI package lock record is invalid: {path}")
+        if record.get("link") is True:
+            continue
+        package = package_name_from_lock_path(str(path))
+        if package is None:
+            fail(f"Kilo CLI package lock has unexpected package path: {path}")
+        expected = expected_records.get(package)
+        if expected is None:
+            fail(f"Kilo CLI package lock has unexpected package identity: {package}")
+        resolved = record.get("resolved")
+        integrity = record.get("integrity")
+        if not isinstance(resolved, str) or not resolved.startswith(NPM_REGISTRY):
+            fail(f"Kilo CLI package lock record is not resolved from the official registry: {package}")
+        if not isinstance(integrity, str) or not integrity:
+            fail(f"Kilo CLI package lock record omits integrity: {package}")
+        expected_dist = native_record_dist(expected, package)
+        if record.get("version") != expected.get("version"):
+            fail(f"Kilo CLI package lock version mismatch: {package}")
+        if resolved != expected_dist["tarball"]:
+            fail(f"Kilo CLI package lock tarball mismatch: {package}")
+        if integrity != expected_dist["integrity"]:
+            fail(f"Kilo CLI package lock integrity mismatch: {package}")
     cli = packages.get("node_modules/@kilocode/cli")
     if not isinstance(cli, dict):
         fail("Kilo CLI package lock omits @kilocode/cli")
-    if cli.get("version") != KILO_CURRENT_VERSION:
-        fail("Kilo CLI package lock version is invalid")
-    if cli.get("integrity") != KILO_PACKAGE_INTEGRITY:
-        fail("Kilo CLI package lock integrity is invalid")
     optional = cli.get("optionalDependencies")
-    if not isinstance(optional, dict) or not optional:
+    expected_optional = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    if optional != expected_optional:
         fail("Kilo CLI package lock omits native optional dependencies")
-    for package, version in optional.items():
-        if str(package).startswith("@kilocode/cli-") and version != KILO_CURRENT_VERSION:
-            fail(f"Kilo CLI package lock has unexpected native dependency {package}@{version}")
     return lock
 
 
-def installed_native_packages(root: Path) -> list[dict[str, str]]:
+def native_package_binary_digest(root: Path, package_path: Path) -> str:
+    binary = package_path / "bin" / KILO_COMMAND
+    require_safe_executable(binary, root, f"Kilo native package binary {package_path.name}")
+    return digest_regular_file(binary, f"Kilo native package binary {package_path.name}", {"value": 0})
+
+
+def installed_native_packages(root: Path) -> dict[str, Any]:
+    supported, unsupported = native_package_matrix()
+    allowed_for_host = expected_native_records_for_host()
+    lock = package_lock_records(root)
+    lock_packages = lock.get("packages", {})
+    host = host_native_platform()
     install_root = root / SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules"
-    records: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
     path_count = 0
     for manifest in install_root.rglob("package.json"):
         path_count += 1
@@ -2027,20 +2192,69 @@ def installed_native_packages(root: Path) -> list[dict[str, str]]:
         version = metadata.get("version")
         if not isinstance(name, str) or not name.startswith("@kilocode/cli-"):
             continue
-        if name.startswith("@kilocode/cli-windows-"):
-            fail(f"Windows native package is not supported by this module: {name}")
-        if version != KILO_CURRENT_VERSION:
+        baseline_record = supported.get(name)
+        if baseline_record is None:
+            if name in unsupported:
+                fail(f"unsupported Kilo native package is installed: {name}")
+            fail(f"unexpected Kilo native package is installed: {name}")
+        if version != baseline_record.get("version"):
             fail(f"installed native package has unexpected version: {name}@{version}")
+        if metadata.get("os") != baseline_record.get("os"):
+            fail(f"installed native package OS metadata mismatch: {name}")
+        if metadata.get("cpu") != baseline_record.get("cpu"):
+            fail(f"installed native package CPU metadata mismatch: {name}")
+        if metadata.get("libc") != baseline_record.get("libc"):
+            fail(f"installed native package libc metadata mismatch: {name}")
+        lock_path_key = "node_modules/" + name
+        lock_record = lock_packages.get(lock_path_key)
+        if not isinstance(lock_record, dict):
+            fail(f"Kilo native package is not represented in the package lock: {name}")
+        dist = native_record_dist(baseline_record, name)
+        if (
+            lock_record.get("resolved") != dist["tarball"]
+            or lock_record.get("integrity") != dist["integrity"]
+        ):
+            fail(f"Kilo native package lock provenance mismatch: {name}")
+        package_path = manifest.parent
         records.append(
             {
                 "name": name,
                 "version": str(version),
+                "os": list(baseline_record["os"]),
+                "cpu": list(baseline_record["cpu"]),
+                "libc": baseline_record.get("libc"),
                 "path": str(manifest.parent.relative_to(root)),
+                "tarball": dist["tarball"],
+                "integrity": dist["integrity"],
+                "binary_sha256": native_package_binary_digest(root, package_path),
             }
         )
     if not records:
         fail("Kilo CLI postinstall did not leave an installed native package")
-    return sorted(records, key=lambda item: item["name"])
+    allowed_names = set(allowed_for_host)
+    candidates = [record for record in records if record["name"] in allowed_names]
+    if not candidates:
+        fail(
+            "Kilo CLI postinstall did not install a native package allowed for "
+            f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
+        )
+    selected_digest = digest_regular_file(
+        root / KILO_NATIVE_BIN_RELATIVE,
+        "Kilo CLI native executable",
+        {"value": 0},
+    )
+    selected = [record for record in candidates if record["binary_sha256"] == selected_digest]
+    if len(selected) != 1:
+        fail(
+            "Kilo CLI postinstall selected native binary cannot be bound to exactly one "
+            "baseline package"
+        )
+    return {
+        "host": host,
+        "allowed_packages": sorted(allowed_names),
+        "installed": sorted(records, key=lambda item: item["name"]),
+        "selected": selected[0],
+    }
 
 
 def package_metadata(root: Path) -> dict[str, Any]:
@@ -2067,11 +2281,10 @@ def package_metadata(root: Path) -> dict[str, Any]:
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
         fail("Kilo CLI package postinstall contract is invalid")
     optional = metadata.get("optionalDependencies")
-    if not isinstance(optional, dict) or not optional:
+    supported, unsupported = native_package_matrix()
+    expected_optional = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    if optional != expected_optional:
         fail("Kilo CLI package native optional dependency map is invalid")
-    for package, version in optional.items():
-        if str(package).startswith("@kilocode/cli-") and version != KILO_CURRENT_VERSION:
-            fail(f"Kilo CLI package declares unexpected native dependency {package}@{version}")
     return metadata
 
 
@@ -2128,14 +2341,16 @@ def compute_software_tree_digest(root: Path) -> dict[str, Any]:
     require_safe_executable(root / "bin" / KILO_COMMAND, root, "Kilo CLI executable")
     metadata = package_metadata(root)
     lock = package_lock_records(root)
-    native_packages = installed_native_packages(root)
+    native_provenance = installed_native_packages(root)
     return {
         "tree_digest": sha256_bytes(canonical_json(records)),
         "tree_bytes": byte_counter["value"],
         "tree_paths": len(records),
         "package_name": metadata["name"],
         "version": metadata["version"],
-        "native_packages": native_packages,
+        "native_package_provenance": native_provenance,
+        "native_packages": native_provenance["installed"],
+        "selected_native_package": native_provenance["selected"]["name"],
         "package_lock_sha256": digest_regular_file(
             package_lock_path(root),
             "Kilo CLI package lock",
@@ -2289,6 +2504,7 @@ def software_status(target: Path) -> dict[str, Any]:
         "executable": str(executable),
         "package": manifest.get("package"),
         "install_method": manifest.get("install_method"),
+        "selected_native_package": manifest.get("selected_native_package"),
         **presence,
     }
     if validation_error is not None:

@@ -172,11 +172,36 @@ def validate_baseline() -> None:
         fail("unexpected npm integrity")
     if npm.get("scripts", {}).get("postinstall") != "node ./postinstall.mjs":
         fail("unexpected npm postinstall script")
-    native = baseline.get("native_surfaces", {})
-    if native.get("marketplace") is not None:
+    native_surfaces = baseline.get("native_surfaces", {})
+    if native_surfaces.get("marketplace") is not None:
         fail("native marketplace must remain null")
-    if native.get("plugins") is None:
+    if native_surfaces.get("plugins") is None:
         fail("native plugin surface must be recorded")
+    native_packages = npm.get("native_packages", {})
+    supported = native_packages.get("supported", {})
+    unsupported = native_packages.get("unsupported", {})
+    if not isinstance(supported, dict) or not isinstance(unsupported, dict):
+        fail("native package baseline must include supported and unsupported maps")
+    for package, record in {**supported, **unsupported}.items():
+        if not package.startswith("@kilocode/cli-"):
+            fail(f"native package baseline has unexpected package identity: {package}")
+        if record.get("version") != KILO_VERSION:
+            fail(f"native package version is not synchronized: {package}")
+        dist = record.get("dist")
+        if not isinstance(dist, dict):
+            fail(f"native package dist is missing: {package}")
+        if not str(dist.get("tarball", "")).startswith("https://registry.npmjs.org/"):
+            fail(f"native package tarball is not official registry: {package}")
+        if not str(dist.get("integrity", "")).startswith("sha512-"):
+            fail(f"native package integrity is missing: {package}")
+        if not isinstance(dist.get("shasum"), str) or not dist["shasum"]:
+            fail(f"native package shasum is missing: {package}")
+    for package, record in supported.items():
+        if record.get("os") not in (["darwin"], ["linux"]):
+            fail(f"supported native package is not macOS or Linux: {package}")
+    for package, record in unsupported.items():
+        if record.get("os") != ["win32"]:
+            fail(f"unsupported native package must be explicitly Windows today: {package}")
     observation = baseline.get("latest_release_observation", {})
     if observation.get("cli_source") != "https://registry.npmjs.org/@kilocode/cli":
         fail("baseline must use npm dist-tags as CLI latest source")
@@ -418,6 +443,160 @@ def validate_hardlink_materialization_bound() -> None:
             fail("failed hardlink materialization changed the target tree")
 
 
+def write_public_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
+    path.write_bytes(nddev_kilo_cli.canonical_json(value))
+    path.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+
+def scoped_package_path(root: Path, package: str) -> Path:
+    scope, name = package.split("/", 1)
+    return root / nddev_kilo_cli.SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / scope / name
+
+
+def expected_optional_native_versions() -> dict[str, str]:
+    supported, unsupported = nddev_kilo_cli.native_package_matrix()
+    return {package: nddev_kilo_cli.KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+
+
+def lock_record(package: str, record: dict[str, Any]) -> dict[str, Any]:
+    dist = nddev_kilo_cli.native_record_dist(record, package)
+    return {
+        "version": record["version"],
+        "resolved": dist["tarball"],
+        "integrity": dist["integrity"],
+        "optional": True,
+        "os": record.get("os"),
+        "cpu": record.get("cpu"),
+        **({"libc": record["libc"]} if record.get("libc") is not None else {}),
+    }
+
+
+def valid_package_lock(native_packages: tuple[str, ...]) -> dict[str, Any]:
+    baseline = nddev_kilo_cli.baseline()
+    supported, unsupported = nddev_kilo_cli.native_package_matrix()
+    matrix = {**supported, **unsupported}
+    root_dist = baseline["npm"]["dist"]
+    packages: dict[str, Any] = {
+        "": {
+            "name": "nddev-kilo-cli-lock",
+            "version": "0.0.0",
+            "dependencies": {nddev_kilo_cli.KILO_PACKAGE: nddev_kilo_cli.KILO_CURRENT_VERSION},
+        },
+        "node_modules/@kilocode/cli": {
+            "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+            "resolved": root_dist["tarball"],
+            "integrity": root_dist["integrity"],
+            "bin": {
+                "kilo": "bin/kilo",
+                "kilocode": "bin/kilo",
+            },
+            "optionalDependencies": expected_optional_native_versions(),
+        },
+    }
+    for package in native_packages:
+        packages[f"node_modules/{package}"] = lock_record(package, matrix[package])
+    return {
+        "name": "nddev-kilo-cli-lock",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": True,
+        "packages": packages,
+    }
+
+
+def expect_manager_error(label: str, fn: Any) -> None:
+    try:
+        fn()
+    except nddev_kilo_cli.ManagerError:
+        return
+    fail(f"{label} was accepted")
+
+
+def validate_package_lock_regressions() -> None:
+    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    package = next(iter(supported))
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-lock-") as raw:
+        root = Path(raw)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        write_public_json(
+            root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE,
+            valid_package_lock((package,)),
+        )
+        nddev_kilo_cli.package_lock_records(root)
+
+        lock = valid_package_lock((package,))
+        lock["packages"][f"node_modules/{package}"]["resolved"] = "https://example.invalid/pkg.tgz"
+        write_public_json(root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE, lock)
+        expect_manager_error(
+            "package lock with non-registry resolved URL",
+            lambda: nddev_kilo_cli.package_lock_records(root),
+        )
+
+        lock = valid_package_lock((package,))
+        lock["packages"][f"node_modules/{package}"]["integrity"] = "sha512-invalid"
+        write_public_json(root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE, lock)
+        expect_manager_error(
+            "package lock with mutated integrity",
+            lambda: nddev_kilo_cli.package_lock_records(root),
+        )
+
+        lock = valid_package_lock((package,))
+        lock["packages"]["node_modules/left-pad"] = {
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz",
+            "integrity": "sha512-invalid",
+        }
+        write_public_json(root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE, lock)
+        expect_manager_error(
+            "package lock with unexpected package identity",
+            lambda: nddev_kilo_cli.package_lock_records(root),
+        )
+
+
+def write_fake_native_package(root: Path, package: str, record: dict[str, Any], binary: bytes) -> None:
+    package_root = scoped_package_path(root, package)
+    bin_root = package_root / "bin"
+    bin_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+    metadata = {
+        "name": package,
+        "version": record["version"],
+        "os": record.get("os"),
+        "cpu": record.get("cpu"),
+    }
+    if record.get("libc") is not None:
+        metadata["libc"] = record["libc"]
+    write_public_json(package_root / "package.json", metadata)
+    native = bin_root / nddev_kilo_cli.KILO_COMMAND
+    native.write_bytes(binary)
+    native.chmod(0o700)
+
+
+def validate_wrong_platform_native_regression() -> None:
+    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    allowed = nddev_kilo_cli.expected_native_records_for_host()
+    wrong = next((package for package in supported if package not in allowed), None)
+    if wrong is None:
+        fail("wrong-platform regression has no unsupported supported-platform package")
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-native-") as raw:
+        root = Path(raw)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        binary = b"wrong-platform-native\n"
+        write_public_json(
+            root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE,
+            valid_package_lock((wrong,)),
+        )
+        native_root = root / nddev_kilo_cli.KILO_NATIVE_BIN_RELATIVE
+        native_root.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
+        native_root.write_bytes(binary)
+        native_root.chmod(0o700)
+        write_fake_native_package(root, wrong, supported[wrong], binary)
+        expect_manager_error(
+            "wrong-platform installed native package",
+            lambda: nddev_kilo_cli.installed_native_packages(root),
+        )
+
+
 def validate_private_target_required() -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-0777-") as raw:
         target = Path(raw) / "target"
@@ -538,6 +717,8 @@ def main() -> int:
         validate_manager_parse_args()
         validate_launch_guard()
         validate_hardlink_materialization_bound()
+        validate_package_lock_regressions()
+        validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()
         validate_sticky_tmp_target()

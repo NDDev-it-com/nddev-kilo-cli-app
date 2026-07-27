@@ -30,19 +30,201 @@
       "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
       "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.16"
     },
-    "optional_dependencies": {
-      "@kilocode/cli-darwin-arm64": "7.4.16",
-      "@kilocode/cli-darwin-x64": "7.4.16",
-      "@kilocode/cli-darwin-x64-baseline": "7.4.16",
-      "@kilocode/cli-linux-arm64": "7.4.16",
-      "@kilocode/cli-linux-arm64-musl": "7.4.16",
-      "@kilocode/cli-linux-x64": "7.4.16",
-      "@kilocode/cli-linux-x64-baseline": "7.4.16",
-      "@kilocode/cli-linux-x64-baseline-musl": "7.4.16",
-      "@kilocode/cli-linux-x64-musl": "7.4.16",
-      "@kilocode/cli-windows-arm64": "7.4.16",
-      "@kilocode/cli-windows-x64": "7.4.16",
-      "@kilocode/cli-windows-x64-baseline": "7.4.16"
+    "native_packages": {
+      "supported": {
+        "@kilocode/cli-darwin-arm64": {
+          "version": "7.4.16",
+          "os": [
+            "darwin"
+          ],
+          "cpu": [
+            "arm64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-m+YADdbjJExwetzk45ldWmSW1CDtbpH5Ib+gQgRQYTKP6HGT3kgz1HBkW6koGyW3Y2NmVxdA9IZ4Oh33oTB2tA==",
+            "shasum": "071d3724f0c3833df331e7e26077ba46feb67858",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-darwin-x64": {
+          "version": "7.4.16",
+          "os": [
+            "darwin"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-+4VqpJ3HQKRSWUDUYswA9J50drgavucWC2Gg5NDgmI+MybYbLQDawU4qSO3GCr5qsER3rmMsMppxW2skH05Vtw==",
+            "shasum": "d21f40963036f373f5625fae7c2614d18c6000bc",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-darwin-x64-baseline": {
+          "version": "7.4.16",
+          "os": [
+            "darwin"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-07TwFGTRNsx10KxFdE4pqDe58ftnN+wQGiEiWOz7aehtEbqilPelCEtotDOwq1Qtur7s4UrFSFajd+s7GtpX+w==",
+            "shasum": "35a346847260d8a143b30a8db960d332fa3467df",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-arm64": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "arm64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-RXgMU29amB6zs6M5UgtyDRXduKGUDNDOjxDY2/SFhQ7BHshB3USSWseQH9n4kLU5+qoPUBUb0gxgSj1N0t2kwQ==",
+            "shasum": "35a6bf77c8ed0b5c2d85f115fae97ba2719b4920",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-arm64-musl": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "arm64"
+          ],
+          "libc": [
+            "musl"
+          ],
+          "dist": {
+            "integrity": "sha512-4tT24ZzFRVZ8jLTXhVnTZG1oErlxTdGX0fKOI/4pH/fUXUmRGOyrgeJwqyY9kDpklDtDN90AQZADgxEIBitWYw==",
+            "shasum": "8bc8cc53be649558e1b066b5818063e6b78163e7",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64-musl/-/cli-linux-arm64-musl-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-x64": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-jO20+U1htCyp0UPSrzCE8yNycg01QpGiuYajsDMxY5dTql8CoaHukPtqtDtMIm1UgYKdImL2YAhXqbu1YxF8SA==",
+            "shasum": "2975588f4efc5a45374a6b7b9670689d2c90f78a",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-x64-baseline": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-LLTctqZQADOp3MS2jHq3ELiVP46L05KuEg6DymvS2h78aAIC5b4f0jGlpgTME5meHmq9dozrDQrG9JWKlDXckQ==",
+            "shasum": "0499983060cf670a39a8014061043781bada66a1",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-x64-baseline-musl": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": [
+            "musl"
+          ],
+          "dist": {
+            "integrity": "sha512-LZ8Ry5VWF/osxPPfPtH5viZ1D6wdGm75vth2n4ddbtZsCvrcVpEbGK/Gjf5q06rh5ujZzUA++c0xvLIKBM9ZEA==",
+            "shasum": "77cbec06657cfa07d44987abe56890d9f0324d6f",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline-musl/-/cli-linux-x64-baseline-musl-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-linux-x64-musl": {
+          "version": "7.4.16",
+          "os": [
+            "linux"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": [
+            "musl"
+          ],
+          "dist": {
+            "integrity": "sha512-z1byOIz81nsprwHz8fPIde6JWY0iTv0hiEEP4SqJg8oFGAHyK7Khu7uV8rMhJ8RyOQsb4dcpr6VWanEslWcBnQ==",
+            "shasum": "13969db6562db7f7b33b23a5b09f1b1b8874f054",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-musl/-/cli-linux-x64-musl-7.4.16.tgz"
+          }
+        }
+      },
+      "unsupported": {
+        "@kilocode/cli-windows-arm64": {
+          "reason": "Windows is not supported by this module.",
+          "version": "7.4.16",
+          "os": [
+            "win32"
+          ],
+          "cpu": [
+            "arm64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-2NUwUW93yPYR8O6neQ+F6CAGRQIR613efDucemPzfa1bknenMr+y91+8yuRcz/HTgXL0+01bW7g6F8w0i2Pptw==",
+            "shasum": "26da7dc29f6d769860d6777dab6a37388cc0eac0",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-arm64/-/cli-windows-arm64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-windows-x64": {
+          "reason": "Windows is not supported by this module.",
+          "version": "7.4.16",
+          "os": [
+            "win32"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-XojHS5kN8UmXkhVbVpqSdu01gxsrvGKrECasEb2VK80ZBPa3C3qMAL5SNUE5F34kK2+DSqDXyj8Rfq5UiFmyug==",
+            "shasum": "10d9f101a6659fc1f50680b885ca3118fe3be9bc",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64/-/cli-windows-x64-7.4.16.tgz"
+          }
+        },
+        "@kilocode/cli-windows-x64-baseline": {
+          "reason": "Windows is not supported by this module.",
+          "version": "7.4.16",
+          "os": [
+            "win32"
+          ],
+          "cpu": [
+            "x64"
+          ],
+          "libc": null,
+          "dist": {
+            "integrity": "sha512-R8Qa29BauHVkkMzLIFoNz86XItvePVG7QqtxeyqFAgWN7bGjhFN1fauxQaza9QgLhiUKLOiz+HE/HTKM7Uqv8g==",
+            "shasum": "6428ce2e2bf75e8ab285c52dbe8d1dd2c2f747c0",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64-baseline/-/cli-windows-x64-baseline-7.4.16.tgz"
+          }
+        }
+      },
+      "unsupported_other": []
     }
   },
   "latest_release_observation": {
