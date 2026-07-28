@@ -1427,6 +1427,7 @@ def publish_bootstrap_anchor_file(root: Path, path: Path, content: bytes, label:
         except FileExistsError:
             return False
         linked = True
+        fsync_directory(root, f"{label} root")
         remove_path_durable_retry(temporary, f"{label} temporary anchor")
         fsync_directory(root, f"{label} root")
         return True
@@ -1437,8 +1438,6 @@ def publish_bootstrap_anchor_file(root: Path, path: Path, content: bytes, label:
             remove_path_durable(temporary)
             if root_state is not None:
                 restore_bootstrap_directory_metadata(root, root_state, f"{label} root")
-        else:
-            remove_path_durable(temporary)
 
 
 def recover_bootstrap_publication_alias(
@@ -7611,6 +7610,7 @@ def publish_cleanup_journal_file(root: Path, content: bytes) -> bool:
             allow_publication_alias=True,
         )
         try:
+            fsync_directory(root, f"cleanup pending root {root}")
             remove_path_durable_retry(temporary, "cleanup pending journal temporary")
             fsync_directory(root, f"cleanup pending root {root}")
         except BaseException:
@@ -7667,6 +7667,7 @@ def publish_cleanup_intent_file(root: Path, content: bytes) -> bool:
             allow_publication_alias=True,
         )
         try:
+            fsync_directory(root, f"cleanup pending root {root}")
             remove_path_durable_retry(temporary, "cleanup pending intent temporary")
             fsync_directory(root, f"cleanup pending root {root}")
         except BaseException:
