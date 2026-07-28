@@ -9,6 +9,8 @@ Skill toolkit, agents, commands, and a target-local local-file plugin. The exact
 file inventory and native config paths are owned by
 `setups/nddev-builder/setup.json` and `cli-tools/nddev_kilo_cli.py`; use
 `plan --json` and `status --json` for the current machine-readable view.
+`plan --json` includes the same stable byte-diff `changed_paths` policy used by
+setup mutations.
 
 Lifecycle commands:
 

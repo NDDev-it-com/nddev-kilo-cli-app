@@ -167,6 +167,10 @@
     "full-auto",
     "safe"
   ],
+  "setup_lifecycle": {
+    "plan_changed_paths": "actual-byte-diff",
+    "mutation_changed_paths": "actual-byte-diff"
+  },
   "managed_state": [
     "xdg-config/kilo/kilo.jsonc",
     "AGENTS.md",

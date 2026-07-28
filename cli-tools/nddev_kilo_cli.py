@@ -385,6 +385,30 @@ class DirectoryTransaction:
                 path.rmdir()
 
 
+@dataclass(frozen=True)
+class ManagedPathState:
+    content: bytes | None
+    mode: int | None
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    kind: str
+    mode: int
+    content: bytes | str | None = None
+
+
+@dataclass
+class BackupSlotTransaction:
+    target: Path
+    slot: int
+    pool: Path
+    slot_dir: Path
+    previous_dir: Path | None
+    created_pool: bool
+    pre_pool_snapshot: dict[str, TreeEntry] | None
+
+
 def fail(message: str) -> NoReturn:
     raise ManagerError(message)
 
@@ -776,10 +800,7 @@ def platform_label(host: dict[str, Any]) -> str:
     distro_id = None
     if isinstance(distro, dict):
         distro_id = distro.get("id")
-    return (
-        f"{host.get('os')}/{host.get('cpu')}/"
-        f"{host.get('libc') or 'none'}/{distro_id or 'none'}"
-    )
+    return f"{host.get('os')}/{host.get('cpu')}/{host.get('libc') or 'none'}/{distro_id or 'none'}"
 
 
 def unsupported_platform_category(host: dict[str, Any]) -> str:
@@ -845,10 +866,7 @@ def expected_native_records_for_host() -> dict[str, dict[str, Any]]:
         if isinstance(record, dict) and native_record_matches_platform(record, host)
     }
     if not matches:
-        fail(
-            "Kilo CLI baseline has no supported native package for "
-            f"{platform_label(host)}"
-        )
+        fail(f"Kilo CLI baseline has no supported native package for {platform_label(host)}")
     return matches
 
 
@@ -865,10 +883,7 @@ def selected_native_package_name_for_host(host: dict[str, Any]) -> str:
     for package in native_package_preference_order(host):
         if package in production:
             return package
-    fail(
-        "Kilo CLI baseline has no selected native package for "
-        f"{platform_label(host)}"
-    )
+    fail(f"Kilo CLI baseline has no selected native package for {platform_label(host)}")
 
 
 def native_package_binary_relative(package: str) -> Path:
@@ -1169,7 +1184,9 @@ def open_bootstrap_lock_file(target: Path) -> int:
         opened = os.fstat(descriptor)
         if identity_of(opened) != identity_of(info):
             os.close(descriptor)
-            raise ConcurrentTargetChange("bootstrap lifecycle lock file changed while it was opened")
+            raise ConcurrentTargetChange(
+                "bootstrap lifecycle lock file changed while it was opened"
+            )
         require_open_bootstrap_lock_identity(descriptor, lock_file)
         return descriptor
     raise ConcurrentTargetChange("bootstrap lifecycle lock file changed during creation")
@@ -1214,10 +1231,9 @@ def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path)
         fail("bootstrap lifecycle lock file schema mismatch")
     if record.get("product_name") != PRODUCT_NAME:
         fail("bootstrap lifecycle lock file belongs to another product")
-    if (
-        record.get("target") != os.fspath(target)
-        or record.get("target_sha256") != target_binding_sha256(target)
-    ):
+    if record.get("target") != os.fspath(target) or record.get(
+        "target_sha256"
+    ) != target_binding_sha256(target):
         fail("bootstrap lifecycle lock file target binding mismatch")
 
 
@@ -1384,7 +1400,9 @@ def write_lock_owner(target: Path, *, held: bool) -> None:
     )
 
 
-def cleanup_lock_artifacts_for_created_target(target: Path, transaction: DirectoryTransaction) -> None:
+def cleanup_lock_artifacts_for_created_target(
+    target: Path, transaction: DirectoryTransaction
+) -> None:
     if target not in transaction.created:
         return
     lock = lock_path(target)
@@ -1578,9 +1596,7 @@ def desired_for_setup(target: Path, setup_id: str, profile_id: str) -> dict[str,
     desired: dict[str, bytes | None] = {CONFIG: canonical_json(merged)}
     for relative in BUILDER_FILES:
         desired[relative] = setup.files[relative]
-    desired[STAMP_NAME] = canonical_json(
-        stamp_for_desired(target, setup_id, profile_id, desired)
-    )
+    desired[STAMP_NAME] = canonical_json(stamp_for_desired(target, setup_id, profile_id, desired))
     return desired
 
 
@@ -1694,6 +1710,7 @@ def cleanup_empty_parents(target: Path, relative: str) -> None:
             current.rmdir()
         except OSError:
             return
+        fsync_parent_directory(current, f"managed empty parent cleanup {current}")
         current = current.parent
 
 
@@ -1729,34 +1746,180 @@ def preflight_destination(target: Path, relative: str) -> None:
         fail(f"managed file {relative} must not have hard-link aliases")
 
 
-def atomic_write(target: Path, relative: str, content: bytes) -> None:
+def fsync_directory(path: Path, label: str) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a directory")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_path_state(target: Path, relative: str) -> ManagedPathState:
+    reject_relative_symlink_ancestors(target, relative)
+    path = target / safe_relative_path(relative)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return ManagedPathState(None, None)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"managed file {relative} must be a regular non-symlink file")
+    if info.st_nlink != 1:
+        fail(f"managed file {relative} must not have hard-link aliases")
+    content = read_regular_file(
+        path,
+        f"snapshot {relative}",
+        max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+    )
+    return ManagedPathState(content, stat.S_IMODE(info.st_mode))
+
+
+def snapshot_path_states(target: Path, relatives: set[str]) -> dict[str, ManagedPathState]:
+    return {relative: snapshot_path_state(target, relative) for relative in sorted(relatives)}
+
+
+def _write_path_state(target: Path, relative: str, state: ManagedPathState) -> None:
+    if state.content is None:
+        path = target / safe_relative_path(relative)
+        parent = path.parent
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            fsync_directory(parent, f"managed parent {parent}")
+        cleanup_empty_parents(target, relative)
+        return
     path = ensure_parent(target, relative)
     parent_info = require_directory(path.parent, f"managed parent {path.parent}")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(state.content)
             handle.flush()
+            os.chmod(temporary, state.mode or OWNER_FILE_MODE)
             os.fsync(handle.fileno())
-        os.chmod(temporary, OWNER_FILE_MODE)
         if identity_of(
             require_directory(path.parent, f"managed parent {path.parent}")
         ) != identity_of(parent_info):
             raise ConcurrentTargetChange(f"managed parent changed while writing {relative}")
         os.replace(temporary, path)
-        os.chmod(path, OWNER_FILE_MODE)
+        fsync_directory(path.parent, f"managed parent {path.parent}")
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
 
 
+def restore_path_state(target: Path, relative: str, state: ManagedPathState) -> None:
+    _write_path_state(target, relative, state)
+
+
+def path_state_matches(target: Path, relative: str, state: ManagedPathState) -> bool:
+    try:
+        return snapshot_path_state(target, relative) == state
+    except ManagerError:
+        return False
+
+
+def verify_path_states(target: Path, snapshot: dict[str, ManagedPathState], label: str) -> None:
+    mismatches = [
+        relative
+        for relative, state in snapshot.items()
+        if not path_state_matches(target, relative, state)
+    ]
+    if mismatches:
+        fail(f"{label} did not leave exact managed path state: {', '.join(mismatches)}")
+
+
+def restore_path_states(target: Path, snapshot: dict[str, ManagedPathState]) -> None:
+    first_error: BaseException | None = None
+    ordered = sorted(snapshot)
+    for _attempt in range(2):
+        for relative in ordered:
+            state = snapshot[relative]
+            if path_state_matches(target, relative, state):
+                continue
+            try:
+                restore_path_state(target, relative, state)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if all(path_state_matches(target, relative, snapshot[relative]) for relative in ordered):
+            return
+    try:
+        verify_path_states(target, snapshot, "managed rollback")
+    except ManagerError as exc:
+        if first_error is not None:
+            raise ManagerError(str(exc)) from first_error
+        raise
+
+
+def desired_path_state(content: bytes | None) -> ManagedPathState:
+    if content is None:
+        return ManagedPathState(None, None)
+    return ManagedPathState(content, OWNER_FILE_MODE)
+
+
+def verify_desired_state(target: Path, desired: dict[str, bytes | None]) -> None:
+    expected = {relative: desired_path_state(content) for relative, content in desired.items()}
+    verify_path_states(target, expected, "managed mutation")
+
+
+def atomic_write(target: Path, relative: str, content: bytes) -> None:
+    before = snapshot_path_state(target, relative)
+    path = ensure_parent(target, relative)
+    parent_info = require_directory(path.parent, f"managed parent {path.parent}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    replaced = False
+    try:
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.chmod(temporary, OWNER_FILE_MODE)
+            os.fsync(handle.fileno())
+        if identity_of(
+            require_directory(path.parent, f"managed parent {path.parent}")
+        ) != identity_of(parent_info):
+            raise ConcurrentTargetChange(f"managed parent changed while writing {relative}")
+        os.replace(temporary, path)
+        replaced = True
+        try:
+            fsync_directory(path.parent, f"managed parent {path.parent}")
+        except BaseException:
+            restore_path_state(target, relative, before)
+            raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not replaced:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def replace_managed_state(
     target: Path,
     desired: dict[str, bytes | None],
     expected: dict[str, str] | None = None,
+    changed_paths: list[str] | None = None,
     **_kwargs: Any,
 ) -> None:
     require_directory(target, "target")
@@ -1768,9 +1931,12 @@ def replace_managed_state(
                 raise ConcurrentTargetChange(f"managed path changed before replacement: {relative}")
     for relative in desired:
         preflight_destination(target, relative)
-    ordered = [relative for relative in desired if relative != STAMP_NAME]
-    if STAMP_NAME in desired:
-        ordered.append(STAMP_NAME)
+    changed = set(
+        changed_paths
+        if changed_paths is not None
+        else stable_changed_paths_for_desired(target, desired)
+    )
+    ordered = [relative for relative in stable_desired_path_order(desired) if relative in changed]
     for relative in ordered:
         content = desired[relative]
         path = target / safe_relative_path(relative)
@@ -1780,10 +1946,13 @@ def replace_managed_state(
                 path.unlink()
             except FileNotFoundError:
                 pass
+            else:
+                fsync_directory(path.parent, f"managed parent {path.parent}")
             cleanup_empty_parents(target, relative)
         else:
             preflight_destination(target, relative)
             atomic_write(target, relative, content)
+    verify_desired_state(target, desired)
 
 
 def snapshot_paths(target: Path, relatives: set[str]) -> dict[str, bytes | None]:
@@ -1809,17 +1978,36 @@ def snapshot_digests(snapshot: dict[str, bytes | None]) -> dict[str, str]:
     }
 
 
+def stable_desired_path_order(desired: dict[str, bytes | None]) -> list[str]:
+    ordered = [relative for relative in MANAGED_FILES if relative in desired]
+    ordered.extend(
+        relative
+        for relative in sorted(desired)
+        if relative not in MANAGED_FILES and relative not in ordered
+    )
+    return ordered
+
+
+def stable_changed_paths_for_desired(target: Path, desired: dict[str, bytes | None]) -> list[str]:
+    changed = []
+    for relative in stable_desired_path_order(desired):
+        expected = desired_path_state(desired[relative])
+        if not path_state_matches(target, relative, expected):
+            changed.append(relative)
+    return changed
+
+
 def restore_snapshot(target: Path, snapshot: dict[str, bytes | None]) -> None:
-    for relative, content in snapshot.items():
-        path = target / safe_relative_path(relative)
-        if content is None:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            cleanup_empty_parents(target, relative)
-        else:
-            atomic_write(target, relative, content)
+    restore_path_states(
+        target,
+        {
+            relative: ManagedPathState(
+                content,
+                OWNER_FILE_MODE if content is not None else None,
+            )
+            for relative, content in snapshot.items()
+        },
+    )
 
 
 def choose_backup_slot(pool: Path) -> int:
@@ -1833,15 +2021,489 @@ def choose_backup_slot(pool: Path) -> int:
     return oldest_slot
 
 
+def is_sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
+    observed = set(value)
+    if observed != expected:
+        missing = sorted(expected - observed)
+        extra = sorted(observed - expected)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("extra " + ", ".join(extra))
+        fail(f"{label} keys are not exact: {'; '.join(details)}")
+
+
+def snapshot_tree_state(
+    root: Path,
+    label: str,
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+    max_paths: int,
+) -> dict[str, TreeEntry] | None:
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return None
+    if root_info.st_nlink < 1:
+        fail(f"{label} changed while it was inspected")
+    snapshot: dict[str, TreeEntry] = {}
+    total_bytes = 0
+    path_count = 0
+
+    def add_entry(path: Path, relative: str) -> None:
+        nonlocal path_count, total_bytes
+        path_count += 1
+        if path_count > max_paths:
+            fail(f"{label} exceeds the {max_paths}-path limit")
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            snapshot[relative] = TreeEntry("symlink", mode, os.readlink(path))
+            return
+        if stat.S_ISDIR(info.st_mode):
+            snapshot[relative] = TreeEntry("directory", mode)
+            return
+        if stat.S_ISREG(info.st_mode):
+            if info.st_size > max_file_bytes:
+                fail(f"{label} file exceeds the {max_file_bytes}-byte limit: {path}")
+            content = read_regular_file(path, f"{label} {relative}", max_bytes=max_file_bytes)
+            total_bytes += len(content)
+            if total_bytes > max_tree_bytes:
+                fail(f"{label} exceeds the {max_tree_bytes}-byte limit")
+            snapshot[relative] = TreeEntry("file", mode, content)
+            return
+        fail(f"{label} contains unsupported path type: {path}")
+
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        add_entry(root, ".")
+        return snapshot
+    add_entry(root, ".")
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        current_path = Path(current)
+        for directory in directories:
+            add_entry(
+                current_path / directory, (current_path / directory).relative_to(root).as_posix()
+            )
+        for filename in files:
+            add_entry(
+                current_path / filename, (current_path / filename).relative_to(root).as_posix()
+            )
+    return snapshot
+
+
+def tree_state_matches(
+    root: Path,
+    expected: dict[str, TreeEntry] | None,
+    label: str,
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+    max_paths: int,
+) -> bool:
+    try:
+        return (
+            snapshot_tree_state(
+                root,
+                label,
+                max_file_bytes=max_file_bytes,
+                max_tree_bytes=max_tree_bytes,
+                max_paths=max_paths,
+            )
+            == expected
+        )
+    except ManagerError:
+        return False
+
+
+def fsync_parent_directory(path: Path, label: str) -> None:
+    parent = path.parent
+    if parent.exists():
+        fsync_directory(parent, label)
+
+
+def remove_path_durable(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+        path.unlink()
+        fsync_parent_directory(path, f"parent of removed path {path}")
+        return
+    if stat.S_ISDIR(info.st_mode):
+        for child in sorted(path.iterdir(), key=lambda item: item.name, reverse=True):
+            remove_path_durable(child)
+        path.rmdir()
+        fsync_parent_directory(path, f"parent of removed directory {path}")
+        return
+    fail(f"cannot remove unsupported path type: {path}")
+
+
+def remove_path_durable_retry(path: Path, label: str, *, attempts: int = 3) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            remove_path_durable(path)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if not path_exists_no_follow(path):
+            return
+    if first_error is not None:
+        raise ManagerError(f"{label} cleanup failed") from first_error
+    fail(f"{label} cleanup left residue: {path}")
+
+
+def chmod_created_tree_parents(root: Path, path: Path) -> None:
+    current = root
+    for part in path.relative_to(root).parent.parts:
+        current = current / part
+        current.chmod(OWNER_DIR_MODE)
+
+
+def write_tree_file(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.chmod(path, mode)
+        os.fsync(handle.fileno())
+    fsync_directory(path.parent, f"tree file parent {path.parent}")
+
+
+def apply_tree_snapshot(root: Path, snapshot: dict[str, TreeEntry] | None) -> None:
+    if snapshot is None:
+        remove_path_durable(root)
+        return
+    remove_path_durable(root)
+    root_entry = snapshot.get(".")
+    if root_entry is None or root_entry.kind != "directory":
+        fail(f"tree snapshot root is invalid: {root}")
+    root.mkdir(mode=root_entry.mode, parents=True, exist_ok=False)
+    root.chmod(root_entry.mode)
+    fsync_parent_directory(root, f"tree root parent {root}")
+    for relative, entry in sorted(snapshot.items(), key=lambda item: (item[0].count("/"), item[0])):
+        if relative == ".":
+            continue
+        path = root / safe_relative_path(relative)
+        if entry.kind == "directory":
+            path.mkdir(mode=entry.mode, parents=True, exist_ok=True)
+            chmod_created_tree_parents(root, path)
+            path.chmod(entry.mode)
+            fsync_directory(path.parent, f"tree directory parent {path.parent}")
+        elif entry.kind == "file":
+            if not isinstance(entry.content, bytes):
+                fail(f"tree snapshot file content is invalid: {relative}")
+            chmod_created_tree_parents(root, path)
+            write_tree_file(path, entry.content, entry.mode)
+        elif entry.kind == "symlink":
+            if not isinstance(entry.content, str):
+                fail(f"tree snapshot symlink content is invalid: {relative}")
+            path.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+            chmod_created_tree_parents(root, path)
+            os.symlink(entry.content, path)
+            fsync_directory(path.parent, f"tree symlink parent {path.parent}")
+        else:
+            fail(f"tree snapshot path type is invalid: {relative}")
+
+
+def restore_tree_snapshot_retry(
+    root: Path,
+    snapshot: dict[str, TreeEntry] | None,
+    label: str,
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+    max_paths: int,
+    attempts: int = 3,
+) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            apply_tree_snapshot(root, snapshot)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if tree_state_matches(
+            root,
+            snapshot,
+            label,
+            max_file_bytes=max_file_bytes,
+            max_tree_bytes=max_tree_bytes,
+            max_paths=max_paths,
+        ):
+            return
+    if first_error is not None:
+        raise ManagerError(f"{label} restore failed") from first_error
+    fail(f"{label} restore did not reach the expected state")
+
+
 def write_backup_file(slot_dir: Path, relative: str, content: bytes) -> None:
     path = slot_dir / safe_relative_path(relative)
     path.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
-    path.write_bytes(content)
-    os.chmod(path, OWNER_FILE_MODE)
+    current = slot_dir
+    for part in path.relative_to(slot_dir).parent.parts:
+        current = current / part
+        current.chmod(OWNER_DIR_MODE)
+    with path.open("wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.chmod(path, OWNER_FILE_MODE)
+        os.fsync(handle.fileno())
+    fsync_directory(path.parent, f"backup parent {path.parent}")
 
 
-def backup_current_state(target: Path, stamp: dict[str, Any]) -> int:
+def iter_backup_file_relatives(slot_dir: Path) -> set[str]:
+    relatives: set[str] = set()
+    for root, directories, files in os.walk(slot_dir):
+        root_path = Path(root)
+        for directory in directories:
+            directory_path = root_path / directory
+            info = directory_path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"backup contains unsafe directory: {directory_path}")
+            if not is_owner_private_directory(info):
+                fail(f"backup directory must be private to the current user: {directory_path}")
+        for filename in files:
+            path = root_path / filename
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail(f"backup contains unsafe file: {path}")
+            if not is_owner_only_file(info):
+                fail(f"backup file must be owned by the current user with mode 0600: {path}")
+            relatives.add(path.relative_to(slot_dir).as_posix())
+    return relatives
+
+
+def validate_backup_slot_directory(target: Path, slot_dir: Path, slot: int) -> dict[str, Any]:
+    slot_info = require_directory(slot_dir, f"backup slot {slot}")
+    if not is_owner_private_directory(slot_info):
+        fail(f"backup slot {slot} must be private to the current user with mode 0700")
+    envelope = read_json_file(slot_dir / BACKUP_NAME, f"backup {slot} envelope", owner_only=True)
+    require_exact_keys(
+        envelope,
+        {
+            "schema_version",
+            "product_name",
+            "build_version",
+            "slot",
+            "canonical_target",
+            "source_setup_id",
+            "managed_files",
+            "stamp_sha256",
+        },
+        f"backup {slot} envelope",
+    )
+    schema_version = envelope["schema_version"]
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != BACKUP_SCHEMA
+    ):
+        fail("backup schema is unsupported")
+    if not isinstance(envelope["product_name"], str) or envelope["product_name"] != PRODUCT_NAME:
+        fail("backup belongs to another product")
+    if not isinstance(envelope["build_version"], str) or envelope["build_version"] != VERSION:
+        fail("backup build version is unsupported")
+    envelope_slot = envelope["slot"]
+    if (
+        not isinstance(envelope_slot, int)
+        or isinstance(envelope_slot, bool)
+        or envelope_slot != slot
+    ):
+        fail("backup slot number mismatch")
+    if not isinstance(envelope["canonical_target"], str) or envelope["canonical_target"] != str(
+        target
+    ):
+        fail("backup is bound to a different target")
+    if not isinstance(envelope["source_setup_id"], str) or not envelope["source_setup_id"]:
+        fail("backup source setup id is invalid")
+    if not is_sha256_hex(envelope["stamp_sha256"]):
+        fail("backup stamp digest is invalid")
+    records = envelope["managed_files"]
+    if not isinstance(records, list):
+        fail("backup managed file records are invalid")
+    seen_paths: set[str] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            fail(f"backup managed file record {index} is invalid")
+        require_exact_keys(
+            record, {"path", "sha256", "size"}, f"backup managed file record {index}"
+        )
+        relative = record["path"]
+        if not isinstance(relative, str) or relative not in MANAGED_FILES:
+            fail(f"backup managed file record {index} path is invalid")
+        if relative in seen_paths:
+            fail(f"backup managed file record is duplicated: {relative}")
+        seen_paths.add(relative)
+        if not is_sha256_hex(record["sha256"]):
+            fail(f"backup managed file record {relative} digest is invalid")
+        size = record["size"]
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            fail(f"backup managed file record {relative} size is invalid")
+        content = read_regular_file(
+            slot_dir / safe_relative_path(relative),
+            f"backup {slot} {relative}",
+            owner_only=True,
+            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        )
+        if len(content) != size:
+            fail(f"backup {slot} {relative} size mismatch")
+        if digest_for_content(relative, content) != record["sha256"]:
+            fail(f"backup {slot} {relative} digest mismatch")
+    if seen_paths != set(MANAGED_FILES):
+        fail("backup managed file path set is not exact")
+    expected_files = {BACKUP_NAME, *seen_paths}
+    if iter_backup_file_relatives(slot_dir) != expected_files:
+        fail("backup file set is not exact")
+    return envelope
+
+
+def backup_tree_max_bytes() -> int:
+    return MAX_BACKUPS * ((len(MANAGED_FILES) + 1) * MANAGED_PAYLOAD_MAX_BYTES)
+
+
+def snapshot_backup_pool(pool: Path) -> dict[str, TreeEntry] | None:
+    return snapshot_tree_state(
+        pool,
+        "backup pool",
+        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_tree_bytes=backup_tree_max_bytes(),
+        max_paths=MAX_BACKUPS * (len(MANAGED_FILES) * 4 + 16),
+    )
+
+
+def restore_backup_pool_snapshot(pool: Path, snapshot: dict[str, TreeEntry] | None) -> None:
+    restore_tree_snapshot_retry(
+        pool,
+        snapshot,
+        "backup pool",
+        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_tree_bytes=backup_tree_max_bytes(),
+        max_paths=MAX_BACKUPS * (len(MANAGED_FILES) * 4 + 16),
+    )
+
+
+def backup_pool_matches(pool: Path, snapshot: dict[str, TreeEntry] | None) -> bool:
+    return tree_state_matches(
+        pool,
+        snapshot,
+        "backup pool",
+        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_tree_bytes=backup_tree_max_bytes(),
+        max_paths=MAX_BACKUPS * (len(MANAGED_FILES) * 4 + 16),
+    )
+
+
+def backup_transaction_residue(pool: Path) -> list[str]:
+    if not path_exists_no_follow(pool):
+        return []
+    residue = []
+    for path in pool.rglob("*"):
+        if path.name.startswith((".tmp-", ".hold-")):
+            residue.append(path.relative_to(pool).as_posix())
+    return sorted(residue)
+
+
+def commit_backup_transactions(transactions: list[BackupSlotTransaction]) -> None:
+    for transaction in transactions:
+        if transaction.previous_dir is not None:
+            remove_path_durable_retry(
+                transaction.previous_dir,
+                f"retired backup slot {transaction.slot}",
+            )
+        fsync_directory(transaction.pool, f"backup pool {transaction.pool}")
+        residue = backup_transaction_residue(transaction.pool)
+        if residue:
+            fail("backup transaction left temp/hold residue: " + ", ".join(residue))
+        validate_backup_slot_directory(transaction.target, transaction.slot_dir, transaction.slot)
+
+
+def rollback_backup_transactions(transactions: list[BackupSlotTransaction]) -> None:
+    first_error: BaseException | None = None
+    for transaction in reversed(transactions):
+        restored = False
+        for _attempt in range(3):
+            try:
+                restore_backup_pool_snapshot(transaction.pool, transaction.pre_pool_snapshot)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            if backup_pool_matches(transaction.pool, transaction.pre_pool_snapshot):
+                residue = backup_transaction_residue(transaction.pool)
+                if residue:
+                    if first_error is None:
+                        first_error = ManagerError(
+                            "backup rollback left temp/hold residue: " + ", ".join(residue)
+                        )
+                    continue
+                restored = True
+                break
+        if not restored:
+            if first_error is not None:
+                raise ManagerError("backup rollback failed") from first_error
+            fail("backup rollback did not restore the exact pool snapshot")
+
+
+def backup_transactions_match_pre(transactions: list[BackupSlotTransaction]) -> bool:
+    return all(
+        backup_pool_matches(transaction.pool, transaction.pre_pool_snapshot)
+        and not backup_transaction_residue(transaction.pool)
+        for transaction in transactions
+    )
+
+
+def rollback_lifecycle_state(
+    target: Path,
+    managed_snapshot: dict[str, ManagedPathState],
+    backup_transactions: list[BackupSlotTransaction],
+) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(3):
+        try:
+            restore_path_states(target, managed_snapshot)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            rollback_backup_transactions(backup_transactions)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            verify_path_states(target, managed_snapshot, "managed rollback")
+            if backup_transactions_match_pre(backup_transactions):
+                return
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise ManagerError(
+            "lifecycle rollback did not restore managed paths and backups"
+        ) from first_error
+    fail("lifecycle rollback did not restore managed paths and backups")
+
+
+def backup_current_state(
+    target: Path,
+    stamp: dict[str, Any],
+    transactions: list[BackupSlotTransaction] | None = None,
+) -> int:
     pool = backup_pool(target)
+    pre_pool_snapshot = snapshot_backup_pool(pool)
+    created_pool = False
     if path_exists_no_follow(pool):
         pool_info = require_directory(pool, "backup pool")
         if not is_owner_private_directory(pool_info):
@@ -1849,57 +2511,84 @@ def backup_current_state(target: Path, stamp: dict[str, Any]) -> int:
     else:
         pool.mkdir(mode=OWNER_DIR_MODE)
         pool.chmod(OWNER_DIR_MODE)
+        created_pool = True
     pool_info = require_directory(pool, "backup pool")
     if not is_owner_private_directory(pool_info):
         fail("backup pool must be private to the current user with mode 0700")
     slot = choose_backup_slot(pool)
     slot_dir = pool / str(slot)
+    previous_dir: Path | None = None
     if slot_dir.exists():
         info = slot_dir.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             fail(f"backup slot is not a real directory: {slot}")
-        shutil.rmtree(slot_dir)
-    temporary = pool / f".tmp-{slot}-{os.getpid()}"
+        validate_backup_slot_directory(target, slot_dir, slot)
+    unique = f"{slot}-{os.getpid()}-{time.time_ns()}"
+    temporary = pool / f".tmp-{unique}"
+    hold = pool / f".hold-{unique}"
     if temporary.exists():
         shutil.rmtree(temporary)
+    if hold.exists():
+        shutil.rmtree(hold)
     temporary.mkdir(mode=OWNER_DIR_MODE)
-    stamp_content = read_regular_file(stamp_path(target), "target stamp")
-    records = stamp["managed_files"]
-    for record in records:
-        relative = str(record["path"])
-        content = read_regular_file(
-            target / safe_relative_path(relative),
-            f"backup source {relative}",
-            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+    try:
+        stamp_content = read_regular_file(stamp_path(target), "target stamp")
+        records: list[dict[str, Any]] = []
+        for record in stamp["managed_files"]:
+            relative = str(record["path"])
+            expected_digest = str(record["sha256"])
+            content = read_regular_file(
+                target / safe_relative_path(relative),
+                f"backup source {relative}",
+                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            )
+            actual_digest = digest_for_content(relative, content)
+            if actual_digest != expected_digest:
+                fail(f"backup source {relative} digest mismatch")
+            write_backup_file(temporary, relative, content)
+            records.append({"path": relative, "sha256": actual_digest, "size": len(content)})
+        envelope = {
+            "schema_version": BACKUP_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "build_version": VERSION,
+            "slot": slot,
+            "canonical_target": str(target),
+            "source_setup_id": stamp["setup_id"],
+            "managed_files": records,
+            "stamp_sha256": sha256_bytes(stamp_content),
+        }
+        write_backup_file(temporary, BACKUP_NAME, canonical_json(envelope))
+        validate_backup_slot_directory(target, temporary, slot)
+        if slot_dir.exists():
+            os.replace(slot_dir, hold)
+            previous_dir = hold
+            fsync_directory(pool, f"backup pool {pool}")
+        os.replace(temporary, slot_dir)
+        fsync_directory(pool, f"backup pool {pool}")
+        transaction = BackupSlotTransaction(
+            target,
+            slot,
+            pool,
+            slot_dir,
+            previous_dir,
+            created_pool,
+            pre_pool_snapshot,
         )
-        write_backup_file(temporary, relative, content)
-    envelope = {
-        "schema_version": BACKUP_SCHEMA,
-        "product_name": PRODUCT_NAME,
-        "build_version": VERSION,
-        "slot": slot,
-        "canonical_target": str(target),
-        "source_setup_id": stamp["setup_id"],
-        "managed_files": records,
-        "stamp_sha256": sha256_bytes(stamp_content),
-    }
-    write_backup_file(temporary, BACKUP_NAME, canonical_json(envelope))
-    os.replace(temporary, slot_dir)
-    return slot
+        if transactions is None:
+            commit_backup_transactions([transaction])
+        else:
+            transactions.append(transaction)
+        return slot
+    except BaseException:
+        restore_backup_pool_snapshot(pool, pre_pool_snapshot)
+        raise
 
 
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot >= MAX_BACKUPS:
         fail(f"backup slot must be between 0 and {MAX_BACKUPS - 1}")
     slot_dir = backup_slot_directory(target, slot)
-    envelope = read_json_file(slot_dir / BACKUP_NAME, f"backup {slot} envelope")
-    if envelope.get("schema_version") != BACKUP_SCHEMA:
-        fail("backup schema is unsupported")
-    if envelope.get("product_name") != PRODUCT_NAME:
-        fail("backup belongs to another product")
-    if envelope.get("canonical_target") != str(target):
-        fail("backup is bound to a different target")
-    return envelope
+    return validate_backup_slot_directory(target, slot_dir, slot)
 
 
 def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | None]]:
@@ -1914,10 +2603,9 @@ def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | 
         content = read_regular_file(
             slot_dir / safe_relative_path(relative),
             f"backup {slot} {relative}",
+            owner_only=True,
             max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
         )
-        if digest_for_content(relative, content) != record["sha256"]:
-            fail(f"backup {slot} {relative} digest mismatch")
         if relative == CONFIG:
             backup_config = parse_json_object(content, f"backup {slot} config")
             managed = extract_managed_config(backup_config)
@@ -1938,7 +2626,10 @@ def desired_for_backup(target: Path, slot: int) -> tuple[str, dict[str, bytes | 
             "build_version": VERSION,
             "setup_id": setup_id,
             "canonical_target": str(target),
-            "managed_files": envelope["managed_files"],
+            "managed_files": [
+                {"path": record["path"], "sha256": record["sha256"]}
+                for record in envelope["managed_files"]
+            ],
             "legacy": True,
             "launchable": False,
             "runtime": {
@@ -1981,6 +2672,7 @@ def _mutate_setup_locked(
 ) -> dict[str, Any]:
     with target_lock(target, create_parent=(operation == "install")) as transaction:
         ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
+        stamp: dict[str, Any] | None
         if operation == "install":
             stamp = read_stamp(target)
             if stamp is None:
@@ -1989,22 +2681,32 @@ def _mutate_setup_locked(
                 require_clean_installed(target)
                 if not stamp_is_active(stamp):
                     fail("legacy managed state must be migrated or removed before install")
-                if stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id:
-                    backup_slot = backup_current_state(target, stamp)
         elif operation == "switch":
             stamp = require_clean_installed(target)
             if not stamp_is_active(stamp):
                 fail("legacy managed state must be migrated or removed before switch")
-            if stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id:
-                backup_slot = backup_current_state(target, stamp)
         else:
             fail(f"unsupported mutation operation: {operation}")
         desired = desired_for_setup(target, setup_id, profile_id)
-        snapshot = snapshot_paths(target, set(desired))
+        changed_paths = stable_changed_paths_for_desired(target, desired)
+        backup_transactions: list[BackupSlotTransaction] = []
+        if (
+            stamp is not None
+            and changed_paths
+            and (stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id)
+        ):
+            backup_slot = backup_current_state(target, stamp, transactions=backup_transactions)
+        snapshot = snapshot_path_states(target, set(desired))
         try:
-            replace_managed_state(target, desired, snapshot_digests(snapshot))
+            replace_managed_state(
+                target,
+                desired,
+                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
+                changed_paths=changed_paths,
+            )
+            commit_backup_transactions(backup_transactions)
         except Exception:
-            restore_snapshot(target, snapshot)
+            rollback_lifecycle_state(target, snapshot, backup_transactions)
             raise
     return {
         "operation": operation,
@@ -2012,6 +2714,7 @@ def _mutate_setup_locked(
         "permission_profile": profile_id,
         "target": str(target),
         "backup_slot": backup_slot,
+        "changed_paths": changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -2023,7 +2726,9 @@ def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -
     setup_id = stamp_setup_id(stamp)
     if setup_id in {"safe", "full-auto"}:
         return setup_id
-    fail("legacy balanced state has no native profile mapping; pass --profile safe or --profile full-auto")
+    fail(
+        "legacy balanced state has no native profile mapping; pass --profile safe or --profile full-auto"
+    )
 
 
 def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
@@ -2042,15 +2747,24 @@ def _migrate_setup_locked(
             profile = profile_id or stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
         elif stamp_is_legacy(stamp):
             profile = infer_legacy_profile(stamp, profile_id)
-            backup_slot = backup_current_state(target, stamp)
         else:
             fail("managed Kilo setup is not migratable")
         desired = desired_for_setup(target, DEFAULT_SETUP_ID, profile)
-        snapshot = snapshot_paths(target, set(desired))
+        changed_paths = stable_changed_paths_for_desired(target, desired)
+        backup_transactions: list[BackupSlotTransaction] = []
+        if stamp_is_legacy(stamp) and changed_paths:
+            backup_slot = backup_current_state(target, stamp, transactions=backup_transactions)
+        snapshot = snapshot_path_states(target, set(desired))
         try:
-            replace_managed_state(target, desired, snapshot_digests(snapshot))
+            replace_managed_state(
+                target,
+                desired,
+                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
+                changed_paths=changed_paths,
+            )
+            commit_backup_transactions(backup_transactions)
         except Exception:
-            restore_snapshot(target, snapshot)
+            rollback_lifecycle_state(target, snapshot, backup_transactions)
             raise
     return {
         "operation": "migrate",
@@ -2058,6 +2772,7 @@ def _migrate_setup_locked(
         "permission_profile": profile,
         "target": str(target),
         "backup_slot": backup_slot,
+        "changed_paths": changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -2072,17 +2787,24 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target):
         require_private_target_directory_for_software(target, allow_missing=False)
         setup_id, desired = desired_for_backup(target, slot)
-        snapshot = snapshot_paths(target, set(desired))
+        changed_paths = stable_changed_paths_for_desired(target, desired)
+        snapshot = snapshot_path_states(target, set(desired))
         try:
-            replace_managed_state(target, desired, snapshot_digests(snapshot))
+            replace_managed_state(
+                target,
+                desired,
+                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
+                changed_paths=changed_paths,
+            )
         except Exception:
-            restore_snapshot(target, snapshot)
+            rollback_lifecycle_state(target, snapshot, [])
             raise
     return {
         "operation": "restore",
         "setup_id": setup_id,
         "target": str(target),
         "backup_slot": slot,
+        "changed_paths": changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -2097,16 +2819,23 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
     with target_lock(target):
         stamp = require_clean_installed(target)
         desired = desired_for_remove(target)
-        snapshot = snapshot_paths(target, set(desired))
+        changed_paths = stable_changed_paths_for_desired(target, desired)
+        snapshot = snapshot_path_states(target, set(desired))
         try:
-            replace_managed_state(target, desired, snapshot_digests(snapshot))
+            replace_managed_state(
+                target,
+                desired,
+                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
+                changed_paths=changed_paths,
+            )
         except Exception:
-            restore_snapshot(target, snapshot)
+            rollback_lifecycle_state(target, snapshot, [])
             raise
     return {
         "operation": "remove",
         "removed_setup_id": stamp["setup_id"],
         "target": str(target),
+        "changed_paths": changed_paths,
         "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
     }
 
@@ -2148,6 +2877,7 @@ def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
         target = resolve_target(locked_target, create=False)
         stamp = read_stamp(target) if target.exists() else None
         operation = "install" if stamp is None else "switch"
+        desired = desired_for_setup(target, setup_id, profile_id)
         return {
             "operation": operation,
             "setup_id": setup_id,
@@ -2155,6 +2885,7 @@ def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
             "target": str(target),
             "mutates": False,
             "managed_files": list(MANAGED_FILES),
+            "changed_paths": stable_changed_paths_for_desired(target, desired),
             "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
         }
 
@@ -2284,7 +3015,7 @@ def native_wrapper_bytes(native_relative: Path, runtime_resources: dict[str, Any
         tree_sitter_block = (
             f'tree_sitter_dir="$self_dir/../{tree_sitter_path}"\n'
             'if [ -f "$tree_sitter_dir/tree-sitter.wasm" ]; then\n'
-            f"  export {NATIVE_TREE_SITTER_ENV}=\"$tree_sitter_dir\"\n"
+            f'  export {NATIVE_TREE_SITTER_ENV}="$tree_sitter_dir"\n'
             "fi\n"
         )
     return (
@@ -2940,7 +3671,9 @@ def package_lock_records(root: Path) -> dict[str, Any]:
         resolved = record.get("resolved")
         integrity = record.get("integrity")
         if not isinstance(resolved, str) or not resolved.startswith(NPM_REGISTRY):
-            fail(f"Kilo CLI package lock record is not resolved from the official registry: {package}")
+            fail(
+                f"Kilo CLI package lock record is not resolved from the official registry: {package}"
+            )
         if not isinstance(integrity, str) or not integrity:
             fail(f"Kilo CLI package lock record omits integrity: {package}")
         expected_dist = native_record_dist(expected, package)
@@ -2963,7 +3696,9 @@ def package_lock_records(root: Path) -> dict[str, Any]:
 def native_package_binary_digest(root: Path, package_path: Path) -> str:
     binary = package_path / "bin" / KILO_COMMAND
     require_safe_executable(binary, root, f"Kilo native package binary {package_path.name}")
-    return digest_regular_file(binary, f"Kilo native package binary {package_path.name}", {"value": 0})
+    return digest_regular_file(
+        binary, f"Kilo native package binary {package_path.name}", {"value": 0}
+    )
 
 
 def optional_directory_entry_contract(
@@ -3512,19 +4247,93 @@ def ensure_replace_parent(destination: Path) -> None:
 
 def move_replace_path(source: Path, destination: Path) -> None:
     ensure_replace_parent(destination)
+    source_parent = source.parent
+    destination_parent = destination.parent
     os.replace(source, destination)
+    fsync_directory(destination_parent, f"software destination parent {destination_parent}")
+    if source_parent != destination_parent and source_parent.exists():
+        fsync_directory(source_parent, f"software source parent {source_parent}")
 
 
 def move_old_path(source: Path, saved: Path) -> None:
     saved.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    saved.parent.chmod(OWNER_DIR_MODE)
+    source_parent = source.parent
+    saved_parent = saved.parent
     os.replace(source, saved)
+    fsync_directory(saved_parent, f"software hold parent {saved_parent}")
+    if source_parent != saved_parent and source_parent.exists():
+        fsync_directory(source_parent, f"software source parent {source_parent}")
 
 
 def cleanup_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
-        shutil.rmtree(path)
+    remove_path_durable(path)
+
+
+def cleanup_software_parents(target: Path, *, preserve: set[Path]) -> None:
+    for relative in sorted(SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True):
+        if relative in preserve:
+            continue
+        parent = target / relative
+        if not parent.exists() or parent.is_symlink() or not parent.is_dir():
+            continue
+        try:
+            parent.rmdir()
+        except OSError:
+            continue
+        fsync_parent_directory(parent, f"software parent cleanup {parent}")
+
+
+def snapshot_software_surface_state(target: Path) -> dict[str, TreeEntry]:
+    snapshot: dict[str, TreeEntry] = {}
+    for relative in sorted(
+        set(SOFTWARE_PARENT_PATHS).union(SOFTWARE_REPLACE_PATHS),
+        key=lambda item: (len(item.parts), str(item)),
+    ):
+        tree = snapshot_tree_state(
+            target / relative,
+            f"software path {relative}",
+            max_file_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_tree_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_paths=SOFTWARE_TREE_MAX_PATHS,
+        )
+        if tree is None:
+            snapshot[relative.as_posix()] = TreeEntry("absent", 0)
+            continue
+        for tree_relative, entry in tree.items():
+            key = relative.as_posix()
+            if tree_relative != ".":
+                key = f"{key}/{tree_relative}"
+            snapshot[key] = entry
+    return snapshot
+
+
+def verify_software_surface_state(
+    target: Path,
+    expected: dict[str, TreeEntry],
+    label: str,
+) -> None:
+    if snapshot_software_surface_state(target) != expected:
+        fail(f"{label} did not leave exact target-owned software state")
+
+
+def software_rollback_complete(
+    target: Path,
+    hold: Path,
+    expected_old: set[Path],
+    expected_absent: set[Path],
+    expected_state: dict[str, TreeEntry],
+) -> bool:
+    for relative in SOFTWARE_REPLACE_PATHS:
+        if path_exists_no_follow(hold / relative):
+            return False
+    for relative in expected_old:
+        if not path_exists_no_follow(target / relative):
+            return False
+    for relative in expected_absent:
+        if path_exists_no_follow(target / relative):
+            return False
+    return snapshot_software_surface_state(target) == expected_state
 
 
 def restore_software_paths(
@@ -3535,29 +4344,38 @@ def restore_software_paths(
     moved_old: list[Path],
     installed_new: list[Path],
     preexisting_parent_paths: set[Path],
+    expected_state: dict[str, TreeEntry],
 ) -> None:
+    expected_old = set(moved_old)
+    expected_old.update(
+        relative for relative in SOFTWARE_REPLACE_PATHS if path_exists_no_follow(hold / relative)
+    )
     new_paths = set(installed_new)
-    for relative in SOFTWARE_REPLACE_PATHS:
-        if relative not in new_paths and not path_exists_no_follow(live_stage / relative):
-            new_paths.add(relative)
-    for relative in reversed(SOFTWARE_REPLACE_PATHS):
-        destination = target / relative
-        if relative in new_paths and path_exists_no_follow(destination):
-            cleanup_path(destination)
-    for relative in reversed(moved_old):
-        saved = hold / relative
-        if path_exists_no_follow(saved):
-            move_replace_path(saved, target / relative)
-    for relative in sorted(SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True):
-        if relative in preexisting_parent_paths:
-            continue
-        parent = target / relative
-        if not parent.exists() or parent.is_symlink() or not parent.is_dir():
-            continue
-        try:
-            parent.rmdir()
-        except OSError:
-            continue
+    expected_absent = {relative for relative in new_paths if relative not in expected_old}
+    first_error: BaseException | None = None
+    for _attempt in range(2):
+        for relative in reversed(SOFTWARE_REPLACE_PATHS):
+            destination = target / relative
+            if relative in new_paths and path_exists_no_follow(destination):
+                try:
+                    cleanup_path(destination)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        for relative in reversed(SOFTWARE_REPLACE_PATHS):
+            saved = hold / relative
+            if path_exists_no_follow(saved):
+                try:
+                    move_replace_path(saved, target / relative)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        cleanup_software_parents(target, preserve=preexisting_parent_paths)
+        if software_rollback_complete(target, hold, expected_old, expected_absent, expected_state):
+            return
+    if first_error is not None:
+        raise ManagerError("software rollback failed") from first_error
+    fail("software rollback did not restore the exact replace path set")
 
 
 def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) -> None:
@@ -3569,8 +4387,9 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
         validate_replace_destination(target, relative)
     hold = hold_parent / "rollback"
     if path_exists_no_follow(hold):
-        cleanup_path(hold)
+        remove_path_durable_retry(hold, "preexisting software rollback hold")
     hold.mkdir(mode=OWNER_DIR_MODE)
+    expected_state = snapshot_software_surface_state(target)
     preexisting_parent_paths = {
         relative for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(target / relative)
     }
@@ -3602,10 +4421,9 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
             moved_old=moved_old,
             installed_new=installed_new,
             preexisting_parent_paths=preexisting_parent_paths,
+            expected_state=expected_state,
         )
         raise
-    finally:
-        shutil.rmtree(hold, ignore_errors=True)
 
 
 def materialize_stage_entrypoint(live_stage: Path, native_provenance: dict[str, Any]) -> None:
@@ -3648,7 +4466,9 @@ def write_lock_project(stage_root: Path) -> Path:
     return project
 
 
-def generate_package_lock(stage_root: Path, live_stage: Path, npm: str, env: dict[str, str]) -> Path:
+def generate_package_lock(
+    stage_root: Path, live_stage: Path, npm: str, env: dict[str, str]
+) -> Path:
     project = write_lock_project(stage_root)
     completed = bounded_process(
         [npm, *NPM_LOCK_ARGV],
@@ -3706,6 +4526,12 @@ def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
             target.rmdir()
     except OSError:
         pass
+
+
+def cleanup_transaction_directory(path: Path, label: str) -> None:
+    remove_path_durable_retry(path, label)
+    if path_exists_no_follow(path):
+        fail(f"{label} cleanup left residue: {path}")
 
 
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
@@ -3784,7 +4610,7 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             raise
         finally:
             if staging is not None:
-                shutil.rmtree(staging, ignore_errors=True)
+                cleanup_transaction_directory(staging, "software staging")
     return {
         "schema_version": 1,
         "command": command,
@@ -3830,6 +4656,7 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
         with target_lock(target):
             require_private_target_directory_for_software(target, allow_missing=False)
             validate_existing_software_surface(target)
+            expected_state = snapshot_software_surface_state(target)
             try:
                 for relative in SOFTWARE_REPLACE_PATHS:
                     destination = target / relative
@@ -3837,27 +4664,24 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
                         saved = hold / relative
                         move_old_path(destination, saved)
                         moved_old.append(relative)
-                for relative in sorted(
-                    SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True
-                ):
-                    if relative in preexisting_parent_paths:
-                        parent = target / relative
-                        try:
-                            parent.rmdir()
-                        except OSError:
-                            pass
+                cleanup_software_parents(target, preserve=set())
+                final_status = software_status(target)
+                if final_status["software_state"] != "absent":
+                    fail("removed Kilo CLI left target-owned software residue")
             except BaseException:
+                moved_old = [
+                    relative
+                    for relative in SOFTWARE_REPLACE_PATHS
+                    if path_exists_no_follow(hold / relative)
+                ]
                 restore_software_paths(
                     target,
                     hold,
                     empty_live,
-                    moved_old=[
-                        relative
-                        for relative in SOFTWARE_REPLACE_PATHS
-                        if path_exists_no_follow(hold / relative)
-                    ],
+                    moved_old=moved_old,
                     installed_new=[],
                     preexisting_parent_paths=preexisting_parent_paths,
+                    expected_state=expected_state,
                 )
                 raise
         return {
@@ -3867,7 +4691,7 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             "changed": bool(moved_old),
         }
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        cleanup_transaction_directory(staging, "software removal staging")
 
 
 def require_current_software(target: Path) -> dict[str, Any]:

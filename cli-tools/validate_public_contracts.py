@@ -3,17 +3,17 @@
 
 from __future__ import annotations
 
-import importlib.util
 import contextlib
+import importlib.util
 import json
 import multiprocessing
 import os
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -40,6 +40,7 @@ MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
+EXPECTED_CHANGED_PATH_POLICY = "actual-byte-diff"
 EXPECTED_PLATFORM_SCOPE = {
     "supported_hosts": [
         {"id": "macos-arm64", "os": "darwin", "cpu": "arm64", "libc": None, "distribution": None},
@@ -117,6 +118,10 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def copy_json(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
 def require_file(relative: str) -> Path:
     path = ROOT / relative
     if not path.is_file():
@@ -151,6 +156,11 @@ def validate_versions() -> None:
         fail("manifest permission profile list is not synchronized")
     if manifest.get("managed_state") != list(MANAGED_FILES):
         fail("manifest managed state list is not synchronized")
+    if manifest.get("setup_lifecycle") != {
+        "plan_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
+        "mutation_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
+    }:
+        fail("manifest setup lifecycle changed-path policy mismatch")
     runtime = manifest.get("runtime", {})
     if runtime.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("manifest launch lifecycle lock contract mismatch")
@@ -201,7 +211,10 @@ def validate_versions() -> None:
         fail("manifest software layout mismatch")
     if software.get("layout", {}).get("entrypoint_kind") != "target-owned-native-wrapper":
         fail("manifest entrypoint kind mismatch")
-    if software.get("layout", {}).get("native_executable_policy") != "selected-native-package-bin-kilo":
+    if (
+        software.get("layout", {}).get("native_executable_policy")
+        != "selected-native-package-bin-kilo"
+    ):
         fail("manifest native executable policy mismatch")
     if software.get("bounds", {}).get("max_paths") != nddev_kilo_cli.SOFTWARE_TREE_MAX_PATHS:
         fail("manifest software path bound mismatch")
@@ -264,6 +277,10 @@ def validate_contract() -> None:
         fail("permission profiles are not synchronized")
     if setup_system.get("legacy_setup_ids") != list(LEGACY_SETUPS):
         fail("legacy setup ids are not synchronized")
+    if setup_system.get("plan_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
+        fail("plan changed-path policy is not synchronized")
+    if setup_system.get("mutation_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
+        fail("mutation changed-path policy is not synchronized")
     managed = contract.get("managed_state", {})
     if managed.get("managed_files") != list(MANAGED_FILES):
         fail("managed file list is not synchronized")
@@ -572,7 +589,9 @@ def validate_workflows() -> None:
 
 def release_path_is_safe(relative: str) -> bool:
     path = Path(relative)
-    return not path.is_absolute() and all(part not in {"", ".", "..", ".git"} for part in path.parts)
+    return not path.is_absolute() and all(
+        part not in {"", ".", "..", ".git"} for part in path.parts
+    )
 
 
 def release_required_source_files() -> set[str]:
@@ -621,8 +640,7 @@ def validate_release_archive_exact_bytes() -> None:
             fail(f"release archive closure omits setup source file: {relative}")
     for relative in nddev_kilo_cli.BUILDER_FILES:
         source_relative = (
-            f"{nddev_kilo_cli.CATALOG_ROOT.name}/"
-            f"{nddev_kilo_cli.DEFAULT_SETUP_ID}/{relative}"
+            f"{nddev_kilo_cli.CATALOG_ROOT.name}/{nddev_kilo_cli.DEFAULT_SETUP_ID}/{relative}"
         )
         if setup.files[relative] != require_file(source_relative).read_bytes():
             fail(f"release source content is not the manager exact bytes: {source_relative}")
@@ -1054,7 +1072,9 @@ def validate_external_lock_blocks_internal_lock_parent_rename() -> None:
                     mutation()
                 except nddev_kilo_cli.ManagerError as exc:
                     if "target is locked" not in str(exc):
-                        fail(f"{label} after internal lock rename failed for the wrong reason: {exc}")
+                        fail(
+                            f"{label} after internal lock rename failed for the wrong reason: {exc}"
+                        )
                 else:
                     fail(f"{label} was accepted after child renamed the internal lock parent")
             stop.write_bytes(b"stop\n")
@@ -1074,8 +1094,7 @@ def validate_external_lock_blocks_internal_lock_parent_rename() -> None:
             raise launch_result["error"]
         if launch_result.get("code") != 0:
             fail(
-                "internal lock rename child returned unexpected code: "
-                f"{launch_result.get('code')}"
+                f"internal lock rename child returned unexpected code: {launch_result.get('code')}"
             )
         if not nddev_kilo_cli.lock_path(target).is_dir():
             fail("canonical internal lock parent was not restored after child rename")
@@ -1100,8 +1119,7 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
             "XDG_DATA_HOME": runtime_paths["XDG_DATA_HOME"] / "nddev-runtime-data",
             "XDG_STATE_HOME": runtime_paths["XDG_STATE_HOME"] / "nddev-runtime-state",
             "XDG_CACHE_HOME": runtime_paths["XDG_CACHE_HOME"] / "nddev-runtime-cache",
-            "KILO_CONFIG_PARENT": (target / nddev_kilo_cli.CONFIG).parent
-            / "nddev-runtime-session",
+            "KILO_CONFIG_PARENT": (target / nddev_kilo_cli.CONFIG).parent / "nddev-runtime-session",
         }
         runtime_ready = runtime_paths["TMPDIR"] / "nddev-runtime-ready"
         executable, native, installation = fake_launch_installation(
@@ -1109,7 +1127,7 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
             (
                 "#!/bin/sh\n"
                 "set -eu\n"
-                'config_dir=${KILO_CONFIG%/*}\n'
+                "config_dir=${KILO_CONFIG%/*}\n"
                 'printf home > "$HOME/nddev-runtime-home"\n'
                 'printf tmp > "$TMPDIR/nddev-runtime-tmp"\n'
                 'printf config > "$XDG_CONFIG_HOME/nddev-runtime-config"\n'
@@ -1138,14 +1156,18 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
         try:
             wait_until(
                 "handoff launch child start",
-                lambda: runtime_ready.exists()
-                or bool(launch_result.get("error"))
-                or not thread.is_alive(),
+                lambda: (
+                    runtime_ready.exists()
+                    or bool(launch_result.get("error"))
+                    or not thread.is_alive()
+                ),
             )
             if "error" in launch_result:
                 raise launch_result["error"]
             if not thread.is_alive() and not runtime_ready.exists():
-                fail(f"handoff child exited before runtime writes with code: {launch_result.get('code')}")
+                fail(
+                    f"handoff child exited before runtime writes with code: {launch_result.get('code')}"
+                )
             for label, path in runtime_writes.items():
                 if not path.is_file():
                     fail(f"launch child could not write runtime state in {label}")
@@ -1204,10 +1226,7 @@ def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
         if "error" in launch_result:
             raise launch_result["error"]
         if launch_result.get("code") != 0:
-            fail(
-                "handoff regression child returned unexpected code: "
-                f"{launch_result.get('code')}"
-            )
+            fail(f"handoff regression child returned unexpected code: {launch_result.get('code')}")
         if private_directory_mode(executable.parent) != 0o700:
             fail("launch wrapper parent mode was not restored after child exit")
         if private_directory_mode(native.parent) != 0o700:
@@ -1242,6 +1261,7 @@ def validate_stale_launch_protection_recovery() -> None:
             if private_directory_mode(directory) != nddev_kilo_cli.OWNER_DIR_MODE:
                 fail("stale launch-protected directory mode was not restored after lock")
 
+
 def validate_runtime_paths_reject_symlinks_before_child() -> None:
     original_require_active_clean_installed = nddev_kilo_cli.require_active_clean_installed
     original_require_current_software = nddev_kilo_cli.require_current_software
@@ -1261,11 +1281,7 @@ def validate_runtime_paths_reject_symlinks_before_child() -> None:
                 executable = nddev_kilo_cli.kilo_executable(target)
                 executable.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
                 executable.write_bytes(
-                    (
-                        "#!/bin/sh\n"
-                        "set -eu\n"
-                        f'printf started > "{started}"\n'
-                    ).encode("utf-8")
+                    (f'#!/bin/sh\nset -eu\nprintf started > "{started}"\n').encode("utf-8")
                 )
                 executable.chmod(0o700)
                 native_relative = nddev_kilo_cli.native_package_binary_relative(
@@ -1298,7 +1314,9 @@ def validate_runtime_paths_reject_symlinks_before_child() -> None:
                         "executable": str(executable),
                         "entrypoint_sha256": nddev_kilo_cli.sha256_bytes(executable.read_bytes()),
                         "native_executable": str(native_relative),
-                        "native_executable_sha256": nddev_kilo_cli.sha256_bytes(native.read_bytes()),
+                        "native_executable_sha256": nddev_kilo_cli.sha256_bytes(
+                            native.read_bytes()
+                        ),
                     }
 
                 nddev_kilo_cli.require_active_clean_installed = fake_require_active_clean_installed
@@ -1490,6 +1508,194 @@ def validate_remove_exhausts_managed_files() -> None:
             nddev_kilo_cli.DEFAULT_PROFILE_ID,
             "install",
         )
+
+
+def validate_plan_changed_paths_match_mutations() -> None:
+    full_set = [*MANAGED_FILES, nddev_kilo_cli.STAMP_NAME]
+    profile_delta = [nddev_kilo_cli.CONFIG, nddev_kilo_cli.STAMP_NAME]
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-plan-paths-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+
+        plan = nddev_kilo_cli.plan_payload(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+        )
+        installed = nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "install",
+        )
+        if plan.get("changed_paths") != installed.get("changed_paths"):
+            fail("install plan changed_paths do not match mutation changed_paths")
+        if installed.get("changed_paths") != full_set:
+            fail("install mutation changed_paths are not the initial managed-files-plus-stamp set")
+
+        snapshot = {
+            relative: (target / nddev_kilo_cli.safe_relative_path(relative)).stat().st_mtime_ns
+            for relative in MANAGED_FILES
+        }
+        stamp_mtime = nddev_kilo_cli.stamp_path(target).stat().st_mtime_ns
+        backup_names_before = (
+            sorted(path.name for path in nddev_kilo_cli.backup_pool(target).iterdir())
+            if nddev_kilo_cli.backup_pool(target).exists()
+            else []
+        )
+        same_plan = nddev_kilo_cli.plan_payload(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+        )
+        same_install = nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "install",
+        )
+        same_switch = nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "switch",
+        )
+        if (
+            same_plan.get("changed_paths") != []
+            or same_install.get("changed_paths") != []
+            or same_switch.get("changed_paths") != []
+        ):
+            fail("same setup/profile must be an actual byte-diff no-op")
+        if (
+            same_install.get("backup_slot") is not None
+            or same_switch.get("backup_slot") is not None
+        ):
+            fail("same setup/profile no-op created a backup")
+        if snapshot != {
+            relative: (target / nddev_kilo_cli.safe_relative_path(relative)).stat().st_mtime_ns
+            for relative in MANAGED_FILES
+        }:
+            fail("same setup/profile no-op rewrote managed payloads")
+        if stamp_mtime != nddev_kilo_cli.stamp_path(target).stat().st_mtime_ns:
+            fail("same setup/profile no-op rewrote stamp")
+        backup_names_after = (
+            sorted(path.name for path in nddev_kilo_cli.backup_pool(target).iterdir())
+            if nddev_kilo_cli.backup_pool(target).exists()
+            else []
+        )
+        if backup_names_after != backup_names_before:
+            fail("same setup/profile no-op changed backup pool")
+
+        switch_plan = nddev_kilo_cli.plan_payload(target, nddev_kilo_cli.DEFAULT_SETUP_ID, "safe")
+        switched = nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            "safe",
+            "switch",
+        )
+        if switch_plan.get("changed_paths") != switched.get("changed_paths"):
+            fail("switch plan changed_paths do not match mutation changed_paths")
+        if switched.get("changed_paths") != profile_delta:
+            fail("switch mutation changed_paths are not the profile byte-diff set")
+
+        desired_remove = nddev_kilo_cli.desired_for_remove(target)
+        if nddev_kilo_cli.stable_changed_paths_for_desired(target, desired_remove) != full_set:
+            fail("remove desired changed_paths do not include every live managed path plus stamp")
+        removed = nddev_kilo_cli.remove_setup(target)
+        if removed.get("changed_paths") != full_set:
+            fail("remove mutation changed_paths are not the live managed-files-plus-stamp set")
+
+
+def validate_backup_schema_and_payload_are_exact_before_restore() -> None:
+    def managed_snapshot(target: Path) -> dict[str, bytes | None]:
+        relatives = [*MANAGED_FILES, nddev_kilo_cli.STAMP_NAME]
+        observed: dict[str, bytes | None] = {}
+        for relative in relatives:
+            path = target / nddev_kilo_cli.safe_relative_path(relative)
+            observed[relative] = path.read_bytes() if path.exists() else None
+        return observed
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-backup-schema-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+        nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            "safe",
+            "install",
+        )
+        nddev_kilo_cli.mutate_setup(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            "switch",
+        )
+        before = managed_snapshot(target)
+        slot_dir = nddev_kilo_cli.backup_pool(target) / "0"
+        envelope_path = slot_dir / nddev_kilo_cli.BACKUP_NAME
+        envelope = load_json(envelope_path)
+
+        cases: list[tuple[str, Any]] = []
+        extra_key = dict(envelope)
+        extra_key["unexpected"] = True
+        cases.append(("extra envelope key", extra_key))
+        missing_size = copy_json(envelope)
+        del missing_size["managed_files"][0]["size"]
+        cases.append(("missing managed file size", missing_size))
+        bad_size = copy_json(envelope)
+        bad_size["managed_files"][0]["size"] += 1
+        cases.append(("managed file size mismatch", bad_size))
+        bad_path_set = copy_json(envelope)
+        bad_path_set["managed_files"] = bad_path_set["managed_files"][:-1]
+        cases.append(("missing managed file record", bad_path_set))
+
+        for label, bad_envelope in cases:
+            with open(envelope_path, "w", encoding="utf-8") as handle:
+                json.dump(bad_envelope, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            envelope_path.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            try:
+                nddev_kilo_cli.restore_setup(target, 0)
+            except nddev_kilo_cli.ManagerError:
+                pass
+            else:
+                fail(f"tampered backup was accepted: {label}")
+            if managed_snapshot(target) != before:
+                fail(f"tampered backup mutated target before rejection: {label}")
+
+        with open(envelope_path, "w", encoding="utf-8") as handle:
+            json.dump(envelope, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        envelope_path.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        relative = envelope["managed_files"][0]["path"]
+        payload = slot_dir / nddev_kilo_cli.safe_relative_path(relative)
+        original_payload = payload.read_bytes()
+        payload.write_bytes(original_payload + b"\n")
+        payload.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        try:
+            nddev_kilo_cli.restore_setup(target, 0)
+        except nddev_kilo_cli.ManagerError:
+            pass
+        else:
+            fail("backup payload tamper was accepted")
+        if managed_snapshot(target) != before:
+            fail("backup payload tamper mutated target before rejection")
+        payload.write_bytes(original_payload)
+        payload.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+
+        extra = slot_dir / "extra.txt"
+        extra.write_bytes(b"extra\n")
+        extra.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        try:
+            nddev_kilo_cli.restore_setup(target, 0)
+        except nddev_kilo_cli.ManagerError:
+            pass
+        else:
+            fail("backup extra file was accepted")
+        if managed_snapshot(target) != before:
+            fail("backup extra file mutated target before rejection")
 
 
 def scoped_package_path(root: Path, package: str) -> Path:
@@ -1968,11 +2174,7 @@ def validate_package_lock_regressions() -> None:
 
 def write_fake_cli_package(root: Path) -> None:
     package_root = (
-        root
-        / nddev_kilo_cli.SOFTWARE_GLOBAL_DIR_RELATIVE
-        / "node_modules"
-        / "@kilocode"
-        / "cli"
+        root / nddev_kilo_cli.SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli"
     )
     bin_root = package_root / "bin"
     bin_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True)
@@ -2082,12 +2284,12 @@ def validate_native_selection_and_wrapper_regressions() -> None:
                 selected = provenance["selected"]
                 if selected["name"] != expected:
                     fail(f"installed native package selection mismatch for {host}")
-                if selected["binary"] != str(nddev_kilo_cli.native_package_binary_relative(expected)):
+                if selected["binary"] != str(
+                    nddev_kilo_cli.native_package_binary_relative(expected)
+                ):
                     fail(f"selected native binary path mismatch for {host}")
                 nddev_kilo_cli.materialize_stage_entrypoint(root, provenance)
-                wrapper = (root / "bin" / nddev_kilo_cli.KILO_COMMAND).read_text(
-                    encoding="utf-8"
-                )
+                wrapper = (root / "bin" / nddev_kilo_cli.KILO_COMMAND).read_text(encoding="utf-8")
                 if ".kilo" in wrapper:
                     fail("native wrapper depends on vendor postinstall .kilo")
                 if selected["binary"] not in wrapper:
@@ -2407,7 +2609,9 @@ def validate_no_public_bootstrap_override_references() -> None:
         ROOT / "README.md",
     )
     for root in scanned_roots:
-        paths = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        paths = (
+            [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        )
         for path in paths:
             if path.stat().st_size > nddev_kilo_cli.METADATA_MAX_BYTES:
                 continue
@@ -2444,6 +2648,8 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_runtime_paths_reject_symlinks_before_child()
         validate_hardlink_materialization_bound()
         validate_remove_exhausts_managed_files()
+        validate_plan_changed_paths_match_mutations()
+        validate_backup_schema_and_payload_are_exact_before_restore()
         validate_package_lock_regressions()
         validate_native_selection_and_wrapper_regressions()
         validate_unsupported_platforms_reject_before_side_effects()

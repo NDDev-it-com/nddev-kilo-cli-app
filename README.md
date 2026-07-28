@@ -46,7 +46,9 @@ builder guidance, a progressive Agent Skill toolkit, native agents, commands,
 and a local-file plugin. The exact installed file inventory and plugin path are
 owned by `setups/nddev-builder/setup.json` and `cli-tools/nddev_kilo_cli.py`;
 use `plan --json` or `status --json` to inspect what a target would receive or
-currently contains.
+currently contains. `plan --json` reports the stable `changed_paths` contract
+that setup mutations use; paths are reported only when their target bytes or
+presence would change.
 
 The plugin's supported purpose and boundaries are owned by the setup source and
 the public contract. It is intended only for deterministic builder context
