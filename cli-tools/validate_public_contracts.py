@@ -735,6 +735,7 @@ def validate_manager_parse_args() -> None:
 
 
 def validate_python_portability() -> None:
+    manager_source = MANAGER_PATH.read_text(encoding="utf-8")
     for path in (
         MANAGER_PATH,
         ROOT / "cli-tools" / "validate_public_contracts.py",
@@ -746,6 +747,22 @@ def validate_python_portability() -> None:
             fail(f"{path.relative_to(ROOT)} is not Python 3.9 syntax-compatible: {exc}")
     if sys.version_info < (3, 9):
         fail("validator runtime requires Python 3.9 or newer")
+    tree = ast.parse(manager_source, filename=str(MANAGER_PATH), feature_version=(3, 9))
+    publish = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "publish_bootstrap_anchor_file"
+        ),
+        None,
+    )
+    if publish is None:
+        fail("manager is missing bootstrap anchor publication function")
+    publish_source = ast.get_source_segment(manager_source, publish) or ""
+    if "os.link(" not in publish_source:
+        fail("bootstrap anchor publication must use an atomic no-replace link primitive")
+    if "os.replace(" in publish_source or "ftruncate(" in publish_source:
+        fail("bootstrap anchor publication must not replace or truncate a published anchor")
 
 
 def validate_launch_guard() -> None:
@@ -2236,6 +2253,8 @@ def validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock() -> Non
                     real_target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
                     real_target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
                 alias_target = alias_parent / target_name
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(real_target):
+                    pass
                 for command, operation in operations:
                     observed: dict[str, tuple[str, str]] = {}
                     for route, raw_target in (("real", real_target), ("alias", alias_target)):
@@ -2249,11 +2268,13 @@ def validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock() -> Non
                             canonical_targets.append(canonical)
                             return canonical
 
-                        def traced_open(canonical_target: Path) -> int:
-                            lock_paths.append(
-                                nddev_kilo_cli.bootstrap_lock_file_path(canonical_target)
-                            )
-                            return original_open(canonical_target)
+                        def traced_open(canonical_target: Path, **kwargs: Any) -> int | None:
+                            opened = original_open(canonical_target, **kwargs)
+                            if opened is not None:
+                                lock_paths.append(
+                                    nddev_kilo_cli.bootstrap_lock_file_path(canonical_target)
+                                )
+                            return opened
 
                         nddev_kilo_cli.canonical_target_for_bootstrap_lock = traced_canonical
                         nddev_kilo_cli.open_bootstrap_lock_file = traced_open
@@ -2290,6 +2311,54 @@ def validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock() -> Non
                 "unsafe symlink target parent",
                 lambda: nddev_kilo_cli.status_payload(unsafe_alias / "target"),
             )
+
+
+def validate_read_only_bootstrap_no_create_paths() -> None:
+    operations: tuple[tuple[str, Any], ...] = (
+        ("status", lambda target: nddev_kilo_cli.status_payload(target)),
+        (
+            "plan",
+            lambda target: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        ),
+        ("software-status", lambda target: nddev_kilo_cli.software_status_command(target)),
+    )
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-read-lock-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        injected_bootstrap = workspace / "bootstrap"
+        injected_bootstrap.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target_parent / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(injected_bootstrap):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            for command, operation in operations:
+                before = snapshot_bootstrap_root_shallow(root)
+                operation(target)
+                if snapshot_bootstrap_root_shallow(root) != before:
+                    fail(f"cold {command} read created bootstrap lock residue")
+
+            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=True):
+                pass
+            product_only = snapshot_bootstrap_root_shallow(root)
+            for command, operation in operations:
+                operation(target)
+                if snapshot_bootstrap_root_shallow(root) != product_only:
+                    fail(f"seeded product-only {command} read created target lock residue")
+
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            seeded_target = snapshot_bootstrap_root_shallow(root)
+            for command, operation in operations:
+                operation(target)
+                if snapshot_bootstrap_root_shallow(root) != seeded_target:
+                    fail(f"seeded target {command} read changed bootstrap lock namespace")
 
 
 def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
@@ -2818,18 +2887,18 @@ def validate_target_commands_use_two_stage_coordination() -> None:
                     return original_lexical(raw_target)
 
                 @contextlib.contextmanager
-                def traced_product_lock() -> Any:
+                def traced_product_lock(*args: Any, **kwargs: Any) -> Any:
                     trace.append("product-bootstrap-lock")
-                    with original_product_lock():
-                        yield
+                    with original_product_lock(*args, **kwargs) as coordinated:
+                        yield coordinated
 
                 def traced_canonical(raw_target: str | Path, **kwargs: Any) -> Path:
                     trace.append("target-canonicalization")
                     return original_canonical(raw_target, **kwargs)
 
-                def traced_open_bootstrap(canonical_target: Path) -> int:
+                def traced_open_bootstrap(canonical_target: Path, **kwargs: Any) -> int | None:
                     trace.append("canonical-target-bootstrap-lock")
-                    return original_open_bootstrap(canonical_target)
+                    return original_open_bootstrap(canonical_target, **kwargs)
 
                 def traced_resolve_target(*_args: Any, **_kwargs: Any) -> Path:
                     trace.append("target-inspection")
@@ -2858,9 +2927,12 @@ def validate_target_commands_use_two_stage_coordination() -> None:
                     "lexical-target",
                     "product-bootstrap-lock",
                     "target-canonicalization",
-                    "canonical-target-bootstrap-lock",
                     "target-inspection",
                 ]
+                if command not in {"status", "plan", "software-status"} or (
+                    "canonical-target-bootstrap-lock" in trace
+                ):
+                    expected.insert(4, "canonical-target-bootstrap-lock")
                 if trace != expected:
                     fail(f"{command} target coordination trace mismatch: {trace!r}")
 
@@ -3289,6 +3361,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_python_portability()
         validate_launch_guard()
         validate_bootstrap_lock_precreation_guards()
+        validate_read_only_bootstrap_no_create_paths()
         validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock()
         validate_bootstrap_lock_persistent_inode_handover()
         validate_launch_lock_scope_and_executable_revalidation()

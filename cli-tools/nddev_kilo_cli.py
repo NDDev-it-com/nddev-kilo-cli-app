@@ -221,7 +221,7 @@ LOCK_OWNER_NAME = "owner.json"
 LOCK_HELD_PARENT_MODE = 0o500
 BOOTSTRAP_LOCK_SCHEMA = 1
 BOOTSTRAP_LOCK_PREFIX = f"{PRODUCT_NAME}-bootstrap-locks"
-PRODUCT_BOOTSTRAP_LOCK_NAME = "product-coordination.lock"
+PRODUCT_BOOTSTRAP_LOCK_NAME = "global.lock"
 PRODUCT_BOOTSTRAP_LOCK_RECORD = {
     "schema_version": BOOTSTRAP_LOCK_SCHEMA,
     "product_name": PRODUCT_NAME,
@@ -235,18 +235,24 @@ FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES = (
     "BOOTSTRAP_LOCK_ROOT_OVERRIDE",
 )
 BOOTSTRAP_LOCK_CONTRACT = {
-    "kind": "external-product-uid-flock",
+    "kind": "external-product-anchor-and-persistent-target-flock",
     "system_root": "fixed-real-sticky-system-temp",
     "macos_system_root": "/private/tmp",
     "ubuntu_system_root": "/tmp",
     "product_root_mode": "0700",
     "file_mode": "0600",
+    "product_anchor": PRODUCT_BOOTSTRAP_LOCK_NAME,
+    "product_anchor_lifetime": "monotonic-persistent",
     "filename": "sha256-product-namespace-and-canonical-target",
+    "target_anchor_lifetime": "mutation-published-monotonic-persistent",
     "target_binding": "json-product-canonical-target-and-sha256",
     "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
     "binding_exact": True,
+    "binding_publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
+    "read_only_anchor_policy": "no-create-product-anchor-and-no-create-target-anchor",
+    "cold_read_policy": "inspect-with-anchor-absence-double-check",
     "persistent_inode": True,
     "unlink_on_release": False,
     "acquire_order": "external-before-internal",
@@ -372,6 +378,10 @@ class ConcurrentTargetChange(ManagerError):
     """A fail-closed target race or identity change."""
 
 
+class BootstrapAnchorAppeared(ConcurrentTargetChange):
+    """A cold read observed a concurrent bootstrap anchor publication."""
+
+
 @dataclass(frozen=True)
 class Setup:
     setup_id: str
@@ -421,6 +431,14 @@ class ObjectEntry:
     mtime_ns: int
     size: int
     content: bytes | str | None = None
+
+
+@dataclass(frozen=True)
+class BootstrapNamespaceSnapshot:
+    parent: Path
+    parent_state: ObjectEntry | None
+    root: Path
+    root_state: ObjectEntry | None
 
 
 @dataclass
@@ -1182,6 +1200,12 @@ def bootstrap_lock_root() -> Path:
     return bootstrap_lock_parent() / f"{BOOTSTRAP_LOCK_PREFIX}-{os.geteuid()}"
 
 
+def bootstrap_lock_root_for_parent(parent: Path) -> Path:
+    if not hasattr(os, "geteuid"):
+        fail("bootstrap lifecycle locks require current-user ownership checks")
+    return parent / f"{BOOTSTRAP_LOCK_PREFIX}-{os.geteuid()}"
+
+
 def target_binding_sha256(target: Path) -> str:
     return sha256_bytes(f"{PRODUCT_NAME}\0{os.fspath(target)}".encode("utf-8"))
 
@@ -1192,6 +1216,101 @@ def bootstrap_lock_file_path(target: Path) -> Path:
 
 def product_bootstrap_lock_file_path() -> Path:
     return bootstrap_lock_root() / PRODUCT_BOOTSTRAP_LOCK_NAME
+
+
+def object_entry_for_path(path: Path, label: str) -> ObjectEntry | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    mode = stat.S_IMODE(info.st_mode)
+    identity = identity_of(info)
+    if stat.S_ISLNK(info.st_mode):
+        return ObjectEntry(
+            "symlink", mode, identity, info.st_mtime_ns, info.st_size, os.readlink(path)
+        )
+    if stat.S_ISDIR(info.st_mode):
+        return ObjectEntry("directory", mode, identity, info.st_mtime_ns, info.st_size)
+    if stat.S_ISREG(info.st_mode):
+        content = read_regular_file(path, label, max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+        return ObjectEntry("file", mode, identity, info.st_mtime_ns, info.st_size, content)
+    fail(f"{label} contains unsupported path type: {path}")
+
+
+def snapshot_bootstrap_namespace(parent: Path, root: Path) -> BootstrapNamespaceSnapshot:
+    return BootstrapNamespaceSnapshot(
+        parent=parent,
+        parent_state=object_entry_for_path(parent, "bootstrap lifecycle lock parent"),
+        root=root,
+        root_state=object_entry_for_path(root, "bootstrap lifecycle lock root"),
+    )
+
+
+def restore_bootstrap_directory_metadata(
+    path: Path, expected: ObjectEntry | None, label: str
+) -> None:
+    if expected is None:
+        if path_exists_no_follow(path):
+            fail(f"{label} should be absent after rollback: {path}")
+        return
+    current = object_entry_for_path(path, label)
+    if current is None:
+        fail(f"{label} disappeared during rollback: {path}")
+    if (
+        current.kind != expected.kind
+        or current.identity != expected.identity
+        or current.size != expected.size
+    ):
+        fail(f"{label} identity/topology changed during rollback: {path}")
+    if current.mode != expected.mode:
+        os.chmod(path, expected.mode, follow_symlinks=False)
+    refreshed = object_entry_for_path(path, label)
+    if refreshed is None:
+        fail(f"{label} disappeared during rollback: {path}")
+    os.utime(path, ns=(refreshed.mtime_ns, expected.mtime_ns), follow_symlinks=False)
+    if object_entry_for_path(path, label) != expected:
+        fail(f"{label} metadata was not restored after rollback: {path}")
+
+
+def cleanup_unpublished_bootstrap_root(snapshot: BootstrapNamespaceSnapshot) -> None:
+    if snapshot.root_state is not None:
+        restore_bootstrap_directory_metadata(
+            snapshot.root, snapshot.root_state, "bootstrap lifecycle lock root"
+        )
+        restore_bootstrap_directory_metadata(
+            snapshot.parent, snapshot.parent_state, "bootstrap lifecycle lock parent"
+        )
+        return
+    try:
+        snapshot.root.rmdir()
+    except FileNotFoundError:
+        pass
+    restore_bootstrap_directory_metadata(
+        snapshot.parent, snapshot.parent_state, "bootstrap lifecycle lock parent"
+    )
+
+
+@contextlib.contextmanager
+def bootstrap_parent_creation_lock(parent: Path) -> Iterator[None]:
+    if fcntl is None:
+        fail("bootstrap parent creation lock requires fcntl.flock on this platform")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(parent, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = parent.lstat()
+        if identity_of(opened) != identity_of(current):
+            raise ConcurrentTargetChange(
+                "bootstrap lifecycle lock parent changed while it was opened"
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
@@ -1223,7 +1342,9 @@ def require_open_product_bootstrap_lock_identity(
 
 
 def ensure_bootstrap_lock_root() -> Path:
-    root = bootstrap_lock_root()
+    parent = bootstrap_lock_parent()
+    root = bootstrap_lock_root_for_parent(parent)
+    snapshot = snapshot_bootstrap_namespace(parent, root)
     try:
         info = root.lstat()
     except FileNotFoundError:
@@ -1232,9 +1353,16 @@ def ensure_bootstrap_lock_root() -> Path:
         except FileExistsError:
             info = root.lstat()
         else:
-            final = chmod_directory_no_follow(root, OWNER_DIR_MODE, "bootstrap lifecycle lock root")
-            if not is_owner_private_directory(final):
-                fail("bootstrap lifecycle lock root must be private to the current user")
+            try:
+                final = chmod_directory_no_follow(
+                    root, OWNER_DIR_MODE, "bootstrap lifecycle lock root"
+                )
+                if not is_owner_private_directory(final):
+                    fail("bootstrap lifecycle lock root must be private to the current user")
+                fsync_directory(parent, "bootstrap lifecycle lock parent")
+            except BaseException:
+                cleanup_unpublished_bootstrap_root(snapshot)
+                raise
             return root
     if stat.S_ISLNK(info.st_mode):
         fail("bootstrap lifecycle lock root must not be a symlink")
@@ -1245,89 +1373,182 @@ def ensure_bootstrap_lock_root() -> Path:
     return root
 
 
-def open_product_bootstrap_lock_file() -> int:
+def publish_bootstrap_anchor_file(root: Path, path: Path, content: bytes, label: str) -> bool:
+    root_state = object_entry_for_path(root, f"{label} root")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=root)
+    temporary = Path(temporary_name)
+    linked = False
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                fail(f"{label} write made no forward progress")
+            offset += written
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        if identity_of(require_directory(root, f"{label} root")) != (
+            root_state.identity if root_state is not None else None
+        ):
+            raise ConcurrentTargetChange(f"{label} root changed during publication")
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        linked = True
+        remove_path_durable_retry(temporary, f"{label} temporary anchor")
+        fsync_directory(root, f"{label} root")
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not linked:
+            remove_path_durable(temporary)
+            if root_state is not None:
+                restore_bootstrap_directory_metadata(root, root_state, f"{label} root")
+        else:
+            remove_path_durable(temporary)
+
+
+def product_bootstrap_lock_content() -> bytes:
+    return canonical_json(PRODUCT_BOOTSTRAP_LOCK_RECORD)
+
+
+def target_bootstrap_lock_content(target: Path) -> bytes:
+    return canonical_json(
+        {
+            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "target": os.fspath(target),
+            "target_sha256": target_binding_sha256(target),
+        }
+    )
+
+
+def open_existing_product_bootstrap_lock_file(lock_file: Path) -> int:
+    info = lock_file.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("product bootstrap coordination file must be a regular file")
+    if info.st_nlink != 1:
+        fail("product bootstrap coordination file must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("product bootstrap coordination file must be owned by the current user with mode 0600")
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_file, flags)
+    opened = os.fstat(descriptor)
+    if identity_of(opened) != identity_of(info):
+        os.close(descriptor)
+        raise ConcurrentTargetChange(
+            "product bootstrap coordination file changed while it was opened"
+        )
+    require_open_product_bootstrap_lock_identity(descriptor, lock_file)
+    validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
+    return descriptor
+
+
+def open_product_bootstrap_lock_file(*, create: bool = True) -> int | None:
     if not hasattr(os, "O_NOFOLLOW"):
         fail("product bootstrap coordination file requires O_NOFOLLOW support")
-    root = ensure_bootstrap_lock_root()
-    lock_file = root / PRODUCT_BOOTSTRAP_LOCK_NAME
-    for _attempt in range(2):
+    if not create:
+        root = bootstrap_lock_root()
         try:
-            info = lock_file.lstat()
+            info = root.lstat()
         except FileNotFoundError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            flags |= os.O_NOFOLLOW
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            fail("bootstrap lifecycle lock root must not be a symlink")
+        if not stat.S_ISDIR(info.st_mode):
+            fail("bootstrap lifecycle lock root must be a real directory")
+        if not is_owner_private_directory(info):
+            fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+        lock_file = root / PRODUCT_BOOTSTRAP_LOCK_NAME
+        try:
+            return open_existing_product_bootstrap_lock_file(lock_file)
+        except FileNotFoundError:
+            return None
+    parent = bootstrap_lock_parent()
+    root = bootstrap_lock_root_for_parent(parent)
+    namespace = snapshot_bootstrap_namespace(parent, root)
+    with bootstrap_parent_creation_lock(parent):
+        root = ensure_bootstrap_lock_root()
+        lock_file = root / PRODUCT_BOOTSTRAP_LOCK_NAME
+        for _attempt in range(2):
             try:
-                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
-            except FileExistsError:
-                continue
-            os.fchmod(descriptor, OWNER_FILE_MODE)
-            require_open_product_bootstrap_lock_identity(descriptor, lock_file)
-            return descriptor
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            fail("product bootstrap coordination file must be a regular file")
-        if info.st_nlink != 1:
-            fail("product bootstrap coordination file must not have hard-link aliases")
-        if not is_owner_only_file(info):
-            fail(
-                "product bootstrap coordination file must be owned by the current user with mode 0600"
-            )
-        flags = os.O_RDWR
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        flags |= os.O_NOFOLLOW
-        descriptor = os.open(lock_file, flags)
-        opened = os.fstat(descriptor)
-        if identity_of(opened) != identity_of(info):
-            os.close(descriptor)
-            raise ConcurrentTargetChange(
-                "product bootstrap coordination file changed while it was opened"
-            )
-        require_open_product_bootstrap_lock_identity(descriptor, lock_file)
-        return descriptor
+                return open_existing_product_bootstrap_lock_file(lock_file)
+            except FileNotFoundError:
+                try:
+                    publish_bootstrap_anchor_file(
+                        root,
+                        lock_file,
+                        product_bootstrap_lock_content(),
+                        "product bootstrap coordination file",
+                    )
+                except BaseException:
+                    if namespace.root_state is None:
+                        cleanup_unpublished_bootstrap_root(namespace)
+                    raise
     raise ConcurrentTargetChange("product bootstrap coordination file changed during creation")
 
 
-def open_bootstrap_lock_file(target: Path) -> int:
+def open_existing_bootstrap_lock_file(target: Path, lock_file: Path) -> int:
+    info = lock_file.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lifecycle lock file must be a regular file")
+    if info.st_nlink != 1:
+        fail("bootstrap lifecycle lock file must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_file, flags)
+    opened = os.fstat(descriptor)
+    if identity_of(opened) != identity_of(info):
+        os.close(descriptor)
+        raise ConcurrentTargetChange("bootstrap lifecycle lock file changed while it was opened")
+    require_open_bootstrap_lock_identity(descriptor, lock_file)
+    validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
+    return descriptor
+
+
+def open_bootstrap_lock_file(target: Path, *, create: bool = True) -> int | None:
     if not hasattr(os, "O_NOFOLLOW"):
         fail("bootstrap lifecycle lock file requires O_NOFOLLOW support")
+    if not create:
+        root = bootstrap_lock_root()
+        try:
+            info = root.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            fail("bootstrap lifecycle lock root must not be a symlink")
+        if not stat.S_ISDIR(info.st_mode):
+            fail("bootstrap lifecycle lock root must be a real directory")
+        if not is_owner_private_directory(info):
+            fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+        lock_file = root / f"{target_binding_sha256(target)}.lock"
+        try:
+            return open_existing_bootstrap_lock_file(target, lock_file)
+        except FileNotFoundError:
+            return None
     root = ensure_bootstrap_lock_root()
     lock_file = root / f"{target_binding_sha256(target)}.lock"
     for _attempt in range(2):
         try:
-            info = lock_file.lstat()
+            return open_existing_bootstrap_lock_file(target, lock_file)
         except FileNotFoundError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            flags |= os.O_NOFOLLOW
-            try:
-                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
-            except FileExistsError:
-                continue
-            os.fchmod(descriptor, OWNER_FILE_MODE)
-            require_open_bootstrap_lock_identity(descriptor, lock_file)
-            return descriptor
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            fail("bootstrap lifecycle lock file must be a regular file")
-        if info.st_nlink != 1:
-            fail("bootstrap lifecycle lock file must not have hard-link aliases")
-        if not is_owner_only_file(info):
-            fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
-        flags = os.O_RDWR
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        flags |= os.O_NOFOLLOW
-        descriptor = os.open(lock_file, flags)
-        opened = os.fstat(descriptor)
-        if identity_of(opened) != identity_of(info):
-            os.close(descriptor)
-            raise ConcurrentTargetChange(
-                "bootstrap lifecycle lock file changed while it was opened"
+            publish_bootstrap_anchor_file(
+                root,
+                lock_file,
+                target_bootstrap_lock_content(target),
+                "bootstrap lifecycle lock file",
             )
-        require_open_bootstrap_lock_identity(descriptor, lock_file)
-        return descriptor
     raise ConcurrentTargetChange("bootstrap lifecycle lock file changed during creation")
 
 
@@ -1341,29 +1562,9 @@ def read_bootstrap_lock_record(descriptor: int) -> dict[str, Any] | None:
     return parse_json_object(content, "bootstrap lifecycle lock file")
 
 
-def write_bootstrap_lock_record(descriptor: int, target: Path) -> None:
-    content = canonical_json(
-        {
-            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
-            "product_name": PRODUCT_NAME,
-            "target": os.fspath(target),
-            "target_sha256": target_binding_sha256(target),
-        }
-    )
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    offset = 0
-    while offset < len(content):
-        written = os.write(descriptor, content[offset:])
-        if written <= 0:
-            fail("bootstrap lifecycle lock file write made no forward progress")
-        offset += written
-    os.ftruncate(descriptor, len(content))
-    os.fsync(descriptor)
-
-
 def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path) -> None:
     if record is None:
-        return
+        fail("bootstrap lifecycle lock file binding is missing")
     if set(record) != BOOTSTRAP_LOCK_BINDING_KEYS:
         fail("bootstrap lifecycle lock file binding keys mismatch")
     if record.get("schema_version") != BOOTSTRAP_LOCK_SCHEMA:
@@ -1378,45 +1579,32 @@ def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path)
 
 def validate_product_bootstrap_lock_binding(record: dict[str, Any] | None) -> None:
     if record is None:
-        return
+        fail("product bootstrap coordination file binding is missing")
     if record != PRODUCT_BOOTSTRAP_LOCK_RECORD:
         fail("product bootstrap coordination file binding mismatch")
 
 
-def write_product_bootstrap_lock_record(descriptor: int) -> None:
-    content = canonical_json(PRODUCT_BOOTSTRAP_LOCK_RECORD)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    offset = 0
-    while offset < len(content):
-        written = os.write(descriptor, content[offset:])
-        if written <= 0:
-            fail("product bootstrap coordination file write made no forward progress")
-        offset += written
-    os.ftruncate(descriptor, len(content))
-    os.fsync(descriptor)
-
-
 @contextlib.contextmanager
-def product_bootstrap_coordination_lock() -> Iterator[None]:
+def product_bootstrap_coordination_lock(
+    *, create: bool = True, shared: bool = False
+) -> Iterator[bool]:
     if fcntl is None:
         fail("product bootstrap coordination requires fcntl.flock on this platform")
     descriptor = -1
     acquired = False
     try:
-        descriptor = open_product_bootstrap_lock_file()
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        opened = open_product_bootstrap_lock_file(create=create)
+        if opened is None:
+            yield False
+            return
+        descriptor = opened
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         acquired = True
         require_open_product_bootstrap_lock_identity(descriptor, product_bootstrap_lock_file_path())
         record = read_bootstrap_lock_record(descriptor)
         validate_product_bootstrap_lock_binding(record)
-        if record is None:
-            write_product_bootstrap_lock_record(descriptor)
-            require_open_product_bootstrap_lock_identity(
-                descriptor, product_bootstrap_lock_file_path()
-            )
-            validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
         require_open_product_bootstrap_lock_identity(descriptor, product_bootstrap_lock_file_path())
-        yield
+        yield True
     finally:
         if descriptor >= 0:
             if acquired:
@@ -1425,22 +1613,38 @@ def product_bootstrap_coordination_lock() -> Iterator[None]:
             os.close(descriptor)
 
 
+def product_bootstrap_anchor_exists_no_create() -> bool:
+    descriptor = open_product_bootstrap_lock_file(create=False)
+    if descriptor is None:
+        return False
+    os.close(descriptor)
+    return True
+
+
 @contextlib.contextmanager
-def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
+def bootstrap_lifecycle_lock(
+    raw_target: str | Path, *, shared: bool = False, wait: bool = False
+) -> Iterator[Path]:
     if fcntl is None:
         fail("bootstrap lifecycle locks require fcntl.flock on this platform")
     lexical_target = lexical_target_for_bootstrap_lock(raw_target)
     descriptor = -1
     acquired = False
     try:
-        with product_bootstrap_coordination_lock():
+        with product_bootstrap_coordination_lock(create=True, shared=False):
             target = canonical_target_for_bootstrap_lock(
                 lexical_target,
                 lexical_validated=True,
             )
-            descriptor = open_bootstrap_lock_file(target)
+            opened = open_bootstrap_lock_file(target, create=not shared)
+            if opened is None:
+                fail("bootstrap lifecycle lock file is missing")
+            descriptor = opened
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_kind = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                if not wait:
+                    lock_kind |= fcntl.LOCK_NB
+                fcntl.flock(descriptor, lock_kind)
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
@@ -1451,12 +1655,6 @@ def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             record = read_bootstrap_lock_record(descriptor)
             validate_bootstrap_lock_binding(record, target)
-            if record is None:
-                write_bootstrap_lock_record(descriptor, target)
-                require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
-                record = read_bootstrap_lock_record(descriptor)
-                validate_bootstrap_lock_binding(record, target)
-                require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
         yield target
     finally:
@@ -1465,6 +1663,55 @@ def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 with contextlib.suppress(OSError):
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
+
+
+@contextlib.contextmanager
+def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
+    if fcntl is None:
+        fail("bootstrap lifecycle locks require fcntl.flock on this platform")
+    lexical_target = lexical_target_for_bootstrap_lock(raw_target)
+    descriptor = -1
+    acquired = False
+    cold_read = False
+    try:
+        with product_bootstrap_coordination_lock(create=False, shared=True) as coordinated:
+            if not coordinated:
+                cold_read = True
+                target = canonical_target_for_bootstrap_lock(
+                    lexical_target,
+                    lexical_validated=True,
+                )
+                yield target
+                return
+            target = canonical_target_for_bootstrap_lock(
+                lexical_target,
+                lexical_validated=True,
+            )
+            opened = open_bootstrap_lock_file(target, create=False)
+            if opened is None:
+                yield target
+                return
+            descriptor = opened
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                os.close(descriptor)
+                descriptor = -1
+                fail(f"target is locked: {bootstrap_lock_file_path(target)}")
+            acquired = True
+            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+            validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
+        yield target
+    finally:
+        if descriptor >= 0:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        if cold_read and product_bootstrap_anchor_exists_no_create():
+            raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
 
 
 def lock_path(target: Path) -> Path:
@@ -3787,54 +4034,66 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
 
 def status_payload(target: Path) -> dict[str, Any]:
     require_supported_production_platform()
-    with bootstrap_lifecycle_lock(target) as locked_target:
-        target = resolve_target(locked_target, create=False)
-        software = software_status(target)
-        stamp = read_stamp(target)
-        if stamp is None:
-            return {
-                "installed": False,
-                "target": str(target),
-                "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
-                "software": software,
-            }
-        drift = drift_paths(target, stamp)
-        active = stamp_is_active(stamp)
-        legacy = stamp_is_legacy(stamp)
-        return {
-            "installed": True,
-            "target": str(target),
-            "setup_id": stamp_setup_id(stamp),
-            "permission_profile": stamp_profile_id(stamp),
-            "build_version": stamp["build_version"],
-            "drift": drift,
-            "legacy": legacy,
-            "launchable": active and not drift,
-            "builder": stamp.get("builder", {"enabled": False, "projection": BUILDER_PROJECTION}),
-            "backup_pool": str(backup_pool(target)),
-            "software": software,
-        }
+    for _attempt in range(2):
+        try:
+            with bootstrap_read_lifecycle_lock(target) as locked_target:
+                target = resolve_target(locked_target, create=False)
+                software = software_status(target)
+                stamp = read_stamp(target)
+                if stamp is None:
+                    return {
+                        "installed": False,
+                        "target": str(target),
+                        "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
+                        "software": software,
+                    }
+                drift = drift_paths(target, stamp)
+                active = stamp_is_active(stamp)
+                legacy = stamp_is_legacy(stamp)
+                return {
+                    "installed": True,
+                    "target": str(target),
+                    "setup_id": stamp_setup_id(stamp),
+                    "permission_profile": stamp_profile_id(stamp),
+                    "build_version": stamp["build_version"],
+                    "drift": drift,
+                    "legacy": legacy,
+                    "launchable": active and not drift,
+                    "builder": stamp.get(
+                        "builder", {"enabled": False, "projection": BUILDER_PROJECTION}
+                    ),
+                    "backup_pool": str(backup_pool(target)),
+                    "software": software,
+                }
+        except BootstrapAnchorAppeared:
+            continue
+    raise BootstrapAnchorAppeared("bootstrap anchor changed during status read")
 
 
 def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     require_supported_production_platform()
     require_active_setup_id(setup_id)
     require_profile_id(profile_id)
-    with bootstrap_lifecycle_lock(target) as locked_target:
-        target = resolve_target(locked_target, create=False)
-        stamp = read_stamp(target) if target.exists() else None
-        operation = "install" if stamp is None else "switch"
-        desired = desired_for_setup(target, setup_id, profile_id)
-        return {
-            "operation": operation,
-            "setup_id": setup_id,
-            "permission_profile": profile_id,
-            "target": str(target),
-            "mutates": False,
-            "managed_files": list(MANAGED_FILES),
-            "changed_paths": stable_changed_paths_for_desired(target, desired),
-            "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
-        }
+    for _attempt in range(2):
+        try:
+            with bootstrap_read_lifecycle_lock(target) as locked_target:
+                target = resolve_target(locked_target, create=False)
+                stamp = read_stamp(target) if target.exists() else None
+                operation = "install" if stamp is None else "switch"
+                desired = desired_for_setup(target, setup_id, profile_id)
+                return {
+                    "operation": operation,
+                    "setup_id": setup_id,
+                    "permission_profile": profile_id,
+                    "target": str(target),
+                    "mutates": False,
+                    "managed_files": list(MANAGED_FILES),
+                    "changed_paths": stable_changed_paths_for_desired(target, desired),
+                    "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+                }
+        except BootstrapAnchorAppeared:
+            continue
+    raise BootstrapAnchorAppeared("bootstrap anchor changed during plan read")
 
 
 def list_payload() -> dict[str, Any]:
@@ -5116,9 +5375,14 @@ def software_status(target: Path) -> dict[str, Any]:
 
 def software_status_command(target: Path) -> dict[str, Any]:
     require_supported_production_platform()
-    with bootstrap_lifecycle_lock(target) as locked_target:
-        target = resolve_target(locked_target, create=False)
-        return software_status(target)
+    for _attempt in range(2):
+        try:
+            with bootstrap_read_lifecycle_lock(target) as locked_target:
+                target = resolve_target(locked_target, create=False)
+                return software_status(target)
+        except BootstrapAnchorAppeared:
+            continue
+    raise BootstrapAnchorAppeared("bootstrap anchor changed during software status read")
 
 
 def validate_software_parent_destination(target: Path, relative: Path) -> None:
