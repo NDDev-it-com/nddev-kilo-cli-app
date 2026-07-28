@@ -85,17 +85,14 @@
       "remove-cli"
     ],
     "installer": {
-      "tool": "npm",
-      "argv": [
-        "install",
-        "--global",
-        "--ignore-scripts",
-        "--save-exact",
-        "--audit=false",
-        "--fund=false",
-        "--registry=https://registry.npmjs.org/",
-        "@kilocode/cli@7.4.16"
+      "tool": "verified-npm-archive-set",
+      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
+      "native_tarball": "host-selected-production-native-package",
+      "verification": [
+        "sha512-integrity",
+        "sha1-shasum"
       ],
+      "materialization": "extract-verified-local-bytes-without-scripts",
       "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
       "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
       "lifecycle_scripts": "disabled",

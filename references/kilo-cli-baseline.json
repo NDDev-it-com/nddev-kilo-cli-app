@@ -6,7 +6,7 @@
     "documented_command": "kilo",
     "docs_title": "Kilo Code CLI: Run the AI Coding Agent from Your Terminal",
     "official_install_command": "npm install -g @kilocode/cli",
-    "managed_install_channel": "target-owned isolated npm global install"
+    "managed_install_channel": "target-owned verified npm archive extraction"
   },
   "npm": {
     "package": "@kilocode/cli",
@@ -32,7 +32,7 @@
       "copies_and_removes_files": true,
       "uses_sysctl_or_ldd": true,
       "nested_npm_install_fallback": true,
-      "managed_policy": "install with --ignore-scripts and bind directly to the selected native package bin/kilo"
+      "managed_policy": "verify pinned JS and selected native package tarballs before extracting local bytes without lifecycle scripts"
     },
     "dist": {
       "integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",

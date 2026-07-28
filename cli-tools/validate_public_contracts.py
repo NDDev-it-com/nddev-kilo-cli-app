@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
+import gzip
+import hashlib
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
 import shutil
 import signal
 import stat
-import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -107,6 +111,12 @@ EXPECTED_PLATFORM_SCOPE = {
         "ubuntu-glibc-x64": ["@kilocode/cli-linux-x64-baseline", "@kilocode/cli-linux-x64"],
     },
     "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog",
+}
+EXPECTED_ARCHIVE_AUTHORITY = {
+    "package_tarball": f"https://registry.npmjs.org/@kilocode/cli/-/cli-{KILO_VERSION}.tgz",
+    "native_tarball": "host-selected-production-native-package",
+    "verification": ["sha512-integrity", "sha1-shasum"],
+    "materialization": "extract-verified-local-bytes-without-scripts",
 }
 CONTRACT_KEYS = {
     "contract_version",
@@ -243,9 +253,15 @@ def validate_versions() -> None:
     software = manifest.get("software_lifecycle", {})
     if software.get("manager_commands") != EXPECTED_SOFTWARE_COMMANDS:
         fail("manifest software lifecycle command list mismatch")
-    if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
-        fail("manifest npm installer argv mismatch")
     installer = software.get("installer", {})
+    if installer.get("tool") != "verified-npm-archive-set":
+        fail("manifest installer must use verified npm archive set materialization")
+    if {
+        key: installer.get(key) for key in EXPECTED_ARCHIVE_AUTHORITY
+    } != EXPECTED_ARCHIVE_AUTHORITY:
+        fail("manifest installer archive authority mismatch")
+    if "argv" in installer:
+        fail("manifest installer must not declare npm install argv")
     if installer.get("lifecycle_scripts") != "disabled":
         fail("manifest installer lifecycle scripts must be disabled")
     if installer.get("nested_npm_fallback_allowed") is not False:
@@ -347,12 +363,19 @@ def validate_contract() -> None:
     if "plugin" not in managed.get("managed_config_keys", []):
         fail("plugin must be a managed config key")
     software = contract.get("software_lifecycle", {})
-    if software.get("install_tool") != "npm":
-        fail("software lifecycle must use npm")
-    if software.get("install_argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
-        fail("software lifecycle npm argv mismatch")
-    if "--ignore-scripts" not in software.get("install_argv", []):
-        fail("software lifecycle install argv must disable lifecycle scripts")
+    if software.get("install_tool") != "verified-npm-archive-set":
+        fail("software lifecycle must use verified npm archive set materialization")
+    if software.get("archive_authority") != EXPECTED_ARCHIVE_AUTHORITY:
+        fail("software lifecycle archive authority mismatch")
+    if "install_argv" in software:
+        fail("software lifecycle must not declare npm install argv")
+    identity = nddev_kilo_cli.software_manifest_identity()
+    if identity.get("install_method") != "verified-npm-archive-set-ignore-scripts":
+        fail("software manifest identity must use verified archive install method")
+    if identity.get("archive_authority") != EXPECTED_ARCHIVE_AUTHORITY:
+        fail("software manifest identity archive authority mismatch")
+    if "npm_install_argv" in identity or "npm_lock_argv" in identity:
+        fail("software manifest identity must not record npm argv authority")
     postinstall = software.get("official_postinstall")
     if not isinstance(postinstall, dict):
         fail("official npm postinstall must be recorded as structured evidence")
@@ -395,6 +418,9 @@ def validate_baseline() -> None:
     if baseline.get("schema_version") != 2:
         fail("unexpected baseline schema")
     npm = baseline.get("npm", {})
+    product = baseline.get("product", {})
+    if product.get("managed_install_channel") != "target-owned verified npm archive extraction":
+        fail("baseline managed install channel must be verified archive extraction")
     if npm.get("package") != nddev_kilo_cli.KILO_PACKAGE or npm.get("version") != KILO_VERSION:
         fail("unexpected npm package identity")
     if npm.get("dist_tags", {}).get("latest") != KILO_VERSION:
@@ -407,7 +433,8 @@ def validate_baseline() -> None:
     if postinstall.get("source") != "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz":
         fail("postinstall analysis must point at the official npm tarball")
     if postinstall.get("managed_policy") != (
-        "install with --ignore-scripts and bind directly to the selected native package bin/kilo"
+        "verify pinned JS and selected native package tarballs before extracting local bytes "
+        "without lifecycle scripts"
     ):
         fail("postinstall analysis managed policy mismatch")
     for key in (
@@ -1724,9 +1751,9 @@ def validate_hardlink_materialization_bound() -> None:
         marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
         before = snapshot_tree(target)
 
-        original_run_npm_install = nddev_kilo_cli.run_npm_install
+        original_run_verified_archive_install = nddev_kilo_cli.run_verified_archive_install
 
-        def fake_run_npm_install(stage_root: Path, live_stage: Path) -> None:
+        def fake_run_verified_archive_install(stage_root: Path, live_stage: Path) -> None:
             del stage_root
             hardlink_root = (
                 live_stage
@@ -1748,7 +1775,7 @@ def validate_hardlink_materialization_bound() -> None:
                 max_tree_bytes=64,
             )
 
-        nddev_kilo_cli.run_npm_install = fake_run_npm_install
+        nddev_kilo_cli.run_verified_archive_install = fake_run_verified_archive_install
         try:
             try:
                 nddev_kilo_cli.install_or_update_cli(target, "install-cli")
@@ -1758,7 +1785,7 @@ def validate_hardlink_materialization_bound() -> None:
             else:
                 fail("oversized hardlinked staged file was accepted")
         finally:
-            nddev_kilo_cli.run_npm_install = original_run_npm_install
+            nddev_kilo_cli.run_verified_archive_install = original_run_verified_archive_install
 
         if without_lifecycle_lock(snapshot_tree(target)) != without_lifecycle_lock(before):
             fail("failed hardlink materialization changed the target tree")
@@ -1825,12 +1852,12 @@ def validate_first_install_failures_restore_parent_identity() -> None:
 
         software_target = parent / "software-target"
         before_parent = snapshot_object_tree(parent)
-        original_run_npm_install = nddev_kilo_cli.run_npm_install
+        original_run_verified_archive_install = nddev_kilo_cli.run_verified_archive_install
 
-        def fail_npm_install(_stage_root: Path, _live_stage: Path) -> None:
+        def fail_verified_archive_install(_stage_root: Path, _live_stage: Path) -> None:
             raise nddev_kilo_cli.ManagerError("injected public first software failure")
 
-        nddev_kilo_cli.run_npm_install = fail_npm_install
+        nddev_kilo_cli.run_verified_archive_install = fail_verified_archive_install
         try:
             try:
                 nddev_kilo_cli.install_or_update_cli(software_target, "install-cli")
@@ -1840,7 +1867,7 @@ def validate_first_install_failures_restore_parent_identity() -> None:
             else:
                 fail("first software failure was accepted")
         finally:
-            nddev_kilo_cli.run_npm_install = original_run_npm_install
+            nddev_kilo_cli.run_verified_archive_install = original_run_verified_archive_install
         assert_first_install_failure_clean(
             parent,
             software_target,
@@ -2211,6 +2238,131 @@ def valid_package_lock(native_packages: tuple[str, ...]) -> dict[str, Any]:
         "requires": True,
         "packages": packages,
     }
+
+
+def npm_integrity(content: bytes) -> str:
+    return "sha512-" + base64.b64encode(hashlib.sha512(content).digest()).decode("ascii")
+
+
+def npm_shasum(content: bytes) -> str:
+    return hashlib.sha1(content).hexdigest()
+
+
+def npm_archive(files: dict[str, tuple[bytes, int]]) -> bytes:
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gzip_file:
+        with tarfile.open(fileobj=gzip_file, mode="w") as archive:
+            for relative, (content, mode) in sorted(files.items()):
+                info = tarfile.TarInfo(f"package/{relative}")
+                info.size = len(content)
+                info.mode = mode
+                info.mtime = 0
+                info.uid = 0
+                info.gid = 0
+                info.uname = ""
+                info.gname = ""
+                archive.addfile(info, io.BytesIO(content))
+    return raw.getvalue()
+
+
+def package_archive_content() -> bytes:
+    package = {
+        "name": nddev_kilo_cli.KILO_PACKAGE,
+        "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+        "bin": {"kilo": "./bin/kilo", "kilocode": "./bin/kilo"},
+        "scripts": {"postinstall": "node ./postinstall.mjs"},
+        "optionalDependencies": expected_optional_native_versions(),
+    }
+    return npm_archive(
+        {
+            "package.json": (
+                nddev_kilo_cli.canonical_json(package),
+                nddev_kilo_cli.OWNER_FILE_MODE,
+            ),
+            "bin/kilo": (b"vendor package bin, not executed by nddev\n", 0o700),
+        }
+    )
+
+
+def native_archive_content(package: str, record: dict[str, Any], binary: bytes) -> bytes:
+    metadata = {
+        "name": package,
+        "version": record["version"],
+        "os": record.get("os"),
+        "cpu": record.get("cpu"),
+    }
+    if record.get("libc") is not None:
+        metadata["libc"] = record["libc"]
+    return npm_archive(
+        {
+            "package.json": (
+                nddev_kilo_cli.canonical_json(metadata),
+                nddev_kilo_cli.OWNER_FILE_MODE,
+            ),
+            "bin/kilo": (binary, 0o700),
+            "bin/tree-sitter/tree-sitter.wasm": (b"fake wasm\n", nddev_kilo_cli.OWNER_FILE_MODE),
+        }
+    )
+
+
+@contextlib.contextmanager
+def patched_verified_archives(
+    package_content: bytes,
+    native_content: bytes,
+    selected_native: str,
+) -> Any:
+    baseline = copy_json(nddev_kilo_cli.baseline())
+    package_dist = {
+        "integrity": npm_integrity(package_content),
+        "shasum": npm_shasum(package_content),
+        "tarball": EXPECTED_ARCHIVE_AUTHORITY["package_tarball"],
+    }
+    native_dist = {
+        "integrity": npm_integrity(native_content),
+        "shasum": npm_shasum(native_content),
+        "tarball": baseline["npm"]["native_packages"]["production"][selected_native]["dist"][
+            "tarball"
+        ],
+    }
+    baseline["npm"]["dist"] = dict(package_dist)
+    baseline["npm"]["native_packages"]["catalog"][selected_native]["dist"] = dict(native_dist)
+    baseline["npm"]["native_packages"]["production"][selected_native]["dist"] = dict(native_dist)
+    archive_map = {
+        package_dist["tarball"]: package_content,
+        native_dist["tarball"]: native_content,
+    }
+    metadata = {
+        "name": nddev_kilo_cli.KILO_PACKAGE,
+        "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+        "dist": dict(package_dist),
+        "scripts": baseline["npm"]["scripts"],
+        "optionalDependencies": expected_optional_native_versions(),
+    }
+    original_baseline = nddev_kilo_cli.baseline
+    original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
+    original_fetch_archive_bytes = nddev_kilo_cli.fetch_archive_bytes
+    original_integrity = nddev_kilo_cli.KILO_PACKAGE_INTEGRITY
+    original_shasum = nddev_kilo_cli.KILO_PACKAGE_SHASUM
+
+    def fake_fetch_archive_bytes(url: str, label: str) -> bytes:
+        try:
+            return archive_map[url]
+        except KeyError:
+            fail(f"unexpected archive URL for {label}: {url}")
+
+    nddev_kilo_cli.baseline = lambda: baseline
+    nddev_kilo_cli.fetch_registry_metadata = lambda: copy_json(metadata)
+    nddev_kilo_cli.fetch_archive_bytes = fake_fetch_archive_bytes
+    nddev_kilo_cli.KILO_PACKAGE_INTEGRITY = package_dist["integrity"]
+    nddev_kilo_cli.KILO_PACKAGE_SHASUM = package_dist["shasum"]
+    try:
+        yield
+    finally:
+        nddev_kilo_cli.baseline = original_baseline
+        nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
+        nddev_kilo_cli.fetch_archive_bytes = original_fetch_archive_bytes
+        nddev_kilo_cli.KILO_PACKAGE_INTEGRITY = original_integrity
+        nddev_kilo_cli.KILO_PACKAGE_SHASUM = original_shasum
 
 
 def expect_manager_error(label: str, fn: Any) -> None:
@@ -3513,82 +3665,21 @@ def validate_target_commands_use_two_stage_coordination() -> None:
                     fail(f"{command} target coordination trace mismatch: {trace!r}")
 
 
-def validate_npm_install_ignores_lifecycle_scripts() -> None:
+def validate_verified_archive_install_materializes_selected_native() -> None:
     production, _catalog = nddev_kilo_cli.native_package_matrix()
     host = nddev_kilo_cli.host_native_platform()
     selected = nddev_kilo_cli.selected_native_package_name_for_host(host)
-    commands: list[tuple[list[str], dict[str, str], Path]] = []
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-npm-") as raw:
+    package_content = package_archive_content()
+    native_content = native_archive_content(
+        selected, production[selected], b"fake selected native\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-archives-") as raw:
         stage_root = Path(raw)
         stage_root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
         live_stage = stage_root / "live"
         live_stage.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
-
-        def fake_find_npm_executable() -> tuple[str, tuple[str, ...]]:
-            return "/usr/bin/npm", ("/usr/bin",)
-
-        def fake_fetch_registry_metadata() -> dict[str, Any]:
-            baseline = nddev_kilo_cli.baseline()
-            npm = baseline["npm"]
-            return {
-                "name": nddev_kilo_cli.KILO_PACKAGE,
-                "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
-                "dist": npm["dist"],
-                "scripts": npm["scripts"],
-                "optionalDependencies": expected_optional_native_versions(),
-            }
-
-        def fake_bounded_process(
-            command: list[str],
-            *,
-            cwd: Path,
-            env: dict[str, str],
-            timeout: int,
-        ) -> subprocess.CompletedProcess[str]:
-            del timeout
-            commands.append((list(command), dict(env), cwd))
-            if "--ignore-scripts" not in command:
-                fail("npm command omitted --ignore-scripts")
-            if env.get("NPM_CONFIG_IGNORE_SCRIPTS") != "true":
-                fail("npm command omitted NPM_CONFIG_IGNORE_SCRIPTS=true")
-            if env.get("npm_config_ignore_scripts") != "true":
-                fail("npm command omitted npm_config_ignore_scripts=true")
-            if "--package-lock-only" in command:
-                write_public_json(cwd / "package-lock.json", valid_package_lock((selected,)))
-            elif "--global" in command:
-                write_fake_cli_package(live_stage)
-                write_fake_native_package(
-                    live_stage,
-                    selected,
-                    production[selected],
-                    b"fake selected native\n",
-                    tree_sitter=True,
-                )
-            else:
-                fail(f"unexpected npm command in script-free install: {command}")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        original_find_npm_executable = nddev_kilo_cli.find_npm_executable
-        original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
-        original_bounded_process = nddev_kilo_cli.bounded_process
-        nddev_kilo_cli.find_npm_executable = fake_find_npm_executable
-        nddev_kilo_cli.fetch_registry_metadata = fake_fetch_registry_metadata
-        nddev_kilo_cli.bounded_process = fake_bounded_process
-        try:
-            nddev_kilo_cli.run_npm_install(stage_root, live_stage)
-        finally:
-            nddev_kilo_cli.find_npm_executable = original_find_npm_executable
-            nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
-            nddev_kilo_cli.bounded_process = original_bounded_process
-
-        if len(commands) != 2:
-            fail("script-free install executed an unexpected number of npm commands")
-        for command, _env, _cwd in commands:
-            if "--no-save" in command:
-                fail("script-free install attempted vendor nested npm fallback")
-        npmrc = (stage_root / "npmrc").read_text(encoding="utf-8")
-        if "ignore-scripts=true" not in npmrc:
-            fail("sanitized npmrc does not disable lifecycle scripts")
+        with patched_verified_archives(package_content, native_content, selected):
+            nddev_kilo_cli.run_verified_archive_install(stage_root, live_stage)
         for relative in nddev_kilo_cli.VENDOR_POSTINSTALL_RESOURCE_RELATIVES:
             if (live_stage / relative).exists() or (live_stage / relative).is_symlink():
                 fail(f"vendor postinstall artifact was materialized: {relative}")
@@ -3603,57 +3694,17 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
     production, _catalog = nddev_kilo_cli.native_package_matrix()
     host = nddev_kilo_cli.host_native_platform()
     selected = nddev_kilo_cli.selected_native_package_name_for_host(host)
+    package_content = package_archive_content()
+    native_content = native_archive_content(
+        selected,
+        production[selected],
+        b"fake selected native rollback\n",
+    )
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-software-rollback-") as raw:
         workspace = Path(raw)
         workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
         target = workspace / "target"
-
-        def fake_find_npm_executable() -> tuple[str, tuple[str, ...]]:
-            return "/usr/bin/npm", ("/usr/bin",)
-
-        def fake_fetch_registry_metadata() -> dict[str, Any]:
-            baseline = nddev_kilo_cli.baseline()
-            npm = baseline["npm"]
-            return {
-                "name": nddev_kilo_cli.KILO_PACKAGE,
-                "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
-                "dist": npm["dist"],
-                "scripts": npm["scripts"],
-                "optionalDependencies": expected_optional_native_versions(),
-            }
-
-        def fake_bounded_process(
-            command: list[str],
-            *,
-            cwd: Path,
-            env: dict[str, str],
-            timeout: int,
-        ) -> subprocess.CompletedProcess[str]:
-            del env, timeout
-            if "--package-lock-only" in command:
-                write_public_json(cwd / "package-lock.json", valid_package_lock((selected,)))
-            elif "--global" in command and "--prefix" in command:
-                prefix = Path(command[command.index("--prefix") + 1])
-                live_stage = prefix.parents[len(nddev_kilo_cli.SOFTWARE_PREFIX_RELATIVE.parts) - 1]
-                write_fake_cli_package(live_stage)
-                write_fake_native_package(
-                    live_stage,
-                    selected,
-                    production[selected],
-                    b"fake selected native rollback\n",
-                    tree_sitter=True,
-                )
-            else:
-                fail(f"unexpected npm command in software rollback probe: {command}")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        original_find_npm_executable = nddev_kilo_cli.find_npm_executable
-        original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
-        original_bounded_process = nddev_kilo_cli.bounded_process
-        nddev_kilo_cli.find_npm_executable = fake_find_npm_executable
-        nddev_kilo_cli.fetch_registry_metadata = fake_fetch_registry_metadata
-        nddev_kilo_cli.bounded_process = fake_bounded_process
-        try:
+        with patched_verified_archives(package_content, native_content, selected):
             nddev_kilo_cli.install_or_update_cli(target, "install-cli")
             manifest_path = target / nddev_kilo_cli.SOFTWARE_MANIFEST_RELATIVE
             manifest = load_json(manifest_path)
@@ -3693,10 +3744,6 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
             )
             if residue:
                 fail("remove-cli late fault left staging residue: " + ", ".join(residue))
-        finally:
-            nddev_kilo_cli.find_npm_executable = original_find_npm_executable
-            nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
-            nddev_kilo_cli.bounded_process = original_bounded_process
 
 
 def validate_wrong_platform_native_regression() -> None:
@@ -3837,27 +3884,48 @@ def validate_sticky_tmp_target() -> None:
 
 
 def validate_fake_path_is_ignored() -> None:
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-fakepath-") as raw:
-        fake_dir = Path(raw)
-        fake = fake_dir / "npm"
-        fake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
-        fake.chmod(0o700)
-        original_path = os.environ.get("PATH")
-        os.environ["PATH"] = str(fake_dir)
-        try:
-            try:
-                npm, path_entries = nddev_kilo_cli.find_npm_executable()
-            except nddev_kilo_cli.ManagerError:
-                return
-            if Path(npm) == fake:
-                fail("fake npm from ambient PATH was selected")
-            if str(fake_dir) in path_entries:
-                fail("fake PATH entry was retained for install")
-        finally:
-            if original_path is None:
-                os.environ.pop("PATH", None)
-            else:
-                os.environ["PATH"] = original_path
+    if hasattr(nddev_kilo_cli, "find_npm_executable"):
+        fail("public manager must not retain an npm executable selector")
+    source = MANAGER_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(MANAGER_PATH))
+    install_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_verified_archive_install"
+        ),
+        None,
+    )
+    if install_function is None:
+        fail("public manager omits verified archive install function")
+    called: set[str] = set()
+    for node in ast.walk(install_function):
+        if isinstance(node, ast.Call):
+            function = node.func
+            if isinstance(function, ast.Name):
+                called.add(function.id)
+            elif isinstance(function, ast.Attribute):
+                called.add(function.attr)
+    forbidden = {
+        "bounded_process",
+        "generate_package_lock",
+        "install_stage_environment",
+        "find_npm_executable",
+        "Popen",
+        "run",
+    }
+    if called & forbidden:
+        fail("verified archive install calls forbidden npm/process materializer primitives")
+    required = {
+        "fetch_registry_metadata",
+        "verify_registry_metadata",
+        "verified_archive_bytes",
+        "extract_verified_npm_archive",
+        "write_verified_package_lock",
+        "selected_native_package_name_for_host",
+    }
+    if not required.issubset(called):
+        fail("verified archive install omits required archive authority checks")
 
 
 def validate_no_public_bootstrap_override_references() -> None:
@@ -3925,7 +3993,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_native_selection_and_wrapper_regressions()
         validate_unsupported_platforms_reject_before_side_effects()
         validate_target_commands_use_two_stage_coordination()
-        validate_npm_install_ignores_lifecycle_scripts()
+        validate_verified_archive_install_materializes_selected_native()
         validate_software_cleanup_fault_restores_object_identity()
         validate_wrong_platform_native_regression()
         validate_private_target_required()

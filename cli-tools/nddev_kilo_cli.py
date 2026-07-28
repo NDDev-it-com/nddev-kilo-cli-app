@@ -10,10 +10,13 @@ explicit absolute target. It never infers or mutates the caller's live
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import copy
 import errno
 import hashlib
+import io
 import json
 import os
 import platform
@@ -21,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -131,26 +135,6 @@ KILO_PACKAGE_INTEGRITY = (
     "nk0OGNO1kRaygEyc7+Htr2Q=="
 )
 KILO_PACKAGE_SHASUM = "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d"
-NPM_INSTALL_ARGV = (
-    "install",
-    "--global",
-    "--ignore-scripts",
-    "--save-exact",
-    "--audit=false",
-    "--fund=false",
-    f"--registry={NPM_REGISTRY}",
-    KILO_PACKAGE_SPEC,
-)
-NPM_LOCK_ARGV = (
-    "install",
-    "--package-lock-only",
-    "--ignore-scripts",
-    "--save-exact",
-    "--audit=false",
-    "--fund=false",
-    f"--registry={NPM_REGISTRY}",
-    KILO_PACKAGE_SPEC,
-)
 PRODUCTION_HOSTS = {
     "macos-arm64": {
         "os": "darwin",
@@ -202,13 +186,9 @@ PRODUCTION_NATIVE_PACKAGES = (
     "@kilocode/cli-linux-x64",
 )
 CONTROLLED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-TRUSTED_NPM_CANDIDATES = (
-    "/opt/homebrew/bin/npm",
-    "/usr/local/bin/npm",
-    "/usr/bin/npm",
-)
 PROCESS_OUTPUT_MAX_BYTES = 256 * 1024
 PROCESS_TIMEOUT_SECONDS = 180
+PACKAGE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
 SOFTWARE_TREE_MAX_BYTES = 1024 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 120000
 SOFTWARE_PREFIX_RELATIVE = Path("install") / "npm-prefix"
@@ -1965,6 +1945,8 @@ def restore_lock_path_after_failed_transaction(
 ) -> None:
     lock = lock_path(target)
     if expected is None:
+        if path_exists_no_follow(lock):
+            chmod_directory_no_follow(lock, OWNER_DIR_MODE, "failed target lock parent")
         remove_path_durable_retry(lock, "failed target lock path")
         return
     restore_object_metadata(lock, expected)
@@ -2223,6 +2205,7 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
         current_lock_file = lock_file_path(target).lstat()
         if identity_of(lock_file_info) != identity_of(current_lock_file):
             raise ConcurrentTargetChange("target lock file changed after it was locked")
+        chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
         owner_transaction = begin_lock_owner_transaction(target)
         write_lock_owner(target, held=True)
         restore_stale_launch_protection_modes(target)
@@ -4404,57 +4387,6 @@ def safe_child_base_environment(
     return env
 
 
-def install_stage_environment(
-    stage_root: Path, live_stage: Path, *, path_entries: tuple[str, ...]
-) -> dict[str, str]:
-    home = stage_root / "home"
-    tmp = stage_root / "tmp"
-    xdg_config = stage_root / "xdg-config"
-    xdg_data = stage_root / "xdg-data"
-    xdg_state = stage_root / "xdg-state"
-    xdg_cache = stage_root / "xdg-cache"
-    npm_cache = stage_root / "npm-cache"
-    npm_prefix = live_stage / SOFTWARE_PREFIX_RELATIVE
-    npm_userconfig = stage_root / "npmrc"
-    npm_globalconfig = stage_root / "global-npmrc"
-    for directory in (home, tmp, xdg_config, xdg_data, xdg_state, xdg_cache, npm_cache, npm_prefix):
-        directory.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
-        directory.chmod(OWNER_DIR_MODE)
-    npm_userconfig.write_text(
-        f"registry={NPM_REGISTRY}\naudit=false\nfund=false\nignore-scripts=true\n",
-        encoding="utf-8",
-    )
-    npm_userconfig.chmod(OWNER_FILE_MODE)
-    npm_globalconfig.write_text("", encoding="utf-8")
-    npm_globalconfig.chmod(OWNER_FILE_MODE)
-    env = safe_child_base_environment(include_path=True, path_entries=path_entries)
-    env.update(
-        {
-            "HOME": str(home),
-            "USERPROFILE": str(home),
-            "TMPDIR": str(tmp),
-            "XDG_CONFIG_HOME": str(xdg_config),
-            "XDG_DATA_HOME": str(xdg_data),
-            "XDG_STATE_HOME": str(xdg_state),
-            "XDG_CACHE_HOME": str(xdg_cache),
-            "npm_config_cache": str(npm_cache),
-            "npm_config_prefix": str(npm_prefix),
-            "npm_config_userconfig": str(npm_userconfig),
-            "npm_config_globalconfig": str(npm_globalconfig),
-            "npm_config_update_notifier": "false",
-            "npm_config_ignore_scripts": "true",
-            "npm_config_audit": "false",
-            "npm_config_fund": "false",
-            "NPM_CONFIG_CACHE": str(npm_cache),
-            "NPM_CONFIG_PREFIX": str(npm_prefix),
-            "NPM_CONFIG_USERCONFIG": str(npm_userconfig),
-            "NPM_CONFIG_GLOBALCONFIG": str(npm_globalconfig),
-            "NPM_CONFIG_IGNORE_SCRIPTS": "true",
-        }
-    )
-    return env
-
-
 def native_wrapper_bytes(native_relative: Path, runtime_resources: dict[str, Any]) -> bytes:
     tree_sitter = runtime_resources.get("tree_sitter")
     tree_sitter_block = ""
@@ -4611,92 +4543,6 @@ def protect_launch_handoff_paths(
     except BaseException:
         LaunchDirectoryProtection(protected, {lock_path(target)}).restore()
         raise
-
-
-def reject_unsafe_tool_ancestors(path: Path) -> None:
-    current = Path(path.anchor)
-    for part in path.parts[1:-1]:
-        current = current / part
-        info = require_directory(current, f"tool ancestor {current}")
-        if group_or_world_writable(info) and not is_sticky_directory(info):
-            fail(f"tool ancestor must not be group/world-writable unless sticky: {current}")
-
-
-def trusted_executable(path: Path, label: str) -> bool:
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False
-    resolved = path
-    if stat.S_ISLNK(info.st_mode):
-        try:
-            resolved = path.resolve(strict=True)
-        except FileNotFoundError:
-            return False
-    try:
-        reject_unsafe_tool_ancestors(path)
-        reject_unsafe_tool_ancestors(resolved)
-        resolved_info = resolved.lstat()
-    except ManagerError:
-        raise
-    except OSError:
-        return False
-    if stat.S_ISLNK(resolved_info.st_mode) or not stat.S_ISREG(resolved_info.st_mode):
-        return False
-    if group_or_world_writable(resolved_info):
-        fail(f"{label} must not be group/world-writable: {resolved}")
-    return os.access(resolved, os.X_OK)
-
-
-def find_npm_executable() -> tuple[str, tuple[str, ...]]:
-    for raw in TRUSTED_NPM_CANDIDATES:
-        path = Path(raw)
-        if trusted_executable(path, "npm executable"):
-            return str(path), (str(path.parent),)
-    fail("trusted npm executable not found in supported absolute locations")
-
-
-def bounded_process(
-    command: list[str], *, cwd: Path, env: dict[str, str], timeout: int
-) -> subprocess.CompletedProcess[str]:
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=(os.name == "posix"),
-        )
-    except FileNotFoundError:
-        fail(f"process executable not found: {command[0]}")
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, 15)
-        else:
-            process.kill()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.communicate(timeout=5)
-        if process.poll() is None:
-            if os.name == "posix":
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, 9)
-            else:
-                process.kill()
-            process.communicate()
-        fail(f"process timed out after {timeout} seconds: {command[0]}")
-    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-    if (
-        len(completed.stdout) > PROCESS_OUTPUT_MAX_BYTES
-        or len(completed.stderr) > PROCESS_OUTPUT_MAX_BYTES
-    ):
-        fail(f"process output exceeded {PROCESS_OUTPUT_MAX_BYTES}-byte limit: {command[0]}")
-    return completed
 
 
 def chmod_private_tree(root: Path) -> None:
@@ -5083,6 +4929,169 @@ def verify_registry_metadata(metadata: dict[str, Any]) -> None:
         fail("npm registry metadata native optional dependency map is not synchronized")
 
 
+def verify_integrity_bytes(content: bytes, integrity: str, label: str) -> None:
+    try:
+        algorithm, encoded = integrity.split("-", 1)
+    except ValueError:
+        fail(f"{label} integrity is invalid")
+    if algorithm != "sha512":
+        fail(f"{label} integrity algorithm is unsupported")
+    try:
+        expected = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error):
+        fail(f"{label} integrity payload is invalid")
+    observed = hashlib.sha512(content).digest()
+    if observed != expected:
+        fail(f"{label} integrity does not match the pinned baseline")
+
+
+def verify_shasum_bytes(content: bytes, shasum: str, label: str) -> None:
+    if len(shasum) != 40 or any(character not in "0123456789abcdef" for character in shasum):
+        fail(f"{label} shasum is invalid")
+    if hashlib.sha1(content).hexdigest() != shasum:
+        fail(f"{label} shasum does not match the pinned baseline")
+
+
+def fetch_archive_bytes(url: str, label: str) -> bytes:
+    if not url.startswith(NPM_REGISTRY):
+        fail(f"{label} tarball is not from the official npm registry")
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/octet-stream", "User-Agent": f"{PRODUCT_NAME}/{VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=PROCESS_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                fail(f"npm registry returned HTTP {response.status} for {label}")
+            content = response.read(PACKAGE_ARCHIVE_MAX_BYTES + 1)
+    except urllib.error.URLError as exc:
+        fail(f"cannot read npm package archive for {label}: {exc}")
+    if len(content) > PACKAGE_ARCHIVE_MAX_BYTES:
+        fail(f"{label} archive exceeds the bounded read limit")
+    return content
+
+
+def verified_archive_bytes(dist: dict[str, str], label: str) -> bytes:
+    content = fetch_archive_bytes(dist["tarball"], label)
+    verify_integrity_bytes(content, dist["integrity"], label)
+    verify_shasum_bytes(content, dist["shasum"], label)
+    return content
+
+
+def tar_member_relative(member: tarfile.TarInfo, label: str) -> Path | None:
+    path = Path(member.name)
+    if path.is_absolute() or not path.parts or path.parts[0] != "package":
+        fail(f"{label} archive member path is invalid: {member.name}")
+    if len(path.parts) == 1:
+        return None
+    relative = Path(*path.parts[1:])
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        fail(f"{label} archive member path is unsafe: {member.name}")
+    return relative
+
+
+def extract_verified_npm_archive(content: bytes, destination: Path, label: str) -> None:
+    destination.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    destination.chmod(OWNER_DIR_MODE)
+    path_count = 0
+    byte_count = 0
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(content), mode="r:gz")
+    except tarfile.TarError as exc:
+        raise ManagerError(f"{label} archive is not a valid gzip tarball") from exc
+    with archive:
+        for member in archive:
+            relative = tar_member_relative(member, label)
+            if relative is None:
+                continue
+            path_count += 1
+            if path_count > SOFTWARE_TREE_MAX_PATHS:
+                fail(f"{label} archive exceeds the bounded path limit")
+            target_path = destination / relative
+            try:
+                target_path.relative_to(destination)
+            except ValueError:
+                fail(f"{label} archive member escapes the package root: {member.name}")
+            if member.isdir():
+                target_path.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+                target_path.chmod(OWNER_DIR_MODE)
+                continue
+            if member.issym() or member.islnk():
+                fail(f"{label} archive must not contain links: {member.name}")
+            if not member.isfile():
+                fail(f"{label} archive contains unsupported member type: {member.name}")
+            if member.size < 0 or member.size > SOFTWARE_TREE_MAX_BYTES:
+                fail(f"{label} archive member size is invalid: {member.name}")
+            byte_count += member.size
+            if byte_count > SOFTWARE_TREE_MAX_BYTES:
+                fail(f"{label} archive exceeds the bounded byte limit")
+            source = archive.extractfile(member)
+            if source is None:
+                fail(f"{label} archive member is unreadable: {member.name}")
+            target_path.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+            with source:
+                data = source.read(member.size + 1)
+            if len(data) != member.size:
+                fail(f"{label} archive member size changed while reading: {member.name}")
+            target_path.write_bytes(data)
+            mode = stat.S_IMODE(member.mode)
+            target_path.chmod(0o700 if mode & stat.S_IXUSR else OWNER_FILE_MODE)
+
+
+def expected_package_dist() -> dict[str, str]:
+    return {
+        "integrity": KILO_PACKAGE_INTEGRITY,
+        "shasum": KILO_PACKAGE_SHASUM,
+        "tarball": f"https://registry.npmjs.org/@kilocode/cli/-/cli-{KILO_CURRENT_VERSION}.tgz",
+    }
+
+
+def write_verified_package_lock(live_stage: Path, selected_native: str) -> None:
+    supported, unsupported = native_package_matrix()
+    native_record = supported.get(selected_native)
+    if native_record is None:
+        fail(f"selected native package is not a production package: {selected_native}")
+    native_dist = native_record_dist(native_record, selected_native)
+    package_dist = expected_package_dist()
+    native_lock: dict[str, Any] = {
+        "version": KILO_CURRENT_VERSION,
+        "resolved": native_dist["tarball"],
+        "integrity": native_dist["integrity"],
+        "cpu": list(native_record["cpu"]),
+        "os": list(native_record["os"]),
+    }
+    if native_record.get("libc") is not None:
+        native_lock["libc"] = native_record["libc"]
+    lock = {
+        "name": "nddev-kilo-cli-lock",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": True,
+        "packages": {
+            "": {
+                "name": "nddev-kilo-cli-lock",
+                "version": "0.0.0",
+                "dependencies": {KILO_PACKAGE: KILO_CURRENT_VERSION},
+            },
+            "node_modules/@kilocode/cli": {
+                "version": KILO_CURRENT_VERSION,
+                "resolved": package_dist["tarball"],
+                "integrity": package_dist["integrity"],
+                "bin": {"kilo": "bin/kilo", "kilocode": "bin/kilo"},
+                "optionalDependencies": {
+                    package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)
+                },
+            },
+            f"node_modules/{selected_native}": native_lock,
+        },
+    }
+    destination = live_stage / SOFTWARE_LOCK_RELATIVE
+    destination.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+    destination.write_bytes(canonical_json(lock))
+    destination.chmod(OWNER_FILE_MODE)
+    package_lock_records(live_stage)
+
+
 def package_lock_path(root: Path) -> Path:
     return root / SOFTWARE_LOCK_RELATIVE
 
@@ -5318,12 +5327,12 @@ def installed_native_packages(root: Path) -> dict[str, Any]:
             }
         )
     if not records:
-        fail("Kilo CLI npm install did not leave an installed native package")
+        fail("verified Kilo CLI archive install did not leave an installed native package")
     allowed_names = set(allowed_for_host)
     candidates = [record for record in records if record["name"] in allowed_names]
     if not candidates:
         fail(
-            "Kilo CLI npm install did not install a native package allowed for "
+            "verified Kilo CLI archive install did not install a native package allowed for "
             f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
         )
     installed_by_name = {record["name"]: record for record in candidates}
@@ -5475,13 +5484,17 @@ def software_manifest_identity() -> dict[str, Any]:
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "package": KILO_PACKAGE,
-        "install_method": "npm-global-exact-isolated-ignore-scripts",
+        "install_method": "verified-npm-archive-set-ignore-scripts",
         "package_version": KILO_CURRENT_VERSION,
         "package_integrity": KILO_PACKAGE_INTEGRITY,
         "package_shasum": KILO_PACKAGE_SHASUM,
         "npm_registry": NPM_REGISTRY,
-        "npm_install_argv": list(NPM_INSTALL_ARGV),
-        "npm_lock_argv": list(NPM_LOCK_ARGV),
+        "archive_authority": {
+            "package_tarball": expected_package_dist()["tarball"],
+            "native_tarball": "host-selected-production-native-package",
+            "verification": ["sha512-integrity", "sha1-shasum"],
+            "materialization": "extract-verified-local-bytes-without-scripts",
+        },
         "lifecycle_scripts": "disabled",
         "vendor_postinstall": {
             "present": True,
@@ -6159,64 +6172,40 @@ def materialize_stage_entrypoint(live_stage: Path, native_provenance: dict[str, 
     require_safe_executable(entrypoint, live_stage, "staged Kilo CLI executable")
 
 
-def write_lock_project(stage_root: Path) -> Path:
-    project = stage_root / "npm-lock-project"
-    project.mkdir(mode=OWNER_DIR_MODE)
-    package_json = {
-        "private": True,
-        "name": "nddev-kilo-cli-lock",
-        "version": "0.0.0",
-        "dependencies": {KILO_PACKAGE: KILO_CURRENT_VERSION},
-    }
-    path = project / "package.json"
-    path.write_bytes(canonical_json(package_json))
-    path.chmod(OWNER_FILE_MODE)
-    return project
-
-
-def generate_package_lock(
-    stage_root: Path, live_stage: Path, npm: str, env: dict[str, str]
-) -> Path:
-    project = write_lock_project(stage_root)
-    completed = bounded_process(
-        [npm, *NPM_LOCK_ARGV],
-        cwd=project,
-        env=env,
-        timeout=PROCESS_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        fail(
-            "npm package-lock generation for Kilo CLI failed with exit "
-            f"{completed.returncode}: {completed.stderr.strip()}"
-        )
-    source = project / "package-lock.json"
-    require_regular_file(source, "generated Kilo CLI package lock", max_bytes=METADATA_MAX_BYTES)
-    destination = live_stage / SOFTWARE_LOCK_RELATIVE
-    destination.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    destination.chmod(OWNER_FILE_MODE)
-    package_lock_records(live_stage)
-    return destination
-
-
-def run_npm_install(stage_root: Path, live_stage: Path) -> None:
+def run_verified_archive_install(_stage_root: Path, live_stage: Path) -> None:
     require_supported_production_platform()
-    npm, path_entries = find_npm_executable()
     registry_metadata = fetch_registry_metadata()
     verify_registry_metadata(registry_metadata)
-    env = install_stage_environment(stage_root, live_stage, path_entries=path_entries)
-    generate_package_lock(stage_root, live_stage, npm, env)
-    prefix = live_stage / SOFTWARE_PREFIX_RELATIVE
-    completed = bounded_process(
-        [npm, *NPM_INSTALL_ARGV, "--prefix", str(prefix)],
-        cwd=stage_root,
-        env=env,
-        timeout=PROCESS_TIMEOUT_SECONDS,
+    host = host_native_platform()
+    selected_native = selected_native_package_name_for_host(host)
+    supported, _unsupported = native_package_matrix()
+    native_record = supported.get(selected_native)
+    if native_record is None:
+        fail(f"selected native package is not production-supported: {selected_native}")
+    package_dist = expected_package_dist()
+    metadata_dist = registry_metadata["dist"]
+    if (
+        metadata_dist.get("tarball") != package_dist["tarball"]
+        or metadata_dist.get("integrity") != package_dist["integrity"]
+        or metadata_dist.get("shasum") != package_dist["shasum"]
+    ):
+        fail("npm registry metadata dist is not synchronized with the pinned archive")
+    package_content = verified_archive_bytes(package_dist, KILO_PACKAGE)
+    native_dist = native_record_dist(native_record, selected_native)
+    native_content = verified_archive_bytes(native_dist, selected_native)
+    install_root = live_stage / SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules"
+    extract_verified_npm_archive(
+        package_content,
+        install_root / "@kilocode" / "cli",
+        KILO_PACKAGE,
     )
-    if completed.returncode != 0:
-        fail(
-            f"npm install for Kilo CLI failed with exit {completed.returncode}: {completed.stderr.strip()}"
-        )
+    scope, name = selected_native.split("/", 1)
+    extract_verified_npm_archive(
+        native_content,
+        install_root / scope / name,
+        selected_native,
+    )
+    write_verified_package_lock(live_stage, selected_native)
     validate_vendor_postinstall_not_materialized(live_stage)
     chmod_private_tree(live_stage)
     materialize_hardlinked_regular_files(live_stage)
@@ -7937,7 +7926,7 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             staging.chmod(OWNER_DIR_MODE)
             live_stage = staging / "live"
             live_stage.mkdir(mode=OWNER_DIR_MODE)
-            run_npm_install(staging, live_stage)
+            run_verified_archive_install(staging, live_stage)
             chmod_private_tree(live_stage)
             write_stage_software_manifest(live_stage)
             software_transaction = replace_software_state(target, live_stage, staging)
@@ -8347,8 +8336,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     for command, help_text in (
         ("software-status", "inspect target-owned Kilo CLI software"),
-        ("install-cli", "install pinned Kilo CLI package with isolated npm"),
-        ("update-cli", "update or repair target-owned Kilo CLI package with isolated npm"),
+        ("install-cli", "install pinned Kilo CLI package from verified npm archives"),
+        ("update-cli", "update or repair target-owned Kilo CLI package from verified npm archives"),
         ("remove-cli", "remove target-owned Kilo CLI software"),
     ):
         command_parser = subparsers.add_parser(command, help=help_text)
