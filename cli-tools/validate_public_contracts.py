@@ -202,6 +202,11 @@ def validate_versions() -> None:
     runtime = manifest.get("runtime", {})
     if runtime.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("manifest launch lifecycle lock contract mismatch")
+    if (
+        runtime.get("cleanup_pending_policy")
+        != "drain-under-target-lock-before-launch-image-protection-child"
+    ):
+        fail("manifest launch cleanup-pending policy mismatch")
     if runtime.get("bootstrap_lock") != EXPECTED_BOOTSTRAP_LOCK:
         fail("manifest bootstrap lifecycle lock contract mismatch")
     if runtime.get("lock_file") != str(
@@ -280,6 +285,11 @@ def validate_contract() -> None:
         fail("runtime launch --auto must be limited to full-auto profile")
     if runtime_launch.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("runtime launch must hold the target lifecycle lock through child completion")
+    if (
+        runtime_launch.get("cleanup_pending_policy")
+        != "drain-under-target-lock-before-launch-image-protection-child"
+    ):
+        fail("runtime launch cleanup-pending policy mismatch")
     if runtime_launch.get("bootstrap_lock") != EXPECTED_BOOTSTRAP_LOCK:
         fail("runtime launch bootstrap lifecycle lock contract mismatch")
     if runtime_launch.get("lock_file") != str(
@@ -840,6 +850,23 @@ def validate_python_portability() -> None:
         fail("cleanup journal builder must preflight projected serialized size")
     if "cleanup_journal_content" not in promote_calls:
         fail("cleanup journal builder must share the serialized-byte bound")
+    launch_locked = functions.get("_launch_locked")
+    if launch_locked is None:
+        fail("manager is missing _launch_locked")
+    launch_source = ast.get_source_segment(manager_source, launch_locked) or ""
+    drain_index = launch_source.find("drain_cleanup_before_mutation")
+    if drain_index < 0:
+        fail("launch must drain cleanup-pending state under target lock")
+    for later in (
+        "require_active_clean_installed",
+        "require_current_software",
+        "clean_launch_env",
+        "protect_launch_handoff_paths",
+        "subprocess.Popen",
+    ):
+        later_index = launch_source.find(later)
+        if later_index >= 0 and drain_index > later_index:
+            fail("launch must drain cleanup-pending before launch image/protection/child work")
 
 
 def validate_bootstrap_publication_eexist_preserves_destination() -> None:

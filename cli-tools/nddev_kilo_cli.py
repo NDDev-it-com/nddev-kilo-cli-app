@@ -6984,11 +6984,11 @@ def promote_cleanup_tombstone(
                 fail("cleanup tombstone destination already exists")
             source_parent = source.parent
             os.replace(source, destination)
+            moved.append(entry)
+            source_by_tombstone[destination_name] = source
             fsync_directory(tombstone_root, f"cleanup tombstone {tombstone_root}")
             if path_exists_no_follow(source_parent):
                 fsync_directory(source_parent, f"cleanup source parent {source_parent}")
-            moved.append(entry)
-            source_by_tombstone[destination_name] = source
         content = cleanup_journal_content(
             target,
             command,
@@ -7444,6 +7444,8 @@ def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int 
         fail("launch timeout must be positive")
     forwarded = list(child_args)
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            fail("cleanup pending drain failed before launch")
         stamp = require_active_clean_installed(target)
         installation = require_current_software(target)
         env = clean_launch_env(target)

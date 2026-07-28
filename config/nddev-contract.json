@@ -36,6 +36,7 @@
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
     "lifecycle_lock": "persistent-flock-held-through-child",
+    "cleanup_pending_policy": "drain-under-target-lock-before-launch-image-protection-child",
     "bootstrap_lock": {
       "kind": "external-product-anchor-and-persistent-target-flock",
       "system_root": "fixed-real-sticky-system-temp",

@@ -59,6 +59,7 @@
     "lock_file_mode": "0600",
     "lock_parent_mode_while_held": "0500",
     "lock_nonblocking_flock": true,
+    "cleanup_pending_policy": "drain-under-target-lock-before-launch-image-protection-child",
     "pre_child_executable_revalidation": true,
     "denies_lifecycle_mutations_while_running": true,
     "executable_handoff": {
