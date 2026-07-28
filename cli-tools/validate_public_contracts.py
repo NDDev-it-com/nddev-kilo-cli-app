@@ -758,11 +758,72 @@ def validate_python_portability() -> None:
     )
     if publish is None:
         fail("manager is missing bootstrap anchor publication function")
-    publish_source = ast.get_source_segment(manager_source, publish) or ""
-    if "os.link(" not in publish_source:
+
+    def dotted_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted_name(node.value)
+            if parent is None:
+                return node.attr
+            return f"{parent}.{node.attr}"
+        return None
+
+    calls = [dotted_name(node.func) for node in ast.walk(publish) if isinstance(node, ast.Call)]
+    if "os.link" not in calls:
         fail("bootstrap anchor publication must use an atomic no-replace link primitive")
-    if "os.replace(" in publish_source or "ftruncate(" in publish_source:
-        fail("bootstrap anchor publication must not replace or truncate a published anchor")
+    forbidden_calls = {
+        "os.replace",
+        "os.rename",
+        "os.ftruncate",
+        "Path.rename",
+        "Path.replace",
+        "Path.open",
+        "open",
+    }
+    for node in ast.walk(publish):
+        if isinstance(node, ast.Call):
+            name = dotted_name(node.func)
+            if name in forbidden_calls:
+                fail(f"bootstrap anchor publication uses forbidden call: {name}")
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "rename",
+                "replace",
+                "truncate",
+            }:
+                fail("bootstrap anchor publication must not rename, replace, or truncate anchors")
+        if isinstance(node, ast.Attribute) and node.attr == "O_TRUNC":
+            fail("bootstrap anchor publication must not open with O_TRUNC")
+
+
+def validate_bootstrap_publication_eexist_preserves_destination() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-anchor-eexist-") as raw:
+        root = Path(raw)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        final = root / "global.lock"
+        original_content = b"preexisting anchor\n"
+        final.write_bytes(original_content)
+        final.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = final.lstat()
+        published = nddev_kilo_cli.publish_bootstrap_anchor_file(
+            root,
+            final,
+            b"replacement anchor\n",
+            "public EEXIST anchor",
+        )
+        if published:
+            fail("bootstrap anchor publication replaced a pre-existing destination")
+        after = final.lstat()
+        if (
+            final.read_bytes() != original_content
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(before.st_mode)
+            or nddev_kilo_cli.identity_of(after) != nddev_kilo_cli.identity_of(before)
+            or after.st_nlink != before.st_nlink
+        ):
+            fail("EEXIST publication changed the pre-existing destination anchor")
+        residue = sorted(path.name for path in root.iterdir() if path.name != final.name)
+        if residue:
+            fail("EEXIST publication left temporary anchor residue: " + ", ".join(residue))
 
 
 def validate_launch_guard() -> None:
@@ -2361,6 +2422,137 @@ def validate_read_only_bootstrap_no_create_paths() -> None:
                     fail(f"seeded target {command} read changed bootstrap lock namespace")
 
 
+def open_fd_count() -> int:
+    for raw in (Path("/proc") / str(os.getpid()) / "fd", Path("/dev/fd")):
+        try:
+            return len(os.listdir(raw))
+        except OSError:
+            continue
+    fail("fd-count regression requires /proc/<pid>/fd or /dev/fd")
+
+
+def validate_bootstrap_malformed_anchor_does_not_leak_fds() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-fd-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        bootstrap_parent = workspace / "bootstrap"
+        bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(bootstrap_parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            product = root / nddev_kilo_cli.PRODUCT_BOOTSTRAP_LOCK_NAME
+            product.write_bytes(b"{malformed\n")
+            product.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            target_lock = root / f"{nddev_kilo_cli.target_binding_sha256(target)}.lock"
+            target_lock.write_bytes(b"{malformed\n")
+            target_lock.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+            before = open_fd_count()
+            for _index in range(75):
+                expect_manager_error(
+                    "malformed product bootstrap anchor",
+                    lambda: nddev_kilo_cli.open_existing_product_bootstrap_lock_file(product),
+                )
+                expect_manager_error(
+                    "malformed target bootstrap anchor",
+                    lambda: nddev_kilo_cli.open_existing_bootstrap_lock_file(target, target_lock),
+                )
+            after = open_fd_count()
+            if after != before:
+                fail(f"malformed bootstrap anchor validation leaked fds: {before} -> {after}")
+
+
+def validate_cold_read_retry_and_exception_preservation() -> None:
+    operations: tuple[tuple[str, Any], ...] = (
+        ("status", lambda target: nddev_kilo_cli.status_payload(target)),
+        (
+            "plan",
+            lambda target: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        ),
+        ("software-status", lambda target: nddev_kilo_cli.software_status_command(target)),
+    )
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cold-race-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        for command, operation in operations:
+            bootstrap_parent = workspace / f"bootstrap-{command}"
+            bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target_parent = workspace / f"targets-{command}"
+            target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target = target_parent / "target"
+            target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            calls = 0
+            coordination: list[tuple[bool, bool, bool]] = []
+            original_resolve_target = nddev_kilo_cli.resolve_target
+            original_product_lock = nddev_kilo_cli.product_bootstrap_coordination_lock
+
+            @contextlib.contextmanager
+            def traced_product_lock(*, create: bool = True, shared: bool = False) -> Any:
+                with original_product_lock(create=create, shared=shared) as coordinated:
+                    coordination.append((create, shared, coordinated))
+                    yield coordinated
+
+            def publish_during_first_inspection(
+                raw_target: str | Path,
+                *,
+                create: bool = False,
+            ) -> Path:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    with original_product_lock(create=True, shared=False):
+                        pass
+                return original_resolve_target(raw_target, create=create)
+
+            with patched_bootstrap_lock_parent(bootstrap_parent):
+                nddev_kilo_cli.product_bootstrap_coordination_lock = traced_product_lock
+                nddev_kilo_cli.resolve_target = publish_during_first_inspection
+                try:
+                    operation(target)
+                finally:
+                    nddev_kilo_cli.resolve_target = original_resolve_target
+                    nddev_kilo_cli.product_bootstrap_coordination_lock = original_product_lock
+            if calls != 2:
+                fail(f"{command} did not retry after cold-read product anchor publication")
+            if (False, True, False) not in coordination or (False, True, True) not in coordination:
+                fail(f"{command} did not retry under product coordination: {coordination!r}")
+
+            failing_bootstrap_parent = workspace / f"bootstrap-{command}-failing"
+            failing_bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            failing_target_parent = workspace / f"targets-{command}-failing"
+            failing_target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            failing_target = failing_target_parent / "target"
+            failing_target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            failing_target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+
+            def failing_inspection(raw_target: str | Path, *, create: bool = False) -> Path:
+                del raw_target, create
+                with original_product_lock(create=True, shared=False):
+                    pass
+                raise RuntimeError(f"injected {command} inspection failure")
+
+            with patched_bootstrap_lock_parent(failing_bootstrap_parent):
+                nddev_kilo_cli.resolve_target = failing_inspection
+                try:
+                    try:
+                        operation(failing_target)
+                    except RuntimeError as exc:
+                        if f"injected {command} inspection failure" not in str(exc):
+                            fail(f"{command} preserved the wrong inspection error: {exc}")
+                    except nddev_kilo_cli.BootstrapAnchorAppeared as exc:
+                        fail(f"{command} masked a real inspection failure with retry: {exc}")
+                    else:
+                        fail(f"{command} accepted a failing cold-read inspection")
+                finally:
+                    nddev_kilo_cli.resolve_target = original_resolve_target
+
+
 def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -2410,6 +2602,200 @@ def fork_validation_child(label: str, error_dir: Path, fn: Any) -> int:
             os._exit(1)
         os._exit(0)
     return pid
+
+
+def machine_publication_aliases(root: Path, final: Path) -> list[Path]:
+    prefix = f".{final.name}.tmp-"
+    return sorted((path for path in root.iterdir() if path.name.startswith(prefix)), key=str)
+
+
+def validate_bootstrap_hardlink_publication_recovery() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-anchor-crash-product-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        bootstrap_parent = workspace / "bootstrap"
+        bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(bootstrap_parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+
+            def crash_after_product_link() -> None:
+                original_link = nddev_kilo_cli.os.link
+
+                def crash_link(
+                    source: str | bytes | os.PathLike[str],
+                    destination: str | bytes | os.PathLike[str],
+                ) -> None:
+                    original_link(source, destination)
+                    os._exit(0)
+
+                nddev_kilo_cli.os.link = crash_link
+                nddev_kilo_cli.open_product_bootstrap_lock_file(create=True)
+                raise RuntimeError("product anchor publication did not stop after link")
+
+            pid = fork_validation_child("product-crash", workspace, crash_after_product_link)
+            wait_for_process(pid, "product crash-after-link publisher")
+            product = root / nddev_kilo_cli.PRODUCT_BOOTSTRAP_LOCK_NAME
+            product_info = product.lstat()
+            if product_info.st_nlink != 2:
+                fail("product crash-after-link did not leave a two-link final anchor")
+            aliases = machine_publication_aliases(root, product)
+            if len(aliases) != 1:
+                fail("product crash-after-link did not leave exactly one machine temp alias")
+            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=False, shared=True):
+                pass
+            recovered_info = product.lstat()
+            if (
+                nddev_kilo_cli.identity_of(recovered_info)
+                != nddev_kilo_cli.identity_of(product_info)
+                or recovered_info.st_nlink != 1
+                or machine_publication_aliases(root, product)
+            ):
+                fail("product bootstrap anchor hard-link alias was not safely recovered")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-anchor-crash-target-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        bootstrap_parent = workspace / "bootstrap"
+        bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(bootstrap_parent):
+            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=True):
+                pass
+            root = nddev_kilo_cli.bootstrap_lock_root()
+
+            def crash_after_target_link() -> None:
+                original_link = nddev_kilo_cli.os.link
+
+                def crash_link(
+                    source: str | bytes | os.PathLike[str],
+                    destination: str | bytes | os.PathLike[str],
+                ) -> None:
+                    original_link(source, destination)
+                    os._exit(0)
+
+                nddev_kilo_cli.os.link = crash_link
+                with nddev_kilo_cli.product_bootstrap_coordination_lock(create=True):
+                    nddev_kilo_cli.open_bootstrap_lock_file(target, create=True)
+                raise RuntimeError("target anchor publication did not stop after link")
+
+            pid = fork_validation_child("target-crash", workspace, crash_after_target_link)
+            wait_for_process(pid, "target crash-after-link publisher")
+            target_lock = nddev_kilo_cli.bootstrap_lock_file_path(target)
+            target_info = target_lock.lstat()
+            if target_info.st_nlink != 2:
+                fail("target crash-after-link did not leave a two-link final anchor")
+            aliases = machine_publication_aliases(root, target_lock)
+            if len(aliases) != 1:
+                fail("target crash-after-link did not leave exactly one machine temp alias")
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            recovered_info = target_lock.lstat()
+            if (
+                nddev_kilo_cli.identity_of(recovered_info)
+                != nddev_kilo_cli.identity_of(target_info)
+                or recovered_info.st_nlink != 1
+                or machine_publication_aliases(root, target_lock)
+            ):
+                fail("target bootstrap anchor hard-link alias was not safely recovered")
+
+
+def validate_bootstrap_hardlink_alias_fail_closed() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-anchor-alias-deny-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        bootstrap_parent = workspace / "bootstrap"
+        bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(bootstrap_parent):
+            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=True):
+                pass
+            product = nddev_kilo_cli.product_bootstrap_lock_file_path()
+            unknown = product.parent / "unknown-hardlink"
+            os.link(product, unknown)
+
+            def acquire_product_anchor() -> None:
+                with nddev_kilo_cli.product_bootstrap_coordination_lock(
+                    create=False,
+                    shared=True,
+                ):
+                    pass
+
+            expect_manager_error(
+                "unknown product bootstrap hard-link alias",
+                acquire_product_anchor,
+            )
+            unknown.unlink()
+            first = product.parent / f".{product.name}.tmp-a"
+            second = product.parent / f".{product.name}.tmp-b"
+            os.link(product, first)
+            os.link(product, second)
+            expect_manager_error(
+                "multiple product bootstrap hard-link aliases",
+                acquire_product_anchor,
+            )
+
+
+def validate_bootstrap_eexist_waiter_preserves_anchor() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-anchor-eexist-waiter-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        bootstrap_parent = workspace / "bootstrap"
+        bootstrap_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(bootstrap_parent):
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            product = nddev_kilo_cli.product_bootstrap_lock_file_path()
+            target_lock = nddev_kilo_cli.bootstrap_lock_file_path(target)
+            product_before = product.lstat()
+            target_before = target_lock.lstat()
+            original_open_product = nddev_kilo_cli.open_existing_product_bootstrap_lock_file
+            original_open_target = nddev_kilo_cli.open_existing_bootstrap_lock_file
+            stale_product = True
+            stale_target = True
+
+            def stale_product_open(lock_file: Path) -> int:
+                nonlocal stale_product
+                if stale_product:
+                    stale_product = False
+                    raise FileNotFoundError(lock_file)
+                return original_open_product(lock_file)
+
+            def stale_target_open(canonical_target: Path, lock_file: Path) -> int:
+                nonlocal stale_target
+                if stale_target:
+                    stale_target = False
+                    raise FileNotFoundError(lock_file)
+                return original_open_target(canonical_target, lock_file)
+
+            nddev_kilo_cli.open_existing_product_bootstrap_lock_file = stale_product_open
+            try:
+                with nddev_kilo_cli.product_bootstrap_coordination_lock(create=True):
+                    pass
+            finally:
+                nddev_kilo_cli.open_existing_product_bootstrap_lock_file = original_open_product
+            nddev_kilo_cli.open_existing_bootstrap_lock_file = stale_target_open
+            try:
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                    pass
+            finally:
+                nddev_kilo_cli.open_existing_bootstrap_lock_file = original_open_target
+            if stale_product or stale_target:
+                fail("EEXIST waiter did not exercise stale pre-open publication")
+            product_after = product.lstat()
+            target_after = target_lock.lstat()
+            if (
+                nddev_kilo_cli.identity_of(product_after)
+                != nddev_kilo_cli.identity_of(product_before)
+                or product_after.st_nlink != product_before.st_nlink
+                or nddev_kilo_cli.identity_of(target_after)
+                != nddev_kilo_cli.identity_of(target_before)
+                or target_after.st_nlink != target_before.st_nlink
+            ):
+                fail("EEXIST waiter changed an already-published bootstrap anchor")
 
 
 def validate_bootstrap_lock_persistent_inode_handover() -> None:
@@ -3153,6 +3539,44 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
             )
             if residue:
                 fail("remove-cli late fault left staging residue: " + ", ".join(residue))
+
+            before_cleanup_fault = snapshot_object_tree(target)
+            original_cleanup_retry = nddev_kilo_cli.cleanup_transaction_directory_retry
+            cleanup_faults = 0
+
+            def fail_first_remove_cleanup(
+                path: Path,
+                label: str,
+                *,
+                attempts: int = 3,
+            ) -> None:
+                nonlocal cleanup_faults
+                if label == "software removal staging" and cleanup_faults == 0:
+                    del path, attempts
+                    cleanup_faults += 1
+                    raise RuntimeError("injected public remove-cli cleanup fault")
+                original_cleanup_retry(path, label, attempts=attempts)
+
+            nddev_kilo_cli.cleanup_transaction_directory_retry = fail_first_remove_cleanup
+            try:
+                try:
+                    nddev_kilo_cli.remove_cli(target)
+                except RuntimeError as exc:
+                    if "injected public remove-cli cleanup fault" not in str(exc):
+                        fail(f"remove-cli cleanup fault raised the wrong error: {exc}")
+                else:
+                    fail("remove-cli cleanup fault was accepted")
+            finally:
+                nddev_kilo_cli.cleanup_transaction_directory_retry = original_cleanup_retry
+            if cleanup_faults != 1:
+                fail("remove-cli cleanup fault did not exercise the final cleanup window")
+            if snapshot_object_tree(target) != before_cleanup_fault:
+                fail("remove-cli cleanup fault did not restore exact target object identity")
+            residue = sorted(
+                path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-remove.*")
+            )
+            if residue:
+                fail("remove-cli cleanup fault left staging residue: " + ", ".join(residue))
         finally:
             nddev_kilo_cli.find_npm_executable = original_find_npm_executable
             nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
@@ -3359,10 +3783,16 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_release_archive_exact_bytes()
         validate_manager_parse_args()
         validate_python_portability()
+        validate_bootstrap_publication_eexist_preserves_destination()
         validate_launch_guard()
         validate_bootstrap_lock_precreation_guards()
         validate_read_only_bootstrap_no_create_paths()
+        validate_bootstrap_malformed_anchor_does_not_leak_fds()
+        validate_cold_read_retry_and_exception_preservation()
         validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock()
+        validate_bootstrap_hardlink_publication_recovery()
+        validate_bootstrap_hardlink_alias_fail_closed()
+        validate_bootstrap_eexist_waiter_preserves_anchor()
         validate_bootstrap_lock_persistent_inode_handover()
         validate_launch_lock_scope_and_executable_revalidation()
         validate_child_cannot_unlink_persistent_lock()

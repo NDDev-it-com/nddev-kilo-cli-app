@@ -249,6 +249,7 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
     "binding_exact": True,
     "binding_publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
+    "hardlink_publication_alias_recovery": "lock-final-then-unlink-single-machine-temp-alias",
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
     "read_only_anchor_policy": "no-create-product-anchor-and-no-create-target-anchor",
@@ -1313,20 +1314,30 @@ def bootstrap_parent_creation_lock(parent: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
+def require_open_bootstrap_lock_identity(
+    descriptor: int,
+    lock_file: Path,
+    *,
+    allow_publication_alias: bool = False,
+) -> os.stat_result:
     opened = os.fstat(descriptor)
     current = lock_file.lstat()
     if identity_of(opened) != identity_of(current):
         raise ConcurrentTargetChange("bootstrap lifecycle lock file changed after it was opened")
-    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-        fail("bootstrap lifecycle lock file must be a single-link regular file")
+    if not stat.S_ISREG(opened.st_mode):
+        fail("bootstrap lifecycle lock file must be a regular file")
+    if opened.st_nlink != 1 and not (allow_publication_alias and opened.st_nlink == 2):
+        fail("bootstrap lifecycle lock file has unexpected hard-link aliases")
     if not is_owner_only_file(opened):
         fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
     return opened
 
 
 def require_open_product_bootstrap_lock_identity(
-    descriptor: int, lock_file: Path
+    descriptor: int,
+    lock_file: Path,
+    *,
+    allow_publication_alias: bool = False,
 ) -> os.stat_result:
     opened = os.fstat(descriptor)
     current = lock_file.lstat()
@@ -1334,8 +1345,10 @@ def require_open_product_bootstrap_lock_identity(
         raise ConcurrentTargetChange(
             "product bootstrap coordination file changed after it was opened"
         )
-    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-        fail("product bootstrap coordination file must be a single-link regular file")
+    if not stat.S_ISREG(opened.st_mode):
+        fail("product bootstrap coordination file must be a regular file")
+    if opened.st_nlink != 1 and not (allow_publication_alias and opened.st_nlink == 2):
+        fail("product bootstrap coordination file has unexpected hard-link aliases")
     if not is_owner_only_file(opened):
         fail("product bootstrap coordination file must be owned by the current user with mode 0600")
     return opened
@@ -1412,6 +1425,66 @@ def publish_bootstrap_anchor_file(root: Path, path: Path, content: bytes, label:
             remove_path_durable(temporary)
 
 
+def recover_bootstrap_publication_alias(
+    descriptor: int,
+    lock_file: Path,
+    *,
+    label: str,
+    product: bool = False,
+) -> None:
+    if product:
+        opened = require_open_product_bootstrap_lock_identity(
+            descriptor,
+            lock_file,
+            allow_publication_alias=True,
+        )
+    else:
+        opened = require_open_bootstrap_lock_identity(
+            descriptor,
+            lock_file,
+            allow_publication_alias=True,
+        )
+    if opened.st_nlink == 1:
+        return
+    if opened.st_nlink != 2:
+        fail(f"{label} has unknown hard-link aliases")
+    root = lock_file.parent
+    root_info = require_directory(root, f"{label} root")
+    if not is_owner_private_directory(root_info):
+        fail(f"{label} root must be owned by the current user with mode 0700")
+    opened_identity = identity_of(opened)
+    machine_prefix = f".{lock_file.name}.tmp-"
+    machine_aliases: list[Path] = []
+    unknown_aliases: list[Path] = []
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(entries) > 256:
+        fail(f"{label} root contains too many entries for bounded alias recovery")
+    for entry in entries:
+        if entry.name == lock_file.name:
+            continue
+        try:
+            entry_info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(entry_info) != opened_identity:
+            continue
+        if entry.name.startswith(machine_prefix) and stat.S_ISREG(entry_info.st_mode):
+            machine_aliases.append(entry)
+        else:
+            unknown_aliases.append(entry)
+    if unknown_aliases or len(machine_aliases) != 1:
+        fail(f"{label} hard-link alias recovery found an unsafe alias set")
+    alias = machine_aliases[0]
+    alias.unlink()
+    fsync_directory(root, f"{label} root")
+    if product:
+        require_open_product_bootstrap_lock_identity(descriptor, lock_file)
+        validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
+        require_open_product_bootstrap_lock_identity(descriptor, lock_file)
+    else:
+        require_open_bootstrap_lock_identity(descriptor, lock_file)
+
+
 def product_bootstrap_lock_content() -> bytes:
     return canonical_json(PRODUCT_BOOTSTRAP_LOCK_RECORD)
 
@@ -1431,8 +1504,8 @@ def open_existing_product_bootstrap_lock_file(lock_file: Path) -> int:
     info = lock_file.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         fail("product bootstrap coordination file must be a regular file")
-    if info.st_nlink != 1:
-        fail("product bootstrap coordination file must not have hard-link aliases")
+    if info.st_nlink not in {1, 2}:
+        fail("product bootstrap coordination file has unexpected hard-link aliases")
     if not is_owner_only_file(info):
         fail("product bootstrap coordination file must be owned by the current user with mode 0600")
     flags = os.O_RDWR
@@ -1440,14 +1513,21 @@ def open_existing_product_bootstrap_lock_file(lock_file: Path) -> int:
         flags |= os.O_CLOEXEC
     flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_file, flags)
-    opened = os.fstat(descriptor)
-    if identity_of(opened) != identity_of(info):
-        os.close(descriptor)
-        raise ConcurrentTargetChange(
-            "product bootstrap coordination file changed while it was opened"
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            raise ConcurrentTargetChange(
+                "product bootstrap coordination file changed while it was opened"
+            )
+        require_open_product_bootstrap_lock_identity(
+            descriptor,
+            lock_file,
+            allow_publication_alias=True,
         )
-    require_open_product_bootstrap_lock_identity(descriptor, lock_file)
-    validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
+        validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
     return descriptor
 
 
@@ -1499,8 +1579,8 @@ def open_existing_bootstrap_lock_file(target: Path, lock_file: Path) -> int:
     info = lock_file.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         fail("bootstrap lifecycle lock file must be a regular file")
-    if info.st_nlink != 1:
-        fail("bootstrap lifecycle lock file must not have hard-link aliases")
+    if info.st_nlink not in {1, 2}:
+        fail("bootstrap lifecycle lock file has unexpected hard-link aliases")
     if not is_owner_only_file(info):
         fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
     flags = os.O_RDWR
@@ -1508,12 +1588,21 @@ def open_existing_bootstrap_lock_file(target: Path, lock_file: Path) -> int:
         flags |= os.O_CLOEXEC
     flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_file, flags)
-    opened = os.fstat(descriptor)
-    if identity_of(opened) != identity_of(info):
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            raise ConcurrentTargetChange(
+                "bootstrap lifecycle lock file changed while it was opened"
+            )
+        require_open_bootstrap_lock_identity(
+            descriptor,
+            lock_file,
+            allow_publication_alias=True,
+        )
+        validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
+    except BaseException:
         os.close(descriptor)
-        raise ConcurrentTargetChange("bootstrap lifecycle lock file changed while it was opened")
-    require_open_bootstrap_lock_identity(descriptor, lock_file)
-    validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
+        raise
     return descriptor
 
 
@@ -1598,7 +1687,23 @@ def product_bootstrap_coordination_lock(
             yield False
             return
         descriptor = opened
-        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        if shared and os.fstat(descriptor).st_nlink != 1:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            recover_bootstrap_publication_alias(
+                descriptor,
+                product_bootstrap_lock_file_path(),
+                label="product bootstrap coordination file",
+                product=True,
+            )
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            recover_bootstrap_publication_alias(
+                descriptor,
+                product_bootstrap_lock_file_path(),
+                label="product bootstrap coordination file",
+                product=True,
+            )
         acquired = True
         require_open_product_bootstrap_lock_identity(descriptor, product_bootstrap_lock_file_path())
         record = read_bootstrap_lock_record(descriptor)
@@ -1652,6 +1757,11 @@ def bootstrap_lifecycle_lock(
                 descriptor = -1
                 fail(f"target is locked: {bootstrap_lock_file_path(target)}")
             acquired = True
+            recover_bootstrap_publication_alias(
+                descriptor,
+                bootstrap_lock_file_path(target),
+                label="bootstrap lifecycle lock file",
+            )
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             record = read_bootstrap_lock_record(descriptor)
             validate_bootstrap_lock_binding(record, target)
@@ -1673,6 +1783,7 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
     descriptor = -1
     acquired = False
     cold_read = False
+    body_completed = False
     try:
         with product_bootstrap_coordination_lock(create=False, shared=True) as coordinated:
             if not coordinated:
@@ -1682,6 +1793,7 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                     lexical_validated=True,
                 )
                 yield target
+                body_completed = True
                 return
             target = canonical_target_for_bootstrap_lock(
                 lexical_target,
@@ -1690,10 +1802,20 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
             opened = open_bootstrap_lock_file(target, create=False)
             if opened is None:
                 yield target
+                body_completed = True
                 return
             descriptor = opened
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if os.fstat(descriptor).st_nlink != 1:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    recover_bootstrap_publication_alias(
+                        descriptor,
+                        bootstrap_lock_file_path(target),
+                        label="bootstrap lifecycle lock file",
+                    )
+                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
@@ -1701,16 +1823,22 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 descriptor = -1
                 fail(f"target is locked: {bootstrap_lock_file_path(target)}")
             acquired = True
+            recover_bootstrap_publication_alias(
+                descriptor,
+                bootstrap_lock_file_path(target),
+                label="bootstrap lifecycle lock file",
+            )
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
         yield target
+        body_completed = True
     finally:
         if descriptor >= 0:
             if acquired:
                 with contextlib.suppress(OSError):
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
-        if cold_read and product_bootstrap_anchor_exists_no_create():
+        if cold_read and body_completed and product_bootstrap_anchor_exists_no_create():
             raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
 
 
@@ -6141,14 +6269,23 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             "target": str(target),
             "changed": False,
         }
-    staging = Path(
-        tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove.")
-    )
+    staging: Path | None = None
+    hold: Path | None = None
+    moved_old: list[Path] = []
+    expected_state: dict[str, TreeEntry] | None = None
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None] | None = None
+    changed = False
     try:
-        hold = staging / "hold"
-        hold.mkdir(mode=OWNER_DIR_MODE)
-        moved_old: list[Path] = []
         with target_lock(target):
+            staging = Path(
+                tempfile.mkdtemp(
+                    dir=target.parent,
+                    prefix=f".{target.name}.nddev-kilo-cli-remove.",
+                )
+            )
+            staging.chmod(OWNER_DIR_MODE)
+            hold = staging / "hold"
+            hold.mkdir(mode=OWNER_DIR_MODE)
             require_private_target_directory_for_software(target, allow_missing=False)
             validate_existing_software_surface(target)
             validate_owned_software_roots_are_exact(target)
@@ -6156,31 +6293,63 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             expected_object_state = snapshot_software_object_state(target)
             try:
                 moved_old = move_software_roots_to_hold(target, hold)
+                changed = bool(moved_old)
                 final_status = software_status(target)
                 if final_status["software_state"] != "absent":
                     fail("removed Kilo CLI left target-owned software residue")
-            except BaseException:
-                moved_old = held_software_roots(hold)
-                restore_software_roots(
-                    target,
-                    hold,
-                    expected_state=expected_state,
-                    expected_object_state=expected_object_state,
-                )
-                verify_software_object_state(
-                    target,
-                    expected_object_state,
-                    "software removal rollback",
-                )
-                raise
+                cleanup_transaction_directory_retry(staging, "software removal staging")
+                staging = None
+            except BaseException as original:
+                rollback_error: BaseException | None = None
+                cleanup_error: BaseException | None = None
+                moved_old = held_software_roots(hold) if hold is not None else []
+                if (
+                    expected_state is not None
+                    and expected_object_state is not None
+                    and hold is not None
+                ):
+                    try:
+                        restore_software_roots(
+                            target,
+                            hold,
+                            expected_state=expected_state,
+                            expected_object_state=expected_object_state,
+                        )
+                        verify_software_object_state(
+                            target,
+                            expected_object_state,
+                            "software removal rollback",
+                        )
+                    except BaseException as exc:
+                        rollback_error = exc
+                elif expected_state is not None or expected_object_state is not None:
+                    rollback_error = ManagerError("software removal rollback hold is missing")
+                if staging is not None:
+                    try:
+                        cleanup_transaction_directory_retry(staging, "software removal staging")
+                        staging = None
+                    except BaseException as exc:
+                        cleanup_error = exc
+                if rollback_error is not None:
+                    staging = None
+                    raise ManagerError(
+                        "software removal rollback failed after operation error"
+                    ) from rollback_error
+                if cleanup_error is not None:
+                    staging = None
+                    raise ManagerError(
+                        "software removal cleanup failed after rollback"
+                    ) from cleanup_error
+                raise original
         return {
             "schema_version": 1,
             "command": "remove-cli",
             "target": str(target),
-            "changed": bool(moved_old),
+            "changed": changed,
         }
     finally:
-        cleanup_transaction_directory_retry(staging, "software removal staging")
+        if staging is not None:
+            cleanup_transaction_directory_retry(staging, "software removal staging")
 
 
 def require_current_software(target: Path) -> dict[str, Any]:
