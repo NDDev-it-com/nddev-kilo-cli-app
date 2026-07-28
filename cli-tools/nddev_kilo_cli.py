@@ -1732,6 +1732,112 @@ def product_bootstrap_anchor_exists_no_create() -> bool:
     return True
 
 
+def open_existing_bootstrap_lock_file_readonly(target: Path, lock_file: Path) -> os.stat_result:
+    info = lock_file.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lifecycle lock file must be a regular file")
+    if info.st_nlink not in {1, 2}:
+        fail("bootstrap lifecycle lock file has unexpected hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_file, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            raise ConcurrentTargetChange(
+                "bootstrap lifecycle lock file changed while it was opened"
+            )
+        require_open_bootstrap_lock_identity(
+            descriptor,
+            lock_file,
+            allow_publication_alias=True,
+        )
+        validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
+    finally:
+        os.close(descriptor)
+    return info
+
+
+def machine_bootstrap_publication_aliases(
+    root: Path,
+    lock_file: Path,
+    *,
+    final_identity: tuple[int, int] | None = None,
+) -> list[Path]:
+    machine_prefix = f".{lock_file.name}.tmp-"
+    aliases: list[Path] = []
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(entries) > 256:
+        fail("bootstrap lifecycle lock root contains too many entries for bounded inspection")
+    for entry in entries:
+        if entry.name == lock_file.name:
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        entry_identity = identity_of(info)
+        if entry.name.startswith(machine_prefix):
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail("bootstrap lifecycle lock publication alias must be a regular file")
+            if final_identity is not None and entry_identity != final_identity:
+                fail("bootstrap lifecycle lock publication alias identity mismatch")
+            aliases.append(entry)
+            continue
+        if final_identity is not None and entry_identity == final_identity:
+            fail("bootstrap lifecycle lock file has an unknown hard-link alias")
+    return aliases
+
+
+def cold_bootstrap_target_anchor_state(
+    target: Path,
+    *,
+    fail_on_anchor_present: bool,
+) -> tuple[str, tuple[int, int] | None]:
+    if product_bootstrap_anchor_exists_no_create():
+        raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
+    root = bootstrap_lock_root()
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return ("root-absent", None)
+    if stat.S_ISLNK(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must not be a symlink")
+    if not stat.S_ISDIR(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must be a real directory")
+    if not is_owner_private_directory(root_info):
+        fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+    root_identity = identity_of(root_info)
+    lock_file = root / f"{target_binding_sha256(target)}.lock"
+    try:
+        target_info = lock_file.lstat()
+    except FileNotFoundError:
+        if machine_bootstrap_publication_aliases(root, lock_file):
+            if not fail_on_anchor_present:
+                raise BootstrapAnchorAppeared(
+                    "bootstrap lifecycle lock alias appeared during cold read"
+                )
+            fail("bootstrap lifecycle lock publication alias is orphaned without final anchor")
+        return ("target-absent", root_identity)
+    if not fail_on_anchor_present:
+        raise BootstrapAnchorAppeared("bootstrap lifecycle lock file appeared during cold read")
+    target_info = open_existing_bootstrap_lock_file_readonly(target, lock_file)
+    aliases = machine_bootstrap_publication_aliases(
+        root,
+        lock_file,
+        final_identity=identity_of(target_info),
+    )
+    if target_info.st_nlink == 2 and len(aliases) != 1:
+        fail("bootstrap lifecycle lock file has an unsafe publication alias set")
+    if target_info.st_nlink == 1 and aliases:
+        fail("bootstrap lifecycle lock file has a stale publication alias")
+    fail("bootstrap lifecycle lock file is orphaned without product bootstrap coordination")
+
+
 @contextlib.contextmanager
 def bootstrap_lifecycle_lock(
     raw_target: str | Path, *, shared: bool = False, wait: bool = False
@@ -1790,6 +1896,8 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
     acquired = False
     cold_read = False
     body_completed = False
+    cold_state: tuple[str, tuple[int, int] | None] | None = None
+    target: Path | None = None
     try:
         with product_bootstrap_coordination_lock(create=False, shared=True) as coordinated:
             if not coordinated:
@@ -1797,6 +1905,10 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 target = canonical_target_for_bootstrap_lock(
                     lexical_target,
                     lexical_validated=True,
+                )
+                cold_state = cold_bootstrap_target_anchor_state(
+                    target,
+                    fail_on_anchor_present=True,
                 )
                 yield target
                 body_completed = True
@@ -1830,8 +1942,15 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 with contextlib.suppress(OSError):
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
-        if cold_read and body_completed and product_bootstrap_anchor_exists_no_create():
-            raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
+        if cold_read and body_completed:
+            if target is None or cold_state is None:
+                raise BootstrapAnchorAppeared("bootstrap anchor changed during cold read")
+            observed = cold_bootstrap_target_anchor_state(
+                target,
+                fail_on_anchor_present=False,
+            )
+            if observed != cold_state:
+                raise BootstrapAnchorAppeared("bootstrap anchor changed during cold read")
 
 
 def lock_path(target: Path) -> Path:

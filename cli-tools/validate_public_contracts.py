@@ -832,6 +832,27 @@ def validate_python_portability() -> None:
     ]
     if "recover_bootstrap_publication_alias" in read_calls:
         fail("read-only bootstrap lifecycle lock must not recover publication aliases")
+    if "cold_bootstrap_target_anchor_state" not in read_calls:
+        fail("cold read must inspect the target bootstrap anchor without creating state")
+    cold_anchor = functions.get("cold_bootstrap_target_anchor_state")
+    if cold_anchor is None:
+        fail("manager is missing cold_bootstrap_target_anchor_state")
+    cold_source = ast.get_source_segment(manager_source, cold_anchor) or ""
+    for expected in (
+        "product_bootstrap_anchor_exists_no_create",
+        "machine_bootstrap_publication_aliases",
+        "fail_on_anchor_present",
+    ):
+        if expected not in cold_source:
+            fail("cold target anchor inspection omits " + expected)
+    readonly_open = functions.get("open_existing_bootstrap_lock_file_readonly")
+    if readonly_open is None:
+        fail("manager is missing read-only bootstrap anchor opener")
+    readonly_source = ast.get_source_segment(manager_source, readonly_open) or ""
+    if "os.O_RDONLY" not in readonly_source or "os.O_NOFOLLOW" not in readonly_source:
+        fail("read-only bootstrap anchor opener must be no-create and no-follow")
+    if "os.O_RDWR" in readonly_source:
+        fail("read-only bootstrap anchor opener must not request write access")
     cleanup_graph = functions.get("validate_cleanup_graph_record_schema")
     if cleanup_graph is None:
         fail("manager is missing validate_cleanup_graph_record_schema")
