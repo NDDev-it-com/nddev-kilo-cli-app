@@ -2878,36 +2878,37 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
                 fail("software cleanup fault left staging residue: " + ", ".join(residue))
 
             before_remove = snapshot_object_tree(target)
-            original_cleanup_parents = nddev_kilo_cli.cleanup_software_parents
-            cleanup_parent_calls = 0
+            original_status = nddev_kilo_cli.software_status
+            removed_state_observed = False
 
-            def skip_first_parent_cleanup(target_path: Path, *, preserve: set[Path]) -> None:
-                nonlocal cleanup_parent_calls
-                cleanup_parent_calls += 1
-                if cleanup_parent_calls == 1:
-                    return
-                original_cleanup_parents(target_path, preserve=preserve)
+            def fail_after_removed_state(target_path: Path) -> dict[str, Any]:
+                nonlocal removed_state_observed
+                status = original_status(target_path)
+                if status.get("software_state") == "absent":
+                    removed_state_observed = True
+                    raise RuntimeError("injected public late remove-cli fault")
+                return status
 
-            nddev_kilo_cli.cleanup_software_parents = skip_first_parent_cleanup
+            nddev_kilo_cli.software_status = fail_after_removed_state
             try:
                 try:
                     nddev_kilo_cli.remove_cli(target)
-                except nddev_kilo_cli.ManagerError as exc:
-                    if "target-owned software residue" not in str(exc):
-                        fail(f"remove-cli post-move fault raised the wrong error: {exc}")
+                except RuntimeError as exc:
+                    if "injected public late remove-cli fault" not in str(exc):
+                        fail(f"remove-cli late fault raised the wrong error: {exc}")
                 else:
-                    fail("remove-cli post-move fault was accepted")
+                    fail("remove-cli late removed-state fault was accepted")
             finally:
-                nddev_kilo_cli.cleanup_software_parents = original_cleanup_parents
-            if cleanup_parent_calls < 2:
-                fail("remove-cli post-move fault did not exercise rollback cleanup")
+                nddev_kilo_cli.software_status = original_status
+            if not removed_state_observed:
+                fail("remove-cli late fault did not observe removed software state")
             if snapshot_object_tree(target) != before_remove:
-                fail("remove-cli post-move fault did not restore exact target object identity")
+                fail("remove-cli late fault did not restore exact target object identity")
             residue = sorted(
                 path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-remove.*")
             )
             if residue:
-                fail("remove-cli post-move fault left staging residue: " + ", ".join(residue))
+                fail("remove-cli late fault left staging residue: " + ", ".join(residue))
         finally:
             nddev_kilo_cli.find_npm_executable = original_find_npm_executable
             nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata

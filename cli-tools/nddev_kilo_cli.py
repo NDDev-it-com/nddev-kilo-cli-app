@@ -5196,6 +5196,118 @@ def cleanup_software_parents(target: Path, *, preserve: set[Path]) -> None:
         fsync_parent_directory(parent, f"software parent cleanup {parent}")
 
 
+def actual_software_root_paths(target: Path) -> set[Path]:
+    observed: set[Path] = set()
+    for relative in SOFTWARE_PARENT_PATHS:
+        root = target / relative
+        if not path_exists_no_follow(root):
+            continue
+        observed.add(relative)
+        if root.is_symlink() or not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            observed.add(path.relative_to(target))
+            if len(observed) > SOFTWARE_TREE_MAX_PATHS:
+                fail("target-owned Kilo CLI software roots exceed the path limit")
+    return observed
+
+
+def expected_owned_software_root_paths(target: Path) -> set[Path]:
+    expected = set(SOFTWARE_PARENT_PATHS).union(SOFTWARE_REPLACE_PATHS)
+    install_root = target / SOFTWARE_PREFIX_RELATIVE
+    if path_exists_no_follow(install_root):
+        for path in install_root.rglob("*"):
+            expected.add(path.relative_to(target))
+            if len(expected) > SOFTWARE_TREE_MAX_PATHS:
+                fail("target-owned Kilo CLI software roots exceed the path limit")
+    for relative in tuple(expected):
+        current = Path()
+        for part in relative.parts[:-1]:
+            current = current / part
+            expected.add(current)
+    return expected
+
+
+def validate_owned_software_roots_are_exact(target: Path) -> None:
+    extra = sorted(actual_software_root_paths(target) - expected_owned_software_root_paths(target))
+    if extra:
+        fail(
+            "target-owned Kilo CLI software roots contain unmanaged paths: "
+            + ", ".join(str(path) for path in extra[:8])
+        )
+
+
+def move_software_roots_to_hold(target: Path, hold: Path) -> list[Path]:
+    moved: list[Path] = []
+    for relative in sorted(SOFTWARE_PARENT_PATHS, key=lambda item: len(item.parts), reverse=True):
+        source = target / relative
+        if not path_exists_no_follow(source):
+            continue
+        saved = hold / relative
+        move_old_path(source, saved)
+        moved.append(relative)
+    return moved
+
+
+def held_software_roots(hold: Path) -> list[Path]:
+    return [
+        relative for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(hold / relative)
+    ]
+
+
+def software_root_rollback_complete(
+    target: Path,
+    hold: Path,
+    expected_state: dict[str, TreeEntry],
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None],
+) -> bool:
+    for relative in SOFTWARE_PARENT_PATHS:
+        if path_exists_no_follow(hold / relative):
+            return False
+    restore_software_object_metadata(target, expected_object_state)
+    return (
+        snapshot_software_surface_state(target) == expected_state
+        and snapshot_software_object_state(target) == expected_object_state
+    )
+
+
+def restore_software_roots(
+    target: Path,
+    hold: Path,
+    *,
+    expected_state: dict[str, TreeEntry],
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None],
+) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(3):
+        for relative in sorted(
+            SOFTWARE_PARENT_PATHS,
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ):
+            saved = hold / relative
+            if not path_exists_no_follow(saved):
+                continue
+            destination = target / relative
+            try:
+                if path_exists_no_follow(destination):
+                    cleanup_path(destination)
+                move_replace_path(saved, destination)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if software_root_rollback_complete(
+            target,
+            hold,
+            expected_state,
+            expected_object_state,
+        ):
+            return
+    if first_error is not None:
+        raise ManagerError("software root rollback failed") from first_error
+    fail("software root rollback did not restore the exact pre-state")
+
+
 def snapshot_software_surface_state(target: Path) -> dict[str, TreeEntry]:
     snapshot: dict[str, TreeEntry] = {}
     for relative in sorted(
@@ -5726,45 +5838,25 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
         tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove.")
     )
     try:
-        empty_live = staging / "live"
-        empty_live.mkdir(mode=OWNER_DIR_MODE)
         hold = staging / "hold"
         hold.mkdir(mode=OWNER_DIR_MODE)
-        preexisting_parent_paths = {
-            relative
-            for relative in SOFTWARE_PARENT_PATHS
-            if path_exists_no_follow(target / relative)
-        }
         moved_old: list[Path] = []
         with target_lock(target):
             require_private_target_directory_for_software(target, allow_missing=False)
             validate_existing_software_surface(target)
+            validate_owned_software_roots_are_exact(target)
             expected_state = snapshot_software_surface_state(target)
             expected_object_state = snapshot_software_object_state(target)
             try:
-                for relative in SOFTWARE_REPLACE_PATHS:
-                    destination = target / relative
-                    if path_exists_no_follow(destination):
-                        saved = hold / relative
-                        move_old_path(destination, saved)
-                        moved_old.append(relative)
-                cleanup_software_parents(target, preserve=set())
+                moved_old = move_software_roots_to_hold(target, hold)
                 final_status = software_status(target)
                 if final_status["software_state"] != "absent":
                     fail("removed Kilo CLI left target-owned software residue")
             except BaseException:
-                moved_old = [
-                    relative
-                    for relative in SOFTWARE_REPLACE_PATHS
-                    if path_exists_no_follow(hold / relative)
-                ]
-                restore_software_paths(
+                moved_old = held_software_roots(hold)
+                restore_software_roots(
                     target,
                     hold,
-                    empty_live,
-                    moved_old=moved_old,
-                    installed_new=[],
-                    preexisting_parent_paths=preexisting_parent_paths,
                     expected_state=expected_state,
                     expected_object_state=expected_object_state,
                 )
@@ -5781,7 +5873,7 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             "changed": bool(moved_old),
         }
     finally:
-        cleanup_transaction_directory(staging, "software removal staging")
+        cleanup_transaction_directory_retry(staging, "software removal staging")
 
 
 def require_current_software(target: Path) -> dict[str, Any]:
