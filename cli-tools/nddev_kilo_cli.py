@@ -6274,6 +6274,35 @@ def cleanup_tombstone_path(target: Path) -> Path:
     return cleanup_root_path(target) / CLEANUP_TOMBSTONE_NAME
 
 
+def is_unpublished_cleanup_temp(path: Path, final_names: set[str]) -> bool:
+    if not any(path.name.startswith(f".{final_name}.tmp-") for final_name in final_names):
+        return False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and is_owner_only_file(info) and info.st_nlink == 1
+
+
+def remove_unpublished_cleanup_temps(
+    root: Path,
+    *,
+    final_names: set[str],
+    allowed_names: set[str],
+) -> bool:
+    removed = False
+    for entry in sorted(root.iterdir(), key=lambda path: path.name):
+        if entry.name in allowed_names:
+            continue
+        if not is_unpublished_cleanup_temp(entry, final_names):
+            fail("cleanup pending root object set is not exact")
+        entry.unlink()
+        removed = True
+    if removed:
+        fsync_directory(root, f"cleanup pending root {root}")
+    return removed
+
+
 def cleanup_graph_record(
     path: Path,
     relative: str,
@@ -6949,7 +6978,10 @@ def cleanup_intent_content(
 
 
 def read_cleanup_bound_json_file(path: Path, label: str) -> dict[str, Any]:
-    before = path.lstat()
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         fail(f"{label} must be a regular non-symlink file")
     if before.st_size > CLEANUP_JOURNAL_MAX_BYTES:
@@ -7203,7 +7235,62 @@ def cleanup_pending_summary(
 def ensure_no_unknown_cleanup_pending(target: Path) -> None:
     if not path_exists_no_follow(cleanup_root_path(target)):
         return
+    recover_cleanup_prepare_root_only(target)
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return
     validate_cleanup_journal(target, allow_publication_alias=True)
+
+
+def recover_cleanup_prepare_root_only(target: Path) -> None:
+    root = cleanup_root_path(target)
+    if not path_exists_no_follow(root):
+        return
+    if path_exists_no_follow(cleanup_intent_path(target)) or path_exists_no_follow(
+        cleanup_journal_path(target)
+    ):
+        return
+    root_info = require_directory(root, "cleanup pending root")
+    if not is_owner_private_directory(root_info):
+        fail("cleanup pending root must be private to the current user with mode 0700")
+    entries = sorted(root.iterdir(), key=lambda path: path.name)
+    tombstone = cleanup_tombstone_path(target)
+
+    def remove_empty_directory(path: Path, label: str) -> None:
+        try:
+            path.rmdir()
+        except OSError as exc:
+            raise ManagerError(f"{label} is not empty") from exc
+
+    temporary_entries = [entry for entry in entries if entry.name != CLEANUP_TOMBSTONE_NAME]
+    if not entries:
+        remove_empty_directory(root, "cleanup pending root")
+        fsync_parent_directory(root, "cleanup pending parent")
+        return
+    if tombstone not in entries and temporary_entries:
+        remove_unpublished_cleanup_temps(
+            root,
+            final_names={CLEANUP_INTENT_NAME, CLEANUP_JOURNAL_NAME},
+            allowed_names=set(),
+        )
+        remove_empty_directory(root, "cleanup pending root")
+        fsync_parent_directory(root, "cleanup pending parent")
+        return
+    if tombstone not in entries:
+        fail("cleanup pending root object set is not exact")
+    tombstone_info = require_directory(tombstone, "cleanup tombstone")
+    if not is_owner_private_directory(tombstone_info):
+        fail("cleanup tombstone must be private to the current user with mode 0700")
+    if any(tombstone.iterdir()):
+        fail("cleanup tombstone has no recovery authority")
+    remove_unpublished_cleanup_temps(
+        root,
+        final_names={CLEANUP_INTENT_NAME, CLEANUP_JOURNAL_NAME},
+        allowed_names={CLEANUP_TOMBSTONE_NAME},
+    )
+    remove_empty_directory(tombstone, "cleanup tombstone")
+    fsync_directory(root, f"cleanup pending root {root}")
+    remove_empty_directory(root, "cleanup pending root")
+    fsync_parent_directory(root, "cleanup pending parent")
 
 
 def cleanup_record_path_under(root: Path, relative: str) -> Path:
@@ -7274,6 +7361,7 @@ def recover_cleanup_journal_publication_alias(
 
 def remove_cleanup_intent_after_valid_journal(target: Path) -> None:
     if not path_exists_no_follow(cleanup_intent_path(target)):
+        recover_cleanup_prepare_root_only(target)
         return
     recover_cleanup_intent_publication_alias(target, allow_journal_residue=True)
     validate_cleanup_intent(
@@ -7348,8 +7436,14 @@ def recover_cleanup_intent_before_mutation(target: Path) -> None:
         validate_cleanup_journal(target, allow_publication_alias=True)
         return
     if not path_exists_no_follow(cleanup_intent_path(target)):
+        recover_cleanup_prepare_root_only(target)
         return
     recover_cleanup_intent_publication_alias(target)
+    remove_unpublished_cleanup_temps(
+        cleanup_root_path(target),
+        final_names={CLEANUP_JOURNAL_NAME},
+        allowed_names={CLEANUP_INTENT_NAME, CLEANUP_TOMBSTONE_NAME},
+    )
     intent = validate_cleanup_intent(target, allow_publication_alias=False)
     states = [
         cleanup_intent_entry_state(target, entry, index)
@@ -7624,9 +7718,6 @@ def promote_cleanup_tombstone(
     root.chmod(OWNER_DIR_MODE)
     fsync_parent_directory(root, "cleanup pending parent")
     tombstone_root = cleanup_tombstone_path(target)
-    tombstone_root.mkdir(mode=OWNER_DIR_MODE)
-    tombstone_root.chmod(OWNER_DIR_MODE)
-    fsync_directory(root, f"cleanup pending root {root}")
     entries = [
         {
             "kind": kind,
@@ -7642,16 +7733,19 @@ def promote_cleanup_tombstone(
     try:
         intent_entries = cleanup_intent_entries(target, entries, present)
         intent_content = cleanup_intent_content(target, command, intent_entries)
+        intent_publish_issue = publish_cleanup_intent_file(root, intent_content)
+        if intent_publish_issue:
+            recover_cleanup_intent_publication_alias(target)
+        validate_cleanup_intent(target, allow_publication_alias=False)
+        tombstone_root.mkdir(mode=OWNER_DIR_MODE)
+        tombstone_root.chmod(OWNER_DIR_MODE)
+        fsync_directory(root, f"cleanup pending root {root}")
         cleanup_journal_content(
             target,
             command,
             entries,
             projected_cleanup_graph_records(tombstone_root, destinations),
         )
-        intent_publish_issue = publish_cleanup_intent_file(root, intent_content)
-        if intent_publish_issue:
-            recover_cleanup_intent_publication_alias(target)
-        validate_cleanup_intent(target, allow_publication_alias=False)
         for entry, (_kind, source) in zip(entries, present):
             destination_name = entry["tombstone"]
             destination = tombstone_root / destination_name

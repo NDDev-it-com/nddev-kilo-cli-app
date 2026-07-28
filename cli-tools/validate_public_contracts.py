@@ -833,6 +833,10 @@ def validate_python_portability() -> None:
         fail("cleanup journal reader must use the journal serialized-byte bound")
     if "METADATA_MAX_BYTES" in read_journal_source:
         fail("cleanup journal reader must not use the generic metadata byte bound")
+    if "except FileNotFoundError" not in read_journal_source:
+        fail("cleanup journal reader must convert missing files to ManagerError")
+    if "recover_cleanup_prepare_root_only" not in functions:
+        fail("manager must recover exact prepare-only cleanup roots under mutation")
     publish_journal = functions.get("publish_cleanup_journal_file")
     if publish_journal is None:
         fail("manager is missing publish_cleanup_journal_file")
@@ -876,9 +880,15 @@ def validate_python_portability() -> None:
     if '"source": str(source)' in manager_source:
         fail("cleanup intent must not serialize unbound absolute source paths")
     intent_publish_index = promote_source.find("publish_cleanup_intent_file")
+    tombstone_mkdir_index = promote_source.find("tombstone_root.mkdir")
+    projected_bound_index = promote_source.find("projected_cleanup_graph_records")
     first_move_index = promote_source.find("os.replace(source, destination)")
     if intent_publish_index < 0 or first_move_index < 0 or intent_publish_index > first_move_index:
         fail("cleanup tombstone promotion must publish durable intent before source moves")
+    if tombstone_mkdir_index < 0 or tombstone_mkdir_index < intent_publish_index:
+        fail("cleanup tombstone root must not be visible before durable intent")
+    if not (tombstone_mkdir_index < projected_bound_index < first_move_index):
+        fail("cleanup journal builder must preflight projected size after tombstone creation")
     if "allow_intent_residue=True" not in promote_source:
         fail("cleanup journal final validation must tolerate exact intent residue")
     launch_locked = functions.get("_launch_locked")
