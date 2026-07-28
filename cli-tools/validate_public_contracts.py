@@ -41,6 +41,23 @@ REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 EXPECTED_CHANGED_PATH_POLICY = "actual-byte-diff"
+EXPECTED_SETUP_COMMANDS = [
+    "list",
+    "status",
+    "plan",
+    "install",
+    "switch",
+    "update",
+    "migrate",
+    "restore",
+    "remove",
+]
+EXPECTED_SOFTWARE_COMMANDS = [
+    "software-status",
+    "install-cli",
+    "update-cli",
+    "remove-cli",
+]
 EXPECTED_PLATFORM_SCOPE = {
     "supported_hosts": [
         {"id": "macos-arm64", "os": "darwin", "cpu": "arm64", "libc": None, "distribution": None},
@@ -70,7 +87,7 @@ EXPECTED_PLATFORM_SCOPE = {
         "linux-musl",
         "unsupported-architecture",
     ],
-    "reject_before": ["network", "staging", "runtime-launch"],
+    "reject_before": ["target", "lock", "staging", "network", "launch"],
     "vendor_package_preferences": {
         "macos-arm64": ["@kilocode/cli-darwin-arm64"],
         "macos-x64": ["@kilocode/cli-darwin-x64-baseline", "@kilocode/cli-darwin-x64"],
@@ -157,10 +174,11 @@ def validate_versions() -> None:
     if manifest.get("managed_state") != list(MANAGED_FILES):
         fail("manifest managed state list is not synchronized")
     if manifest.get("setup_lifecycle") != {
+        "manager_commands": EXPECTED_SETUP_COMMANDS,
         "plan_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
         "mutation_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
     }:
-        fail("manifest setup lifecycle changed-path policy mismatch")
+        fail("manifest setup lifecycle contract mismatch")
     runtime = manifest.get("runtime", {})
     if runtime.get("lifecycle_lock") != "persistent-flock-held-through-child":
         fail("manifest launch lifecycle lock contract mismatch")
@@ -198,6 +216,8 @@ def validate_versions() -> None:
     if runtime.get("runtime_directories") != expected_runtime_directories:
         fail("manifest runtime directory isolation contract mismatch")
     software = manifest.get("software_lifecycle", {})
+    if software.get("manager_commands") != EXPECTED_SOFTWARE_COMMANDS:
+        fail("manifest software lifecycle command list mismatch")
     if software.get("installer", {}).get("argv") != list(nddev_kilo_cli.NPM_INSTALL_ARGV):
         fail("manifest npm installer argv mismatch")
     installer = software.get("installer", {})
@@ -277,6 +297,9 @@ def validate_contract() -> None:
         fail("permission profiles are not synchronized")
     if setup_system.get("legacy_setup_ids") != list(LEGACY_SETUPS):
         fail("legacy setup ids are not synchronized")
+    expected_lifecycle = [*EXPECTED_SETUP_COMMANDS, *EXPECTED_SOFTWARE_COMMANDS, "launch"]
+    if setup_system.get("lifecycle") != expected_lifecycle:
+        fail("setup lifecycle command list is not synchronized")
     if setup_system.get("plan_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
         fail("plan changed-path policy is not synchronized")
     if setup_system.get("mutation_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
@@ -664,12 +687,28 @@ def release_folded_paths(text: str, key: str) -> list[str]:
 def validate_manager_parse_args() -> None:
     nddev_kilo_cli.parse_args(["list", "--json"])
     nddev_kilo_cli.parse_args(["plan", "--target", "/tmp/nddev-kilo-check", "--json"])
+    nddev_kilo_cli.parse_args(["update", "--target", "/tmp/nddev-kilo-check", "--json"])
     nddev_kilo_cli.parse_args(
         ["switch", "--profile", "safe", "--target", "/tmp/nddev-kilo-check", "--json"]
     )
     nddev_kilo_cli.parse_args(["migrate", "--profile", "safe", "--target", "/tmp/nddev-kilo-check"])
     nddev_kilo_cli.parse_args(["status", "--target", "/tmp/nddev-kilo-check", "--json"])
     nddev_kilo_cli.parse_args(["software-status", "--target", "/tmp/nddev-kilo-check", "--json"])
+    for argv in (
+        ["status", "--json"],
+        ["switch", "--profile", "unsafe", "--target", "/tmp/nddev-kilo-check", "--json"],
+    ):
+        try:
+            with (
+                open(os.devnull, "w", encoding="utf-8") as devnull,
+                contextlib.redirect_stderr(devnull),
+            ):
+                nddev_kilo_cli.parse_args(argv)
+        except nddev_kilo_cli.ManagerError as exc:
+            if "argument error:" not in str(exc):
+                fail(f"argparse failure used unexpected error boundary for {argv}: {exc}")
+        else:
+            fail(f"argparse accepted invalid argv: {argv}")
 
 
 def validate_launch_guard() -> None:
@@ -2303,51 +2342,92 @@ def validate_native_selection_and_wrapper_regressions() -> None:
 
 
 def validate_unsupported_platforms_reject_before_side_effects() -> None:
-    rejected_hosts = (
-        {
+    rejected_hosts = {
+        "linux-musl": {
             "os": "linux",
             "cpu": "x64",
             "libc": "musl",
             "linux_distribution": {"id": "ubuntu", "id_like": [], "version_id": "24.04"},
         },
-        {
+        "non-ubuntu-linux": {
             "os": "linux",
             "cpu": "x64",
             "libc": "glibc",
             "linux_distribution": {"id": "debian", "id_like": [], "version_id": "12"},
         },
-        {"os": "win32", "cpu": "x64", "libc": None, "linux_distribution": None},
-        {"os": "darwin", "cpu": "armv7", "libc": None, "linux_distribution": None},
+        "windows": {"os": "win32", "cpu": "x64", "libc": None, "linux_distribution": None},
+        "unsupported-architecture": {
+            "os": "darwin",
+            "cpu": "armv7",
+            "libc": None,
+            "linux_distribution": None,
+        },
+    }
+    operations = (
+        (
+            "software-status",
+            lambda target: nddev_kilo_cli.software_status_command(target),
+        ),
+        (
+            "install-cli",
+            lambda target: nddev_kilo_cli.install_or_update_cli(target, "install-cli"),
+        ),
+        (
+            "update-cli",
+            lambda target: nddev_kilo_cli.install_or_update_cli(target, "update-cli"),
+        ),
+        ("remove-cli", lambda target: nddev_kilo_cli.remove_cli(target)),
+        ("launch", lambda target: nddev_kilo_cli.launch(target, ["--", "prompt"])),
     )
-    for host in rejected_hosts:
+    for category, host in rejected_hosts.items():
         with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-platform-deny-") as raw:
             root = Path(raw)
-            target = root / "target"
-            before = set(root.iterdir())
+            for command, operation in operations:
+                target = root / f"target-{category}-{command}"
+                before = sorted(path.name for path in root.iterdir())
 
-            def no_stage(*_args: Any, **_kwargs: Any) -> Path:
-                fail("unsupported platform reached staging")
+                def no_lock(*_args: Any, **_kwargs: Any) -> Any:
+                    fail(f"{command} reached bootstrap lock on unsupported {category}")
 
-            def no_network() -> dict[str, Any]:
-                fail("unsupported platform reached network metadata fetch")
+                def no_target_inspection(*_args: Any, **_kwargs: Any) -> bool:
+                    fail(f"{command} inspected target on unsupported {category}")
 
-            original_host_native_platform = nddev_kilo_cli.host_native_platform
-            original_mkdtemp = nddev_kilo_cli.tempfile.mkdtemp
-            original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
-            nddev_kilo_cli.host_native_platform = lambda: dict(host)
-            nddev_kilo_cli.tempfile.mkdtemp = no_stage
-            nddev_kilo_cli.fetch_registry_metadata = no_network
-            try:
-                expect_manager_error(
-                    f"unsupported production platform {host}",
-                    lambda: nddev_kilo_cli.install_or_update_cli(target, "install-cli"),
+                def no_stage(*_args: Any, **_kwargs: Any) -> Path:
+                    fail(f"{command} reached staging on unsupported {category}")
+
+                def no_network() -> dict[str, Any]:
+                    fail(f"{command} reached network metadata fetch on unsupported {category}")
+
+                original_host_native_platform = nddev_kilo_cli.host_native_platform
+                original_bootstrap_lifecycle_lock = nddev_kilo_cli.bootstrap_lifecycle_lock
+                original_private_target = (
+                    nddev_kilo_cli.require_private_target_directory_for_software
                 )
-            finally:
-                nddev_kilo_cli.host_native_platform = original_host_native_platform
-                nddev_kilo_cli.tempfile.mkdtemp = original_mkdtemp
-                nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
-            if set(root.iterdir()) != before:
-                fail(f"unsupported platform changed filesystem before rejection: {host}")
+                original_mkdtemp = nddev_kilo_cli.tempfile.mkdtemp
+                original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
+                nddev_kilo_cli.host_native_platform = lambda: dict(host)
+                nddev_kilo_cli.bootstrap_lifecycle_lock = no_lock
+                nddev_kilo_cli.require_private_target_directory_for_software = no_target_inspection
+                nddev_kilo_cli.tempfile.mkdtemp = no_stage
+                nddev_kilo_cli.fetch_registry_metadata = no_network
+                try:
+                    expect_manager_error(
+                        f"{command} unsupported production platform {category}",
+                        lambda operation=operation, target=target: operation(target),
+                    )
+                finally:
+                    nddev_kilo_cli.host_native_platform = original_host_native_platform
+                    nddev_kilo_cli.bootstrap_lifecycle_lock = original_bootstrap_lifecycle_lock
+                    nddev_kilo_cli.require_private_target_directory_for_software = (
+                        original_private_target
+                    )
+                    nddev_kilo_cli.tempfile.mkdtemp = original_mkdtemp
+                    nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
+                if sorted(path.name for path in root.iterdir()) != before:
+                    fail(
+                        f"{command} left target/lock/stage residue before unsupported "
+                        f"{category} rejection"
+                    )
 
 
 def validate_npm_install_ignores_lifecycle_scripts() -> None:

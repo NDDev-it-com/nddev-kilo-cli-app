@@ -20,8 +20,13 @@ python3 cli-tools/nddev_kilo_cli.py list --json
 python3 cli-tools/nddev_kilo_cli.py status --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py plan --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py update --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py switch --profile safe --target /absolute/kilo-target --json
 ```
+
+`update` refreshes an already installed setup with the installed setup/profile
+identity and follows the same byte-diff postcondition contract as other setup
+mutations. An identical target is a true no-op.
 
 Use `launch` only against an already managed target:
 

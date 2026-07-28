@@ -91,6 +91,7 @@
       "plan",
       "install",
       "switch",
+      "update",
       "migrate",
       "restore",
       "remove",
@@ -227,9 +228,11 @@
         "unsupported-architecture"
       ],
       "reject_before": [
-        "network",
+        "target",
+        "lock",
         "staging",
-        "runtime-launch"
+        "network",
+        "launch"
       ],
       "vendor_package_preferences": {
         "macos-arm64": [

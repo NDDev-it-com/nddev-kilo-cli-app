@@ -409,6 +409,15 @@ class BackupSlotTransaction:
     pre_pool_snapshot: dict[str, TreeEntry] | None
 
 
+@dataclass(frozen=True)
+class SetupMutationPreflight:
+    setup_id: str
+    profile_id: str
+    stamp: dict[str, Any] | None
+    desired: dict[str, bytes | None]
+    changed_paths: list[str]
+
+
 def fail(message: str) -> NoReturn:
     raise ManagerError(message)
 
@@ -2654,69 +2663,135 @@ def desired_for_remove(target: Path) -> dict[str, bytes | None]:
     return desired
 
 
-def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
+def setup_mutation_preflight(
+    target: Path,
+    setup_id: str,
+    profile_id: str | None,
+    operation: str,
+) -> SetupMutationPreflight:
     require_active_setup_id(setup_id)
-    require_profile_id(profile_id)
+    stamp: dict[str, Any] | None
+    selected_profile: str
+    if operation == "install":
+        if profile_id is None:
+            fail("install requires an explicit permission profile")
+        require_profile_id(profile_id)
+        selected_profile = profile_id
+        stamp = read_stamp(target)
+        if stamp is None:
+            preflight_unmanaged_target(target)
+        else:
+            require_clean_installed(target)
+            if not stamp_is_active(stamp):
+                fail("legacy managed state must be migrated or removed before install")
+    elif operation == "switch":
+        if profile_id is None:
+            fail("switch requires an explicit permission profile")
+        require_profile_id(profile_id)
+        selected_profile = profile_id
+        stamp = require_clean_installed(target)
+        if not stamp_is_active(stamp):
+            fail("legacy managed state must be migrated or removed before switch")
+    elif operation == "update":
+        stamp = require_clean_installed(target)
+        if not stamp_is_active(stamp):
+            fail("legacy managed state must be migrated or removed before update")
+        if stamp_setup_id(stamp) != setup_id:
+            fail("setup update cannot change setup id; use switch")
+        selected_profile = stamp_profile_id(stamp) or ""
+        if selected_profile not in profile_ids():
+            fail("managed Kilo setup has an unsupported permission profile")
+    else:
+        fail(f"unsupported mutation operation: {operation}")
+    desired = desired_for_setup(target, setup_id, selected_profile)
+    return SetupMutationPreflight(
+        setup_id=setup_id,
+        profile_id=selected_profile,
+        stamp=stamp,
+        desired=desired,
+        changed_paths=stable_changed_paths_for_desired(target, desired),
+    )
+
+
+def setup_mutation_result(
+    target: Path,
+    operation: str,
+    preflight: SetupMutationPreflight,
+    backup_slot: int | None,
+) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "setup_id": preflight.setup_id,
+        "permission_profile": preflight.profile_id,
+        "target": str(target),
+        "backup_slot": backup_slot,
+        "changed_paths": preflight.changed_paths,
+        "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+    }
+
+
+def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
+        preflight = setup_mutation_preflight(target, setup_id, profile_id, operation)
+        if not preflight.changed_paths:
+            return setup_mutation_result(target, operation, preflight, backup_slot)
         return _mutate_setup_locked(target, setup_id, profile_id, operation, backup_slot)
+
+
+def update_setup(target: Path) -> dict[str, Any]:
+    backup_slot: int | None = None
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        preflight = setup_mutation_preflight(target, DEFAULT_SETUP_ID, None, "update")
+        if not preflight.changed_paths:
+            return setup_mutation_result(target, "update", preflight, backup_slot)
+        return _mutate_setup_locked(
+            target,
+            preflight.setup_id,
+            preflight.profile_id,
+            "update",
+            backup_slot,
+        )
 
 
 def _mutate_setup_locked(
     target: Path,
     setup_id: str,
-    profile_id: str,
+    profile_id: str | None,
     operation: str,
     backup_slot: int | None,
 ) -> dict[str, Any]:
     with target_lock(target, create_parent=(operation == "install")) as transaction:
         ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
-        stamp: dict[str, Any] | None
-        if operation == "install":
-            stamp = read_stamp(target)
-            if stamp is None:
-                preflight_unmanaged_target(target)
-            else:
-                require_clean_installed(target)
-                if not stamp_is_active(stamp):
-                    fail("legacy managed state must be migrated or removed before install")
-        elif operation == "switch":
-            stamp = require_clean_installed(target)
-            if not stamp_is_active(stamp):
-                fail("legacy managed state must be migrated or removed before switch")
-        else:
-            fail(f"unsupported mutation operation: {operation}")
-        desired = desired_for_setup(target, setup_id, profile_id)
-        changed_paths = stable_changed_paths_for_desired(target, desired)
+        preflight = setup_mutation_preflight(target, setup_id, profile_id, operation)
         backup_transactions: list[BackupSlotTransaction] = []
         if (
-            stamp is not None
-            and changed_paths
-            and (stamp_setup_id(stamp) != setup_id or stamp_profile_id(stamp) != profile_id)
+            preflight.stamp is not None
+            and preflight.changed_paths
+            and (
+                operation == "update"
+                or stamp_setup_id(preflight.stamp) != preflight.setup_id
+                or stamp_profile_id(preflight.stamp) != preflight.profile_id
+            )
         ):
-            backup_slot = backup_current_state(target, stamp, transactions=backup_transactions)
-        snapshot = snapshot_path_states(target, set(desired))
+            backup_slot = backup_current_state(
+                target, preflight.stamp, transactions=backup_transactions
+            )
+        snapshot = snapshot_path_states(target, set(preflight.desired))
         try:
             replace_managed_state(
                 target,
-                desired,
+                preflight.desired,
                 snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
-                changed_paths=changed_paths,
+                changed_paths=preflight.changed_paths,
             )
             commit_backup_transactions(backup_transactions)
         except Exception:
             rollback_lifecycle_state(target, snapshot, backup_transactions)
             raise
-    return {
-        "operation": operation,
-        "setup_id": setup_id,
-        "permission_profile": profile_id,
-        "target": str(target),
-        "backup_slot": backup_slot,
-        "changed_paths": changed_paths,
-        "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
-    }
+    return setup_mutation_result(target, operation, preflight, backup_slot)
 
 
 def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -> str:
@@ -4167,6 +4242,13 @@ def software_status(target: Path) -> dict[str, Any]:
     return result
 
 
+def software_status_command(target: Path) -> dict[str, Any]:
+    require_supported_production_platform()
+    with bootstrap_lifecycle_lock(target) as locked_target:
+        target = resolve_target(locked_target, create=False)
+        return software_status(target)
+
+
 def validate_software_parent_destination(target: Path, relative: Path) -> None:
     parent = target / relative
     if not path_exists_no_follow(parent):
@@ -4315,6 +4397,46 @@ def verify_software_surface_state(
 ) -> None:
     if snapshot_software_surface_state(target) != expected:
         fail(f"{label} did not leave exact target-owned software state")
+
+
+def snapshot_software_root_states(target: Path) -> dict[str, dict[str, TreeEntry] | None]:
+    return {
+        relative.as_posix(): snapshot_tree_state(
+            target / relative,
+            f"software root {relative}",
+            max_file_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_tree_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_paths=SOFTWARE_TREE_MAX_PATHS,
+        )
+        for relative in SOFTWARE_PARENT_PATHS
+    }
+
+
+def restore_software_root_states(
+    target: Path,
+    expected: dict[str, dict[str, TreeEntry] | None],
+    label: str,
+) -> None:
+    for relative in sorted(expected, key=lambda item: len(Path(item).parts), reverse=True):
+        root = target / safe_relative_path(relative)
+        restore_tree_snapshot_retry(
+            root,
+            expected[relative],
+            f"{label} {relative}",
+            max_file_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_tree_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_paths=SOFTWARE_TREE_MAX_PATHS,
+        )
+    observed = snapshot_software_root_states(target)
+    if observed != expected:
+        fail(f"{label} did not restore exact target-owned software roots")
+    residue = [
+        relative
+        for relative in SOFTWARE_PARENT_PATHS
+        if expected.get(relative.as_posix()) is None and path_exists_no_follow(target / relative)
+    ]
+    if residue:
+        fail(f"{label} left target-owned software residue: {', '.join(map(str, residue))}")
 
 
 def software_rollback_complete(
@@ -4565,6 +4687,8 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                 "wrapper_sha256": preflight.get("wrapper_sha256"),
             }
     staging: Path | None = None
+    pre_operation_software_roots: dict[str, dict[str, TreeEntry] | None] | None = None
+    published = False
     with target_lock(target, create_parent=(command == "install-cli")) as transaction:
         try:
             ensure_private_directory(
@@ -4594,6 +4718,7 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                         "native_executable": status.get("native_executable"),
                         "wrapper_sha256": status.get("wrapper_sha256"),
                     }
+            pre_operation_software_roots = snapshot_software_root_states(target)
             staging = Path(
                 tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-stage.")
             )
@@ -4604,13 +4729,24 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             chmod_private_tree(live_stage)
             write_stage_software_manifest(live_stage)
             replace_software_state(target, live_stage, staging)
+            published = True
             installation = require_current_software(target)
+            cleanup_transaction_directory(staging, "software staging")
+            staging = None
         except BaseException:
+            if published and pre_operation_software_roots is not None:
+                restore_software_root_states(
+                    target,
+                    pre_operation_software_roots,
+                    "software operation rollback",
+                )
+            if staging is not None:
+                cleanup_transaction_directory(
+                    staging,
+                    "software staging rollback" if published else "software staging",
+                )
             remove_created_target_if_empty(target, target_existed_before)
             raise
-        finally:
-            if staging is not None:
-                cleanup_transaction_directory(staging, "software staging")
     return {
         "schema_version": 1,
         "command": command,
@@ -4625,6 +4761,7 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
 
 
 def remove_cli(target: Path) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _remove_cli_locked(target)
@@ -4852,9 +4989,18 @@ def print_payload(payload: dict[str, Any], *, as_json: bool) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+class ManagerArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        fail(f"argument error: {message}")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage isolated NDDev Kilo Code CLI setups.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = ManagerArgumentParser(description="Manage isolated NDDev Kilo Code CLI setups.")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=ManagerArgumentParser,
+    )
 
     list_parser = subparsers.add_parser("list", help="list available setups")
     list_parser.add_argument("--json", action="store_true")
@@ -4884,6 +5030,10 @@ def build_parser() -> argparse.ArgumentParser:
     switch_parser.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_ids())
     switch_parser.add_argument("--target", required=True)
     switch_parser.add_argument("--json", action="store_true")
+
+    update_parser = subparsers.add_parser("update", help="refresh installed setup content")
+    update_parser.add_argument("--target", required=True)
+    update_parser.add_argument("--json", action="store_true")
 
     migrate_parser = subparsers.add_parser(
         "migrate", help="migrate legacy managed state to nddev-builder setup/profile"
@@ -4945,6 +5095,9 @@ def dispatch(args: argparse.Namespace) -> int:
             mutate_setup(Path(args.target), args.setup, args.profile, "switch"), as_json=args.json
         )
         return 0
+    if args.command == "update":
+        print_payload(update_setup(Path(args.target)), as_json=args.json)
+        return 0
     if args.command == "migrate":
         print_payload(migrate_setup(Path(args.target), args.profile), as_json=args.json)
         return 0
@@ -4955,9 +5108,7 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_setup(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "software-status":
-        with bootstrap_lifecycle_lock(Path(args.target)) as locked_target:
-            target = resolve_target(locked_target, create=False)
-            print_payload(software_status(target), as_json=args.json)
+        print_payload(software_status_command(Path(args.target)), as_json=args.json)
         return 0
     if args.command in {"install-cli", "update-cli"}:
         print_payload(install_or_update_cli(Path(args.target), args.command), as_json=args.json)

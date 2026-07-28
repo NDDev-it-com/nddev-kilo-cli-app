@@ -137,9 +137,11 @@
         "unsupported-architecture"
       ],
       "reject_before": [
-        "network",
+        "target",
+        "lock",
         "staging",
-        "runtime-launch"
+        "network",
+        "launch"
       ],
       "vendor_package_preferences": {
         "macos-arm64": [
@@ -168,6 +170,17 @@
     "safe"
   ],
   "setup_lifecycle": {
+    "manager_commands": [
+      "list",
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "update",
+      "migrate",
+      "restore",
+      "remove"
+    ],
     "plan_changed_paths": "actual-byte-diff",
     "mutation_changed_paths": "actual-byte-diff"
   },

@@ -60,9 +60,14 @@ read-only and lifecycle examples:
 python3 cli-tools/nddev_kilo_cli.py list --json
 python3 cli-tools/nddev_kilo_cli.py plan --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py update --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py software-status --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target -- "implement the task"
 ```
+
+`update` refreshes an already installed setup using the installed setup/profile
+identity. Like other setup mutations, it uses the manager's byte-diff
+postcondition contract; an identical target is a true no-op.
 
 `install-cli` and `update-cli` maintain target-owned CLI software through the
 manager's pinned official-channel install boundary. The volatile package pin,
