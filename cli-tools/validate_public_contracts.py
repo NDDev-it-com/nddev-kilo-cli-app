@@ -804,6 +804,16 @@ def validate_python_portability() -> None:
     ]
     if "recover_bootstrap_publication_alias" in read_calls:
         fail("read-only bootstrap lifecycle lock must not recover publication aliases")
+    cleanup_graph = functions.get("validate_cleanup_graph_records")
+    if cleanup_graph is None:
+        fail("manager is missing validate_cleanup_graph_records")
+    cleanup_graph_source = ast.get_source_segment(manager_source, cleanup_graph) or ""
+    for expected in (
+        "len(graph) > CLEANUP_MAX_PATHS",
+        "total_file_size > CLEANUP_MAX_BYTES",
+    ):
+        if expected not in cleanup_graph_source:
+            fail("cleanup journal graph validation must enforce declared bounds")
 
 
 def validate_bootstrap_publication_eexist_preserves_destination() -> None:

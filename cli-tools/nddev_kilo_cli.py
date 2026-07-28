@@ -6521,7 +6521,10 @@ def validate_cleanup_graph_records(
     graph = journal["graph"]
     if not isinstance(graph, list) or not graph:
         fail("cleanup pending journal graph is invalid")
+    if len(graph) > CLEANUP_MAX_PATHS:
+        fail("cleanup pending journal graph exceeds the bounded path limit")
     records: dict[str, dict[str, Any]] = {}
+    total_file_size = 0
     for index, record in enumerate(graph):
         if not isinstance(record, dict):
             fail(f"cleanup pending journal graph record {index} is invalid")
@@ -6557,6 +6560,10 @@ def validate_cleanup_graph_records(
                 fail(f"cleanup pending journal graph {relative} {key} is invalid")
         if kind == "file" and not is_sha256_hex(record["sha256"]):
             fail(f"cleanup pending journal graph {relative} digest is invalid")
+        if kind == "file":
+            total_file_size += record["size"]
+            if total_file_size > CLEANUP_MAX_BYTES:
+                fail("cleanup pending journal graph exceeds the bounded byte limit")
         records[relative] = record
     if "." not in records:
         fail("cleanup pending journal graph omits the tombstone root")
