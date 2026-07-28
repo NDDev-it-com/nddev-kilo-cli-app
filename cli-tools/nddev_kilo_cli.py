@@ -40,6 +40,7 @@ CATALOG_ROOT = ROOT / "setups"
 PROFILE_ROOT = ROOT / "profiles"
 BASELINE_PATH = ROOT / "references" / "kilo-cli-baseline.json"
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+PYTHON_REQUIRES = ">=3.9"
 PRODUCT_NAME = "nddev-kilo-cli-app"
 STAMP_NAME = "NDDEV-KILO-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-KILO-CLI-BACKUP.json"
@@ -220,6 +221,12 @@ LOCK_OWNER_NAME = "owner.json"
 LOCK_HELD_PARENT_MODE = 0o500
 BOOTSTRAP_LOCK_SCHEMA = 1
 BOOTSTRAP_LOCK_PREFIX = f"{PRODUCT_NAME}-bootstrap-locks"
+PRODUCT_BOOTSTRAP_LOCK_NAME = "product-coordination.lock"
+PRODUCT_BOOTSTRAP_LOCK_RECORD = {
+    "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+    "product_name": PRODUCT_NAME,
+    "coordination": "product-bootstrap",
+}
 BOOTSTRAP_LOCK_MAX_BYTES = 16 * 1024
 FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES = (
     "NDDEV_KILO_BOOTSTRAP_LOCK_ROOT",
@@ -245,6 +252,13 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "release_order": "internal-before-external",
     "child_env_exposed": False,
     "same_uid_tampering_resistant_without_sandbox": False,
+    "coordination_order": [
+        "host",
+        "lexical-target",
+        "product-bootstrap-lock",
+        "canonical-target-bootstrap-lock",
+        "target-inspection",
+    ],
 }
 BOOTSTRAP_LOCK_BINDING_KEYS = frozenset(
     {"schema_version", "product_name", "target", "target_sha256"}
@@ -1102,13 +1116,20 @@ def backup_slot_directory(target: Path, slot: int) -> Path:
     fail(f"backup slot is missing: {slot}")
 
 
-def canonical_target_for_bootstrap_lock(raw: str | Path) -> Path:
+def lexical_target_for_bootstrap_lock(raw: str | Path) -> Path:
     path = Path(raw)
     if not path.is_absolute():
         fail("target must be an absolute path")
     path = Path(os.path.normpath(os.fspath(path)))
     if path.parent == path or not path.name:
         fail("target must name a directory below a real parent")
+    return path
+
+
+def canonical_target_for_bootstrap_lock(
+    raw: str | Path, *, lexical_validated: bool = False
+) -> Path:
+    path = Path(raw) if lexical_validated else lexical_target_for_bootstrap_lock(raw)
     reject_absolute_symlink_ancestors(path.parent)
     try:
         parent = path.parent.resolve(strict=True)
@@ -1162,6 +1183,10 @@ def bootstrap_lock_file_path(target: Path) -> Path:
     return bootstrap_lock_root() / f"{target_binding_sha256(target)}.lock"
 
 
+def product_bootstrap_lock_file_path() -> Path:
+    return bootstrap_lock_root() / PRODUCT_BOOTSTRAP_LOCK_NAME
+
+
 def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
     opened = os.fstat(descriptor)
     current = lock_file.lstat()
@@ -1171,6 +1196,22 @@ def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os
         fail("bootstrap lifecycle lock file must be a single-link regular file")
     if not is_owner_only_file(opened):
         fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+    return opened
+
+
+def require_open_product_bootstrap_lock_identity(
+    descriptor: int, lock_file: Path
+) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    current = lock_file.lstat()
+    if identity_of(opened) != identity_of(current):
+        raise ConcurrentTargetChange(
+            "product bootstrap coordination file changed after it was opened"
+        )
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        fail("product bootstrap coordination file must be a single-link regular file")
+    if not is_owner_only_file(opened):
+        fail("product bootstrap coordination file must be owned by the current user with mode 0600")
     return opened
 
 
@@ -1195,6 +1236,50 @@ def ensure_bootstrap_lock_root() -> Path:
     if not is_owner_private_directory(info):
         fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
     return root
+
+
+def open_product_bootstrap_lock_file() -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("product bootstrap coordination file requires O_NOFOLLOW support")
+    root = ensure_bootstrap_lock_root()
+    lock_file = root / PRODUCT_BOOTSTRAP_LOCK_NAME
+    for _attempt in range(2):
+        try:
+            info = lock_file.lstat()
+        except FileNotFoundError:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
+            except FileExistsError:
+                continue
+            os.fchmod(descriptor, OWNER_FILE_MODE)
+            require_open_product_bootstrap_lock_identity(descriptor, lock_file)
+            return descriptor
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            fail("product bootstrap coordination file must be a regular file")
+        if info.st_nlink != 1:
+            fail("product bootstrap coordination file must not have hard-link aliases")
+        if not is_owner_only_file(info):
+            fail(
+                "product bootstrap coordination file must be owned by the current user with mode 0600"
+            )
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_file, flags)
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            os.close(descriptor)
+            raise ConcurrentTargetChange(
+                "product bootstrap coordination file changed while it was opened"
+            )
+        require_open_product_bootstrap_lock_identity(descriptor, lock_file)
+        return descriptor
+    raise ConcurrentTargetChange("product bootstrap coordination file changed during creation")
 
 
 def open_bootstrap_lock_file(target: Path) -> int:
@@ -1284,32 +1369,87 @@ def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path)
         fail("bootstrap lifecycle lock file target binding mismatch")
 
 
+def validate_product_bootstrap_lock_binding(record: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    if record != PRODUCT_BOOTSTRAP_LOCK_RECORD:
+        fail("product bootstrap coordination file binding mismatch")
+
+
+def write_product_bootstrap_lock_record(descriptor: int) -> None:
+    content = canonical_json(PRODUCT_BOOTSTRAP_LOCK_RECORD)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            fail("product bootstrap coordination file write made no forward progress")
+        offset += written
+    os.ftruncate(descriptor, len(content))
+    os.fsync(descriptor)
+
+
+@contextlib.contextmanager
+def product_bootstrap_coordination_lock() -> Iterator[None]:
+    if fcntl is None:
+        fail("product bootstrap coordination requires fcntl.flock on this platform")
+    descriptor = -1
+    acquired = False
+    try:
+        descriptor = open_product_bootstrap_lock_file()
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        acquired = True
+        require_open_product_bootstrap_lock_identity(descriptor, product_bootstrap_lock_file_path())
+        record = read_bootstrap_lock_record(descriptor)
+        validate_product_bootstrap_lock_binding(record)
+        if record is None:
+            write_product_bootstrap_lock_record(descriptor)
+            require_open_product_bootstrap_lock_identity(
+                descriptor, product_bootstrap_lock_file_path()
+            )
+            validate_product_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor))
+        require_open_product_bootstrap_lock_identity(descriptor, product_bootstrap_lock_file_path())
+        yield
+    finally:
+        if descriptor >= 0:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 @contextlib.contextmanager
 def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
     if fcntl is None:
         fail("bootstrap lifecycle locks require fcntl.flock on this platform")
-    target = canonical_target_for_bootstrap_lock(raw_target)
+    lexical_target = lexical_target_for_bootstrap_lock(raw_target)
     descriptor = -1
     acquired = False
     try:
-        descriptor = open_bootstrap_lock_file(target)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
-                raise
-            os.close(descriptor)
-            descriptor = -1
-            fail(f"target is locked: {bootstrap_lock_file_path(target)}")
-        acquired = True
-        require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
-        record = read_bootstrap_lock_record(descriptor)
-        validate_bootstrap_lock_binding(record, target)
-        if record is None:
-            write_bootstrap_lock_record(descriptor, target)
+        with product_bootstrap_coordination_lock():
+            target = canonical_target_for_bootstrap_lock(
+                lexical_target,
+                lexical_validated=True,
+            )
+            descriptor = open_bootstrap_lock_file(target)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                os.close(descriptor)
+                descriptor = -1
+                fail(f"target is locked: {bootstrap_lock_file_path(target)}")
+            acquired = True
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             record = read_bootstrap_lock_record(descriptor)
             validate_bootstrap_lock_binding(record, target)
+            if record is None:
+                write_bootstrap_lock_record(descriptor, target)
+                require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+                record = read_bootstrap_lock_record(descriptor)
+                validate_bootstrap_lock_binding(record, target)
+                require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
         yield target
     finally:
@@ -2885,8 +3025,9 @@ def write_backup_file(slot_dir: Path, relative: str, content: bytes) -> None:
     fsync_directory(path.parent, f"backup parent {path.parent}")
 
 
-def iter_backup_file_relatives(slot_dir: Path) -> set[str]:
-    relatives: set[str] = set()
+def iter_backup_graph_relatives(slot_dir: Path) -> tuple[set[str], set[str]]:
+    directory_relatives: set[str] = set()
+    file_relatives: set[str] = set()
     for root, directories, files in os.walk(slot_dir):
         root_path = Path(root)
         for directory in directories:
@@ -2896,6 +3037,7 @@ def iter_backup_file_relatives(slot_dir: Path) -> set[str]:
                 fail(f"backup contains unsafe directory: {directory_path}")
             if not is_owner_private_directory(info):
                 fail(f"backup directory must be private to the current user: {directory_path}")
+            directory_relatives.add(directory_path.relative_to(slot_dir).as_posix())
         for filename in files:
             path = root_path / filename
             info = path.lstat()
@@ -2903,7 +3045,17 @@ def iter_backup_file_relatives(slot_dir: Path) -> set[str]:
                 fail(f"backup contains unsafe file: {path}")
             if not is_owner_only_file(info):
                 fail(f"backup file must be owned by the current user with mode 0600: {path}")
-            relatives.add(path.relative_to(slot_dir).as_posix())
+            file_relatives.add(path.relative_to(slot_dir).as_posix())
+    return directory_relatives, file_relatives
+
+
+def expected_backup_directory_relatives(files: set[str]) -> set[str]:
+    relatives: set[str] = set()
+    for relative in files:
+        parent = safe_relative_path(relative).parent
+        while parent != Path("."):
+            relatives.add(parent.as_posix())
+            parent = parent.parent
     return relatives
 
 
@@ -2986,8 +3138,10 @@ def validate_backup_slot_directory(target: Path, slot_dir: Path, slot: int) -> d
     if seen_paths != set(MANAGED_FILES):
         fail("backup managed file path set is not exact")
     expected_files = {BACKUP_NAME, *seen_paths}
-    if iter_backup_file_relatives(slot_dir) != expected_files:
-        fail("backup file set is not exact")
+    expected_directories = expected_backup_directory_relatives(expected_files)
+    observed_directories, observed_files = iter_backup_graph_relatives(slot_dir)
+    if observed_files != expected_files or observed_directories != expected_directories:
+        fail("backup object graph is not exact")
     return envelope
 
 
@@ -3345,6 +3499,10 @@ def setup_mutation_result(
 
 def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
     require_supported_production_platform()
+    require_active_setup_id(setup_id)
+    require_profile_id(profile_id)
+    if operation not in {"install", "switch"}:
+        fail(f"unsupported mutation operation: {operation}")
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
@@ -3430,6 +3588,8 @@ def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -
 
 def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
     require_supported_production_platform()
+    if profile_id is not None:
+        require_profile_id(profile_id)
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         backup_slot: int | None = None
@@ -3484,6 +3644,8 @@ def _migrate_setup_locked(
 
 def restore_setup(target: Path, slot: int) -> dict[str, Any]:
     require_supported_production_platform()
+    if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0 or slot >= MAX_BACKUPS:
+        fail(f"backup slot must be between 0 and {MAX_BACKUPS - 1}")
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _restore_setup_locked(target, slot)
@@ -3594,8 +3756,8 @@ def status_payload(target: Path) -> dict[str, Any]:
 
 def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     require_supported_production_platform()
-    load_setup(setup_id)
-    load_profile(profile_id)
+    require_active_setup_id(setup_id)
+    require_profile_id(profile_id)
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         stamp = read_stamp(target) if target.exists() else None
@@ -5406,6 +5568,8 @@ def cleanup_transaction_directory_retry(path: Path, label: str, *, attempts: int
 
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
     require_supported_production_platform()
+    if command not in {"install-cli", "update-cli"}:
+        fail(f"unsupported software lifecycle command: {command}")
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _install_or_update_cli_locked(target, command)
@@ -5693,15 +5857,18 @@ def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str
 
 def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
     require_supported_production_platform()
+    if timeout_seconds <= 0:
+        fail("launch timeout must be positive")
+    forwarded = normalize_launch_child_args(child_args)
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
-        return _launch_locked(target, child_args, timeout_seconds=timeout_seconds)
+        return _launch_locked(target, forwarded, timeout_seconds=timeout_seconds)
 
 
 def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
     if timeout_seconds <= 0:
         fail("launch timeout must be positive")
-    forwarded = normalize_launch_child_args(child_args)
+    forwarded = list(child_args)
     with target_lock(target):
         stamp = require_active_clean_installed(target)
         installation = require_current_software(target)

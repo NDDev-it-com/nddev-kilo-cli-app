@@ -6,6 +6,7 @@
   "contract": "config/nddev-contract.json",
   "manager": "cli-tools/nddev_kilo_cli.py",
   "validator": "cli-tools/validate_public_contracts.py",
+  "python_requires": ">=3.9",
   "runtime": {
     "command": "kilo",
     "package": "@kilocode/cli",
@@ -36,7 +37,14 @@
       "acquire_order": "external-before-internal",
       "release_order": "internal-before-external",
       "child_env_exposed": false,
-      "same_uid_tampering_resistant_without_sandbox": false
+      "same_uid_tampering_resistant_without_sandbox": false,
+      "coordination_order": [
+        "host",
+        "lexical-target",
+        "product-bootstrap-lock",
+        "canonical-target-bootstrap-lock",
+        "target-inspection"
+      ]
     },
     "lock_file": ".nddev-kilo-cli.lock/lock",
     "lock_file_mode": "0600",

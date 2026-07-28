@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import json
@@ -41,6 +42,7 @@ REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 EXPECTED_CHANGED_PATH_POLICY = "actual-byte-diff"
+EXPECTED_PYTHON_REQUIRES = ">=3.9"
 EXPECTED_SETUP_COMMANDS = [
     "list",
     "status",
@@ -176,6 +178,12 @@ def validate_versions() -> None:
         fail("Kilo CLI package integrity is not synchronized with the manager")
     if version.get("kilo_cli_package_shasum") != nddev_kilo_cli.KILO_PACKAGE_SHASUM:
         fail("Kilo CLI package shasum is not synchronized with the manager")
+    if version.get("python_requires") != EXPECTED_PYTHON_REQUIRES:
+        fail("build version python_requires must include macOS system Python 3.9")
+    if getattr(nddev_kilo_cli, "PYTHON_REQUIRES", None) != EXPECTED_PYTHON_REQUIRES:
+        fail("manager python_requires is not synchronized")
+    if manifest.get("python_requires") != EXPECTED_PYTHON_REQUIRES:
+        fail("manifest python_requires must include macOS system Python 3.9")
     if manifest.get("setups") != list(SETUPS):
         fail("manifest setup list is not synchronized")
     if manifest.get("permission_profiles") != list(PROFILES):
@@ -260,6 +268,9 @@ def validate_contract() -> None:
         fail("public contract top-level keys are not exact")
     if contract.get("contract_version") != 2:
         fail("unexpected public contract version")
+    runtime_compatibility = contract.get("runtime_compatibility", {})
+    if runtime_compatibility.get("python_requires") != EXPECTED_PYTHON_REQUIRES:
+        fail("public contract python_requires must include macOS system Python 3.9")
     runtime_launch = contract.get("runtime_launch", {})
     if runtime_launch.get("subcommand") != ["run"]:
         fail("runtime launch subcommand must be kilo run")
@@ -721,6 +732,20 @@ def validate_manager_parse_args() -> None:
                 fail(f"argparse failure used unexpected error boundary for {argv}: {exc}")
         else:
             fail(f"argparse accepted invalid argv: {argv}")
+
+
+def validate_python_portability() -> None:
+    for path in (
+        MANAGER_PATH,
+        ROOT / "cli-tools" / "validate_public_contracts.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        try:
+            ast.parse(source, filename=str(path), feature_version=(3, 9))
+        except SyntaxError as exc:
+            fail(f"{path.relative_to(ROOT)} is not Python 3.9 syntax-compatible: {exc}")
+    if sys.version_info < (3, 9):
+        fail("validator runtime requires Python 3.9 or newer")
 
 
 def validate_launch_guard() -> None:
@@ -1407,6 +1432,30 @@ def snapshot_tree(root: Path) -> list[tuple[str, str, int, bytes | str | None]]:
     return records
 
 
+def snapshot_object_tree(
+    root: Path,
+) -> list[tuple[str, str, int, int, int, int, bytes | str | None]]:
+    if not root.exists() and not root.is_symlink():
+        return [(".", "absent", 0, 0, 0, 0, None)]
+    records: list[tuple[str, str, int, int, int, int, bytes | str | None]] = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        mode = stat.S_IMODE(info.st_mode)
+        identity = getattr(info, "st_ino", 0)
+        mtime_ns = info.st_mtime_ns
+        size = info.st_size
+        if stat.S_ISLNK(info.st_mode):
+            records.append((relative, "symlink", mode, identity, mtime_ns, size, os.readlink(path)))
+        elif stat.S_ISDIR(info.st_mode):
+            records.append((relative, "directory", mode, identity, mtime_ns, size, None))
+        elif stat.S_ISREG(info.st_mode):
+            records.append((relative, "file", mode, identity, mtime_ns, size, path.read_bytes()))
+        else:
+            records.append((relative, "other", mode, identity, mtime_ns, size, None))
+    return records
+
+
 def without_lifecycle_lock(
     records: list[tuple[str, str, int, bytes | str | None]],
 ) -> list[tuple[str, str, int, bytes | str | None]]:
@@ -1747,6 +1796,18 @@ def validate_backup_schema_and_payload_are_exact_before_restore() -> None:
             fail("backup extra file was accepted")
         if managed_snapshot(target) != before:
             fail("backup extra file mutated target before rejection")
+        extra.unlink()
+
+        extra_empty_dir = slot_dir / "unrecorded-empty-directory"
+        extra_empty_dir.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        try:
+            nddev_kilo_cli.restore_setup(target, 0)
+        except nddev_kilo_cli.ManagerError:
+            pass
+        else:
+            fail("backup extra empty directory was accepted")
+        if managed_snapshot(target) != before:
+            fail("backup extra empty directory mutated target before rejection")
 
 
 def scoped_package_path(root: Path, package: str) -> Path:
@@ -2501,6 +2562,122 @@ def validate_unsupported_platforms_reject_before_side_effects() -> None:
                     )
 
 
+def validate_target_commands_use_two_stage_coordination() -> None:
+    operations = (
+        ("status", lambda target: nddev_kilo_cli.status_payload(target)),
+        (
+            "plan",
+            lambda target: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        ),
+        (
+            "install",
+            lambda target: nddev_kilo_cli.mutate_setup(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                "install",
+            ),
+        ),
+        (
+            "switch",
+            lambda target: nddev_kilo_cli.mutate_setup(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                "switch",
+            ),
+        ),
+        ("update", lambda target: nddev_kilo_cli.update_setup(target)),
+        ("migrate", lambda target: nddev_kilo_cli.migrate_setup(target, None)),
+        ("restore", lambda target: nddev_kilo_cli.restore_setup(target, 0)),
+        ("remove", lambda target: nddev_kilo_cli.remove_setup(target)),
+        ("software-status", lambda target: nddev_kilo_cli.software_status_command(target)),
+        ("install-cli", lambda target: nddev_kilo_cli.install_or_update_cli(target, "install-cli")),
+        ("update-cli", lambda target: nddev_kilo_cli.install_or_update_cli(target, "update-cli")),
+        ("remove-cli", lambda target: nddev_kilo_cli.remove_cli(target)),
+        ("launch", lambda target: nddev_kilo_cli.launch(target, ["--", "prompt"])),
+    )
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-coordination-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        injected_bootstrap = workspace / "bootstrap"
+        injected_bootstrap.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(injected_bootstrap):
+            for command, operation in operations:
+                target = workspace / f"target-{command}"
+                trace: list[str] = []
+                original_host_native_platform = nddev_kilo_cli.host_native_platform
+                original_lexical = nddev_kilo_cli.lexical_target_for_bootstrap_lock
+                original_product_lock = nddev_kilo_cli.product_bootstrap_coordination_lock
+                original_canonical = nddev_kilo_cli.canonical_target_for_bootstrap_lock
+                original_open_bootstrap = nddev_kilo_cli.open_bootstrap_lock_file
+                original_resolve_target = nddev_kilo_cli.resolve_target
+
+                def traced_host() -> dict[str, Any]:
+                    trace.append("host")
+                    return {
+                        "os": "darwin",
+                        "cpu": "arm64",
+                        "libc": None,
+                        "linux_distribution": None,
+                    }
+
+                def traced_lexical(raw_target: str | Path) -> Path:
+                    trace.append("lexical-target")
+                    return original_lexical(raw_target)
+
+                @contextlib.contextmanager
+                def traced_product_lock() -> Any:
+                    trace.append("product-bootstrap-lock")
+                    with original_product_lock():
+                        yield
+
+                def traced_canonical(raw_target: str | Path, **kwargs: Any) -> Path:
+                    trace.append("target-canonicalization")
+                    return original_canonical(raw_target, **kwargs)
+
+                def traced_open_bootstrap(canonical_target: Path) -> int:
+                    trace.append("canonical-target-bootstrap-lock")
+                    return original_open_bootstrap(canonical_target)
+
+                def traced_resolve_target(*_args: Any, **_kwargs: Any) -> Path:
+                    trace.append("target-inspection")
+                    raise nddev_kilo_cli.ManagerError("trace stop before target inspection")
+
+                nddev_kilo_cli.host_native_platform = traced_host
+                nddev_kilo_cli.lexical_target_for_bootstrap_lock = traced_lexical
+                nddev_kilo_cli.product_bootstrap_coordination_lock = traced_product_lock
+                nddev_kilo_cli.canonical_target_for_bootstrap_lock = traced_canonical
+                nddev_kilo_cli.open_bootstrap_lock_file = traced_open_bootstrap
+                nddev_kilo_cli.resolve_target = traced_resolve_target
+                try:
+                    expect_manager_error(
+                        f"{command} stopped at first target inspection",
+                        lambda operation=operation, target=target: operation(target),
+                    )
+                finally:
+                    nddev_kilo_cli.host_native_platform = original_host_native_platform
+                    nddev_kilo_cli.lexical_target_for_bootstrap_lock = original_lexical
+                    nddev_kilo_cli.product_bootstrap_coordination_lock = original_product_lock
+                    nddev_kilo_cli.canonical_target_for_bootstrap_lock = original_canonical
+                    nddev_kilo_cli.open_bootstrap_lock_file = original_open_bootstrap
+                    nddev_kilo_cli.resolve_target = original_resolve_target
+                expected = [
+                    "host",
+                    "lexical-target",
+                    "product-bootstrap-lock",
+                    "target-canonicalization",
+                    "canonical-target-bootstrap-lock",
+                    "target-inspection",
+                ]
+                if trace != expected:
+                    fail(f"{command} target coordination trace mismatch: {trace!r}")
+
+
 def validate_npm_install_ignores_lifecycle_scripts() -> None:
     production, _catalog = nddev_kilo_cli.native_package_matrix()
     host = nddev_kilo_cli.host_native_platform()
@@ -2585,6 +2762,109 @@ def validate_npm_install_ignores_lifecycle_scripts() -> None:
             fail("script-free install wrapper depends on vendor postinstall .kilo")
         if str(nddev_kilo_cli.native_package_binary_relative(selected)) not in wrapper:
             fail("script-free install wrapper does not use the selected native package")
+
+
+def validate_software_cleanup_fault_restores_object_identity() -> None:
+    production, _catalog = nddev_kilo_cli.native_package_matrix()
+    host = nddev_kilo_cli.host_native_platform()
+    selected = nddev_kilo_cli.selected_native_package_name_for_host(host)
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-software-rollback-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = workspace / "target"
+
+        def fake_find_npm_executable() -> tuple[str, tuple[str, ...]]:
+            return "/usr/bin/npm", ("/usr/bin",)
+
+        def fake_fetch_registry_metadata() -> dict[str, Any]:
+            baseline = nddev_kilo_cli.baseline()
+            npm = baseline["npm"]
+            return {
+                "name": nddev_kilo_cli.KILO_PACKAGE,
+                "version": nddev_kilo_cli.KILO_CURRENT_VERSION,
+                "dist": npm["dist"],
+                "scripts": npm["scripts"],
+                "optionalDependencies": expected_optional_native_versions(),
+            }
+
+        def fake_bounded_process(
+            command: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str],
+            timeout: int,
+        ) -> subprocess.CompletedProcess[str]:
+            del env, timeout
+            if "--package-lock-only" in command:
+                write_public_json(cwd / "package-lock.json", valid_package_lock((selected,)))
+            elif "--global" in command and "--prefix" in command:
+                prefix = Path(command[command.index("--prefix") + 1])
+                live_stage = prefix.parents[len(nddev_kilo_cli.SOFTWARE_PREFIX_RELATIVE.parts) - 1]
+                write_fake_cli_package(live_stage)
+                write_fake_native_package(
+                    live_stage,
+                    selected,
+                    production[selected],
+                    b"fake selected native rollback\n",
+                    tree_sitter=True,
+                )
+            else:
+                fail(f"unexpected npm command in software rollback probe: {command}")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        original_find_npm_executable = nddev_kilo_cli.find_npm_executable
+        original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
+        original_bounded_process = nddev_kilo_cli.bounded_process
+        nddev_kilo_cli.find_npm_executable = fake_find_npm_executable
+        nddev_kilo_cli.fetch_registry_metadata = fake_fetch_registry_metadata
+        nddev_kilo_cli.bounded_process = fake_bounded_process
+        try:
+            nddev_kilo_cli.install_or_update_cli(target, "install-cli")
+            manifest_path = target / nddev_kilo_cli.SOFTWARE_MANIFEST_RELATIVE
+            manifest = load_json(manifest_path)
+            manifest["package_version"] = "7.4.15"
+            manifest["version"] = "7.4.15"
+            write_public_json(manifest_path, manifest)
+            before = snapshot_object_tree(target)
+            original_cleanup = nddev_kilo_cli.cleanup_transaction_directory
+            cleanup_calls = 0
+
+            def fail_then_cleanup(path: Path, label: str) -> None:
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                if cleanup_calls <= 2 and label in {
+                    "software staging",
+                    "software staging rollback",
+                }:
+                    raise OSError("injected public software cleanup fault")
+                original_cleanup(path, label)
+
+            nddev_kilo_cli.cleanup_transaction_directory = fail_then_cleanup
+            try:
+                try:
+                    nddev_kilo_cli.install_or_update_cli(target, "update-cli")
+                except OSError as exc:
+                    if "injected public software cleanup fault" not in str(exc):
+                        fail(f"software cleanup fault raised the wrong OSError: {exc}")
+                except nddev_kilo_cli.ManagerError:
+                    pass
+                else:
+                    fail("post-publish software cleanup fault was accepted")
+            finally:
+                nddev_kilo_cli.cleanup_transaction_directory = original_cleanup
+            if cleanup_calls < 3:
+                fail("software cleanup fault did not exercise retrying cleanup")
+            if snapshot_object_tree(target) != before:
+                fail("software cleanup fault did not restore exact target object identity")
+            residue = sorted(
+                path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-stage.*")
+            )
+            if residue:
+                fail("software cleanup fault left staging residue: " + ", ".join(residue))
+        finally:
+            nddev_kilo_cli.find_npm_executable = original_find_npm_executable
+            nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
+            nddev_kilo_cli.bounded_process = original_bounded_process
 
 
 def validate_wrong_platform_native_regression() -> None:
@@ -2788,6 +3068,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_workflows()
         validate_release_archive_exact_bytes()
         validate_manager_parse_args()
+        validate_python_portability()
         validate_launch_guard()
         validate_bootstrap_lock_precreation_guards()
         validate_bootstrap_lock_persistent_inode_handover()
@@ -2804,7 +3085,9 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_package_lock_regressions()
         validate_native_selection_and_wrapper_regressions()
         validate_unsupported_platforms_reject_before_side_effects()
+        validate_target_commands_use_two_stage_coordination()
         validate_npm_install_ignores_lifecycle_scripts()
+        validate_software_cleanup_fault_restores_object_identity()
         validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()

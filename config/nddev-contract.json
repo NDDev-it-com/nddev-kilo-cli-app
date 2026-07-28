@@ -7,6 +7,7 @@
     "current_version": "7.4.16",
     "minimum_version": "7.4.16",
     "package": "@kilocode/cli",
+    "python_requires": ">=3.9",
     "official_source": {
       "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
       "repository": "https://github.com/Kilo-Org/kilocode",
@@ -52,7 +53,14 @@
       "acquire_order": "external-before-internal",
       "release_order": "internal-before-external",
       "child_env_exposed": false,
-      "same_uid_tampering_resistant_without_sandbox": false
+      "same_uid_tampering_resistant_without_sandbox": false,
+      "coordination_order": [
+        "host",
+        "lexical-target",
+        "product-bootstrap-lock",
+        "canonical-target-bootstrap-lock",
+        "target-inspection"
+      ]
     },
     "lock_file": ".nddev-kilo-cli.lock/lock",
     "lock_file_mode": "0600",
