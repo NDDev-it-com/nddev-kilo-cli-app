@@ -223,6 +223,7 @@ CLEANUP_MAX_PATHS = SOFTWARE_TREE_MAX_PATHS + MAX_BACKUPS * (len(MANAGED_FILES) 
 CLEANUP_MAX_BYTES = SOFTWARE_TREE_MAX_BYTES + MAX_BACKUPS * (
     (len(MANAGED_FILES) + 1) * MANAGED_PAYLOAD_MAX_BYTES
 )
+CLEANUP_JOURNAL_MAX_BYTES = 8 * 1024 * 1024
 LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 LOCK_FILE_NAME = "lock"
 LOCK_OWNER_NAME = "owner.json"
@@ -299,6 +300,7 @@ CLEANUP_JOURNAL_CONTRACT = {
     "pending_noop_policy": "drain-is-lifecycle-work",
     "max_paths": CLEANUP_MAX_PATHS,
     "max_bytes": CLEANUP_MAX_BYTES,
+    "serialized_max_bytes": CLEANUP_JOURNAL_MAX_BYTES,
 }
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
@@ -6263,6 +6265,42 @@ def cleanup_tombstone_path(target: Path) -> Path:
     return cleanup_root_path(target) / CLEANUP_TOMBSTONE_NAME
 
 
+def cleanup_graph_record(
+    path: Path,
+    relative: str,
+    path_counter: dict[str, int],
+    byte_counter: dict[str, int],
+) -> dict[str, Any]:
+    path_counter["value"] += 1
+    if path_counter["value"] > CLEANUP_MAX_PATHS:
+        fail("cleanup tombstone exceeds the bounded path limit")
+    info = path.lstat()
+    record: dict[str, Any] = {
+        "path": relative,
+        "uid": owner_of(info),
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+    }
+    if stat.S_ISLNK(info.st_mode):
+        fail(f"cleanup tombstone must not contain symlinks: {path}")
+    if stat.S_ISDIR(info.st_mode):
+        record["kind"] = "directory"
+        if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+            fail(f"cleanup tombstone directory is not owned by the current user: {path}")
+        return record
+    if stat.S_ISREG(info.st_mode):
+        record["kind"] = "file"
+        record["sha256"] = digest_regular_file(path, f"cleanup tombstone {relative}", byte_counter)
+        if byte_counter["value"] > CLEANUP_MAX_BYTES:
+            fail("cleanup tombstone exceeds the bounded byte limit")
+        return record
+    fail(f"cleanup tombstone contains unsupported path type: {path}")
+
+
 def cleanup_graph_records(root: Path) -> list[dict[str, Any]]:
     require_directory(root, "cleanup tombstone")
     records: list[dict[str, Any]] = []
@@ -6270,36 +6308,7 @@ def cleanup_graph_records(root: Path) -> list[dict[str, Any]]:
     byte_counter = {"value": 0}
 
     def add_record(path: Path, relative: str) -> None:
-        path_counter["value"] += 1
-        if path_counter["value"] > CLEANUP_MAX_PATHS:
-            fail("cleanup tombstone exceeds the bounded path limit")
-        info = path.lstat()
-        record: dict[str, Any] = {
-            "path": relative,
-            "uid": owner_of(info),
-            "mode": stat.S_IMODE(info.st_mode),
-            "dev": info.st_dev,
-            "ino": info.st_ino,
-            "mtime_ns": info.st_mtime_ns,
-            "nlink": info.st_nlink,
-            "size": info.st_size,
-        }
-        if stat.S_ISLNK(info.st_mode):
-            fail(f"cleanup tombstone must not contain symlinks: {path}")
-        elif stat.S_ISDIR(info.st_mode):
-            record["kind"] = "directory"
-            if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
-                fail(f"cleanup tombstone directory is not owned by the current user: {path}")
-        elif stat.S_ISREG(info.st_mode):
-            record["kind"] = "file"
-            record["sha256"] = digest_regular_file(
-                path, f"cleanup tombstone {relative}", byte_counter
-            )
-            if byte_counter["value"] > CLEANUP_MAX_BYTES:
-                fail("cleanup tombstone exceeds the bounded byte limit")
-        else:
-            fail(f"cleanup tombstone contains unsupported path type: {path}")
-        records.append(record)
+        records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
 
     add_record(root, ".")
     for current, directories, files in os.walk(root):
@@ -6312,6 +6321,48 @@ def cleanup_graph_records(root: Path) -> list[dict[str, Any]]:
         for filename in files:
             path = current_path / filename
             add_record(path, path.relative_to(root).as_posix())
+    return records
+
+
+def projected_cleanup_root_record(root: Path) -> dict[str, Any]:
+    info = require_directory(root, "cleanup tombstone")
+    max_identity = (1 << 64) - 1
+    return {
+        "path": ".",
+        "uid": owner_of(info),
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": max(info.st_dev, max_identity),
+        "ino": max(info.st_ino, max_identity),
+        "mtime_ns": max(info.st_mtime_ns, max_identity),
+        "nlink": max(info.st_nlink, CLEANUP_MAX_PATHS + 2),
+        "size": max(info.st_size, max_identity),
+        "kind": "directory",
+    }
+
+
+def projected_cleanup_graph_records(
+    tombstone_root: Path,
+    destinations: list[tuple[str, Path]],
+) -> list[dict[str, Any]]:
+    records = [projected_cleanup_root_record(tombstone_root)]
+    path_counter = {"value": 1}
+    byte_counter = {"value": 0}
+    for destination_name, source in destinations:
+        records.append(cleanup_graph_record(source, destination_name, path_counter, byte_counter))
+        if not source.is_dir():
+            continue
+        for current, directories, files in os.walk(source):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for directory in directories:
+                path = current_path / directory
+                relative = Path(destination_name, path.relative_to(source)).as_posix()
+                records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
+            for filename in files:
+                path = current_path / filename
+                relative = Path(destination_name, path.relative_to(source)).as_posix()
+                records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
     return records
 
 
@@ -6596,10 +6647,47 @@ def validate_cleanup_graph_records(
     return records
 
 
+def ensure_cleanup_journal_serialized_bound(content: bytes) -> None:
+    if len(content) > CLEANUP_JOURNAL_MAX_BYTES:
+        fail("cleanup pending journal exceeds the serialized byte limit")
+
+
+def cleanup_journal_document(
+    target: Path,
+    command: str,
+    entries: list[dict[str, str]],
+    graph: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": CLEANUP_SCHEMA,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "target": str(target),
+        "command": command,
+        "root": CLEANUP_RELATIVE.as_posix(),
+        "tombstone": CLEANUP_TOMBSTONE_NAME,
+        "entries": entries,
+        "graph": graph,
+    }
+
+
+def cleanup_journal_content(
+    target: Path,
+    command: str,
+    entries: list[dict[str, str]],
+    graph: list[dict[str, Any]],
+) -> bytes:
+    content = canonical_json(cleanup_journal_document(target, command, entries, graph))
+    ensure_cleanup_journal_serialized_bound(content)
+    return content
+
+
 def read_cleanup_journal_file(path: Path) -> dict[str, Any]:
     before = path.lstat()
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         fail("cleanup pending journal must be a regular non-symlink file")
+    if before.st_size > CLEANUP_JOURNAL_MAX_BYTES:
+        fail("cleanup pending journal exceeds the serialized byte limit")
     if before.st_nlink not in {1, 2}:
         fail("cleanup pending journal has unexpected hard-link aliases")
     if not is_owner_only_file(before):
@@ -6614,9 +6702,8 @@ def read_cleanup_journal_file(path: Path) -> dict[str, Any]:
         opened = os.fstat(descriptor)
         if identity_of(opened) != identity_of(before):
             raise ConcurrentTargetChange("cleanup pending journal changed while it was opened")
-        content = os.read(descriptor, METADATA_MAX_BYTES + 1)
-        if len(content) > METADATA_MAX_BYTES:
-            fail("cleanup pending journal exceeds the bounded read limit")
+        content = os.read(descriptor, CLEANUP_JOURNAL_MAX_BYTES + 1)
+        ensure_cleanup_journal_serialized_bound(content)
     finally:
         os.close(descriptor)
     return parse_json_object(content, "cleanup pending journal")
@@ -6655,6 +6742,7 @@ def validate_cleanup_journal(
         },
         "cleanup pending journal",
     )
+    ensure_cleanup_journal_serialized_bound(canonical_json(journal))
     if journal["schema_version"] != CLEANUP_SCHEMA:
         fail("cleanup pending journal schema is unsupported")
     if journal["product_name"] != PRODUCT_NAME or journal["build_version"] != VERSION:
@@ -6709,6 +6797,7 @@ def cleanup_pending_payload(
         "command": journal["command"],
         "max_paths": CLEANUP_MAX_PATHS,
         "max_bytes": CLEANUP_MAX_BYTES,
+        "serialized_max_bytes": CLEANUP_JOURNAL_MAX_BYTES,
     }
 
 
@@ -6816,6 +6905,7 @@ def drain_cleanup_pending(target: Path) -> tuple[bool, bool]:
 
 
 def publish_cleanup_journal_file(root: Path, content: bytes) -> bool:
+    ensure_cleanup_journal_serialized_bound(content)
     journal = root / CLEANUP_JOURNAL_NAME
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{CLEANUP_JOURNAL_NAME}.tmp-",
@@ -6868,11 +6958,27 @@ def promote_cleanup_tombstone(
     root.chmod(OWNER_DIR_MODE)
     tombstone_root = cleanup_tombstone_path(target)
     tombstone_root.mkdir(mode=OWNER_DIR_MODE)
+    entries = [
+        {
+            "kind": kind,
+            "tombstone": f"{index}-{kind}",
+        }
+        for index, (kind, _source) in enumerate(present)
+    ]
+    destinations = [
+        (entry["tombstone"], source) for entry, (_kind, source) in zip(entries, present)
+    ]
     moved: list[dict[str, str]] = []
     source_by_tombstone: dict[str, Path] = {}
     try:
-        for index, (kind, source) in enumerate(present):
-            destination_name = f"{index}-{kind}"
+        cleanup_journal_content(
+            target,
+            command,
+            entries,
+            projected_cleanup_graph_records(tombstone_root, destinations),
+        )
+        for entry, (_kind, source) in zip(entries, present):
+            destination_name = entry["tombstone"]
             destination = tombstone_root / destination_name
             if path_exists_no_follow(destination):
                 fail("cleanup tombstone destination already exists")
@@ -6881,25 +6987,15 @@ def promote_cleanup_tombstone(
             fsync_directory(tombstone_root, f"cleanup tombstone {tombstone_root}")
             if path_exists_no_follow(source_parent):
                 fsync_directory(source_parent, f"cleanup source parent {source_parent}")
-            moved.append(
-                {
-                    "kind": kind,
-                    "tombstone": destination_name,
-                }
-            )
+            moved.append(entry)
             source_by_tombstone[destination_name] = source
-        journal = {
-            "schema_version": CLEANUP_SCHEMA,
-            "product_name": PRODUCT_NAME,
-            "build_version": VERSION,
-            "target": str(target),
-            "command": command,
-            "root": CLEANUP_RELATIVE.as_posix(),
-            "tombstone": CLEANUP_TOMBSTONE_NAME,
-            "entries": moved,
-            "graph": cleanup_graph_records(tombstone_root),
-        }
-        post_publish_issue = publish_cleanup_journal_file(root, canonical_json(journal))
+        content = cleanup_journal_content(
+            target,
+            command,
+            moved,
+            cleanup_graph_records(tombstone_root),
+        )
+        post_publish_issue = publish_cleanup_journal_file(root, content)
         if post_publish_issue:
             return True
         validate_cleanup_journal(target)

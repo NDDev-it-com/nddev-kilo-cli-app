@@ -223,7 +223,8 @@
       "top_level_cleanup_pending": true,
       "pending_noop_policy": "drain-is-lifecycle-work",
       "max_paths": 121328,
-      "max_bytes": 1356857344
+      "max_bytes": 1356857344,
+      "serialized_max_bytes": 8388608
     },
     "plan_changed_paths": "actual-byte-diff",
     "mutation_changed_paths": "actual-byte-diff"

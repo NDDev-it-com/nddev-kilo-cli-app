@@ -814,6 +814,32 @@ def validate_python_portability() -> None:
     ):
         if expected not in cleanup_graph_source:
             fail("cleanup journal graph validation must enforce declared bounds")
+    read_journal = functions.get("read_cleanup_journal_file")
+    if read_journal is None:
+        fail("manager is missing read_cleanup_journal_file")
+    read_journal_source = ast.get_source_segment(manager_source, read_journal) or ""
+    if "CLEANUP_JOURNAL_MAX_BYTES" not in read_journal_source:
+        fail("cleanup journal reader must use the journal serialized-byte bound")
+    if "METADATA_MAX_BYTES" in read_journal_source:
+        fail("cleanup journal reader must not use the generic metadata byte bound")
+    publish_journal = functions.get("publish_cleanup_journal_file")
+    if publish_journal is None:
+        fail("manager is missing publish_cleanup_journal_file")
+    publish_journal_calls = [
+        dotted_name(node.func) for node in ast.walk(publish_journal) if isinstance(node, ast.Call)
+    ]
+    if "ensure_cleanup_journal_serialized_bound" not in publish_journal_calls:
+        fail("cleanup journal writer must enforce the serialized-byte bound")
+    promote_cleanup = functions.get("promote_cleanup_tombstone")
+    if promote_cleanup is None:
+        fail("manager is missing promote_cleanup_tombstone")
+    promote_calls = [
+        dotted_name(node.func) for node in ast.walk(promote_cleanup) if isinstance(node, ast.Call)
+    ]
+    if "projected_cleanup_graph_records" not in promote_calls:
+        fail("cleanup journal builder must preflight projected serialized size")
+    if "cleanup_journal_content" not in promote_calls:
+        fail("cleanup journal builder must share the serialized-byte bound")
 
 
 def validate_bootstrap_publication_eexist_preserves_destination() -> None:
