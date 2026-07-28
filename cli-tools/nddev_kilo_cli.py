@@ -436,8 +436,9 @@ class BackupSlotTransaction:
     pool: Path
     slot_dir: Path
     previous_dir: Path | None
+    temporary_dir: Path
     created_pool: bool
-    pre_pool_snapshot: dict[str, TreeEntry] | None
+    pre_pool_snapshot: dict[str, ObjectEntry] | None
 
 
 @dataclass(frozen=True)
@@ -3149,8 +3150,8 @@ def backup_tree_max_bytes() -> int:
     return MAX_BACKUPS * ((len(MANAGED_FILES) + 1) * MANAGED_PAYLOAD_MAX_BYTES)
 
 
-def snapshot_backup_pool(pool: Path) -> dict[str, TreeEntry] | None:
-    return snapshot_tree_state(
+def snapshot_backup_pool(pool: Path) -> dict[str, ObjectEntry] | None:
+    return snapshot_object_tree_state(
         pool,
         "backup pool",
         max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
@@ -3159,8 +3160,18 @@ def snapshot_backup_pool(pool: Path) -> dict[str, TreeEntry] | None:
     )
 
 
-def restore_backup_pool_snapshot(pool: Path, snapshot: dict[str, TreeEntry] | None) -> None:
-    restore_tree_snapshot_retry(
+def restore_backup_pool_snapshot(pool: Path, snapshot: dict[str, ObjectEntry] | None) -> None:
+    if snapshot is None:
+        remove_path_durable_retry(pool, "backup pool")
+        return
+    if path_exists_no_follow(pool):
+        restore_object_metadata(pool, snapshot)
+    if not backup_pool_matches(pool, snapshot):
+        fail("backup pool did not restore exact object pre-state")
+
+
+def backup_pool_matches(pool: Path, snapshot: dict[str, ObjectEntry] | None) -> bool:
+    return object_tree_state_matches(
         pool,
         snapshot,
         "backup pool",
@@ -3170,15 +3181,23 @@ def restore_backup_pool_snapshot(pool: Path, snapshot: dict[str, TreeEntry] | No
     )
 
 
-def backup_pool_matches(pool: Path, snapshot: dict[str, TreeEntry] | None) -> bool:
-    return tree_state_matches(
-        pool,
-        snapshot,
-        "backup pool",
-        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
-        max_tree_bytes=backup_tree_max_bytes(),
-        max_paths=MAX_BACKUPS * (len(MANAGED_FILES) * 4 + 16),
-    )
+def rollback_backup_transaction_paths(transaction: BackupSlotTransaction) -> None:
+    if transaction.pre_pool_snapshot is None:
+        remove_path_durable_retry(transaction.pool, "backup pool")
+        return
+    remove_path_durable_retry(transaction.temporary_dir, "backup temporary slot")
+    if transaction.previous_dir is not None and path_exists_no_follow(transaction.previous_dir):
+        if path_exists_no_follow(transaction.slot_dir):
+            remove_path_durable_retry(
+                transaction.slot_dir, f"published backup slot {transaction.slot}"
+            )
+        os.replace(transaction.previous_dir, transaction.slot_dir)
+        fsync_directory(transaction.pool, f"backup pool {transaction.pool}")
+    elif str(transaction.slot) not in transaction.pre_pool_snapshot and path_exists_no_follow(
+        transaction.slot_dir
+    ):
+        remove_path_durable_retry(transaction.slot_dir, f"new backup slot {transaction.slot}")
+    restore_backup_pool_snapshot(transaction.pool, transaction.pre_pool_snapshot)
 
 
 def backup_transaction_residue(pool: Path) -> list[str]:
@@ -3193,6 +3212,7 @@ def backup_transaction_residue(pool: Path) -> list[str]:
 
 def commit_backup_transactions(transactions: list[BackupSlotTransaction]) -> None:
     for transaction in transactions:
+        fsync_directory(transaction.pool, f"backup pool {transaction.pool}")
         if transaction.previous_dir is not None:
             remove_path_durable_retry(
                 transaction.previous_dir,
@@ -3211,7 +3231,7 @@ def rollback_backup_transactions(transactions: list[BackupSlotTransaction]) -> N
         restored = False
         for _attempt in range(3):
             try:
-                restore_backup_pool_snapshot(transaction.pool, transaction.pre_pool_snapshot)
+                rollback_backup_transaction_paths(transaction)
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
@@ -3293,7 +3313,6 @@ def backup_current_state(
         fail("backup pool must be private to the current user with mode 0700")
     slot = choose_backup_slot(pool)
     slot_dir = pool / str(slot)
-    previous_dir: Path | None = None
     if slot_dir.exists():
         info = slot_dir.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
@@ -3306,6 +3325,16 @@ def backup_current_state(
         shutil.rmtree(temporary)
     if hold.exists():
         shutil.rmtree(hold)
+    transaction = BackupSlotTransaction(
+        target,
+        slot,
+        pool,
+        slot_dir,
+        None,
+        temporary,
+        created_pool,
+        pre_pool_snapshot,
+    )
     temporary.mkdir(mode=OWNER_DIR_MODE)
     try:
         stamp_content = read_regular_file(stamp_path(target), "target stamp")
@@ -3337,26 +3366,17 @@ def backup_current_state(
         validate_backup_slot_directory(target, temporary, slot)
         if slot_dir.exists():
             os.replace(slot_dir, hold)
-            previous_dir = hold
+            transaction.previous_dir = hold
             fsync_directory(pool, f"backup pool {pool}")
         os.replace(temporary, slot_dir)
         fsync_directory(pool, f"backup pool {pool}")
-        transaction = BackupSlotTransaction(
-            target,
-            slot,
-            pool,
-            slot_dir,
-            previous_dir,
-            created_pool,
-            pre_pool_snapshot,
-        )
         if transactions is None:
             commit_backup_transactions([transaction])
         else:
             transactions.append(transaction)
         return slot
     except BaseException:
-        restore_backup_pool_snapshot(pool, pre_pool_snapshot)
+        rollback_backup_transactions([transaction])
         raise
 
 
@@ -5720,6 +5740,7 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             require_private_target_directory_for_software(target, allow_missing=False)
             validate_existing_software_surface(target)
             expected_state = snapshot_software_surface_state(target)
+            expected_object_state = snapshot_software_object_state(target)
             try:
                 for relative in SOFTWARE_REPLACE_PATHS:
                     destination = target / relative
@@ -5745,6 +5766,12 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
                     installed_new=[],
                     preexisting_parent_paths=preexisting_parent_paths,
                     expected_state=expected_state,
+                    expected_object_state=expected_object_state,
+                )
+                verify_software_object_state(
+                    target,
+                    expected_object_state,
+                    "software removal rollback",
                 )
                 raise
         return {

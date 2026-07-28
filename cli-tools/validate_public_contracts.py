@@ -1808,6 +1808,21 @@ def validate_backup_schema_and_payload_are_exact_before_restore() -> None:
             fail("backup extra empty directory was accepted")
         if managed_snapshot(target) != before:
             fail("backup extra empty directory mutated target before rejection")
+        extra_empty_dir.rmdir()
+
+        pool = nddev_kilo_cli.backup_pool(target)
+        pool_snapshot = nddev_kilo_cli.snapshot_backup_pool(pool)
+        slot_info = slot_dir.lstat()
+        os.utime(
+            slot_dir,
+            ns=(slot_info.st_atime_ns, slot_info.st_mtime_ns + 1_000_000),
+            follow_symlinks=False,
+        )
+        if nddev_kilo_cli.backup_pool_matches(pool, pool_snapshot):
+            fail("backup pool metadata drift matched the pre-transaction object snapshot")
+        nddev_kilo_cli.restore_backup_pool_snapshot(pool, pool_snapshot)
+        if not nddev_kilo_cli.backup_pool_matches(pool, pool_snapshot):
+            fail("backup pool metadata drift was not restored to the exact object snapshot")
 
 
 def scoped_package_path(root: Path, package: str) -> Path:
@@ -2861,6 +2876,38 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
             )
             if residue:
                 fail("software cleanup fault left staging residue: " + ", ".join(residue))
+
+            before_remove = snapshot_object_tree(target)
+            original_cleanup_parents = nddev_kilo_cli.cleanup_software_parents
+            cleanup_parent_calls = 0
+
+            def skip_first_parent_cleanup(target_path: Path, *, preserve: set[Path]) -> None:
+                nonlocal cleanup_parent_calls
+                cleanup_parent_calls += 1
+                if cleanup_parent_calls == 1:
+                    return
+                original_cleanup_parents(target_path, preserve=preserve)
+
+            nddev_kilo_cli.cleanup_software_parents = skip_first_parent_cleanup
+            try:
+                try:
+                    nddev_kilo_cli.remove_cli(target)
+                except nddev_kilo_cli.ManagerError as exc:
+                    if "target-owned software residue" not in str(exc):
+                        fail(f"remove-cli post-move fault raised the wrong error: {exc}")
+                else:
+                    fail("remove-cli post-move fault was accepted")
+            finally:
+                nddev_kilo_cli.cleanup_software_parents = original_cleanup_parents
+            if cleanup_parent_calls < 2:
+                fail("remove-cli post-move fault did not exercise rollback cleanup")
+            if snapshot_object_tree(target) != before_remove:
+                fail("remove-cli post-move fault did not restore exact target object identity")
+            residue = sorted(
+                path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-remove.*")
+            )
+            if residue:
+                fail("remove-cli post-move fault left staging residue: " + ", ".join(residue))
         finally:
             nddev_kilo_cli.find_npm_executable = original_find_npm_executable
             nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
