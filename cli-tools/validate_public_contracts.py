@@ -796,6 +796,14 @@ def validate_python_portability() -> None:
                     fail(f"{function_name} must not rename, replace, or truncate anchors")
             if isinstance(node, ast.Attribute) and node.attr == "O_TRUNC":
                 fail(f"{function_name} must not open with O_TRUNC")
+    read_lock = functions.get("bootstrap_read_lifecycle_lock")
+    if read_lock is None:
+        fail("manager is missing bootstrap_read_lifecycle_lock")
+    read_calls = [
+        dotted_name(node.func) for node in ast.walk(read_lock) if isinstance(node, ast.Call)
+    ]
+    if "recover_bootstrap_publication_alias" in read_calls:
+        fail("read-only bootstrap lifecycle lock must not recover publication aliases")
 
 
 def validate_bootstrap_publication_eexist_preserves_destination() -> None:
@@ -2670,7 +2678,22 @@ def validate_bootstrap_hardlink_publication_recovery() -> None:
             aliases = machine_publication_aliases(root, product)
             if len(aliases) != 1:
                 fail("product crash-after-link did not leave exactly one machine temp alias")
-            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=False, shared=True):
+            before_read = snapshot_bootstrap_root_shallow(root)
+
+            def read_product_alias() -> None:
+                with nddev_kilo_cli.product_bootstrap_coordination_lock(
+                    create=False,
+                    shared=True,
+                ):
+                    pass
+
+            expect_manager_error(
+                "read-only product bootstrap hard-link alias recovery",
+                read_product_alias,
+            )
+            if snapshot_bootstrap_root_shallow(root) != before_read:
+                fail("read-only product bootstrap alias validation changed the lock namespace")
+            with nddev_kilo_cli.product_bootstrap_coordination_lock(create=False, shared=False):
                 pass
             recovered_info = product.lstat()
             if (
@@ -2718,6 +2741,13 @@ def validate_bootstrap_hardlink_publication_recovery() -> None:
             aliases = machine_publication_aliases(root, target_lock)
             if len(aliases) != 1:
                 fail("target crash-after-link did not leave exactly one machine temp alias")
+            before_read = snapshot_bootstrap_root_shallow(root)
+            expect_manager_error(
+                "read-only target bootstrap hard-link alias recovery",
+                lambda: nddev_kilo_cli.status_payload(target),
+            )
+            if snapshot_bootstrap_root_shallow(root) != before_read:
+                fail("read-only target bootstrap alias validation changed the lock namespace")
             with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
                 pass
             recovered_info = target_lock.lstat()

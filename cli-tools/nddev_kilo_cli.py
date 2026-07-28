@@ -257,7 +257,10 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
     "binding_exact": True,
     "binding_publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
-    "hardlink_publication_alias_recovery": "lock-final-then-unlink-single-machine-temp-alias",
+    "hardlink_publication_alias_recovery": (
+        "mutation-only-lock-final-then-unlink-single-machine-temp-alias"
+    ),
+    "read_only_publication_alias_policy": "fail-closed-no-repair",
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
     "read_only_anchor_policy": "no-create-product-anchor-and-no-create-target-anchor",
@@ -1713,17 +1716,8 @@ def product_bootstrap_coordination_lock(
             yield False
             return
         descriptor = opened
-        if shared and os.fstat(descriptor).st_nlink != 1:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            recover_bootstrap_publication_alias(
-                descriptor,
-                product_bootstrap_lock_file_path(),
-                label="product bootstrap coordination file",
-                product=True,
-            )
-            fcntl.flock(descriptor, fcntl.LOCK_SH)
-        else:
-            fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        if not shared:
             recover_bootstrap_publication_alias(
                 descriptor,
                 product_bootstrap_lock_file_path(),
@@ -1832,16 +1826,7 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 return
             descriptor = opened
             try:
-                if os.fstat(descriptor).st_nlink != 1:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    recover_bootstrap_publication_alias(
-                        descriptor,
-                        bootstrap_lock_file_path(target),
-                        label="bootstrap lifecycle lock file",
-                    )
-                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                else:
-                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
@@ -1849,11 +1834,6 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
                 descriptor = -1
                 fail(f"target is locked: {bootstrap_lock_file_path(target)}")
             acquired = True
-            recover_bootstrap_publication_alias(
-                descriptor,
-                bootstrap_lock_file_path(target),
-                label="bootstrap lifecycle lock file",
-            )
             require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
             validate_bootstrap_lock_binding(read_bootstrap_lock_record(descriptor), target)
         yield target
