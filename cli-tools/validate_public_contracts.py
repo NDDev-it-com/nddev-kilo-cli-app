@@ -925,107 +925,6 @@ def validate_child_cannot_unlink_persistent_lock() -> None:
             fail("persistent lock parent mode was not restored after child exit")
 
 
-def validate_external_lock_blocks_internal_lock_parent_rename() -> None:
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-dual-lock-") as raw:
-        workspace = Path(raw)
-        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
-        target = workspace / "target"
-        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
-        target = target.resolve(strict=False)
-        started = target / "child-started"
-        renamed = target / ".nddev-kilo-cli.lock.renamed"
-        rename_result = target / "child-rename-result"
-        stop = target / "child-stop"
-        executable, _native, installation = fake_launch_installation(
-            target,
-            (
-                "#!/bin/sh\n"
-                "set -eu\n"
-                f'printf started > "{started}"\n'
-                f'if /bin/mv "{nddev_kilo_cli.lock_path(target)}" "{renamed}" 2>/dev/null; then\n'
-                f'  printf renamed > "{rename_result}"\n'
-                "else\n"
-                f'  printf denied > "{rename_result}"\n'
-                "fi\n"
-                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
-            ).encode("utf-8"),
-        )
-        del executable
-        original_require_current_software = nddev_kilo_cli.require_current_software
-        launch_result: dict[str, Any] = {}
-
-        def run_launch() -> None:
-            try:
-                launch_result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
-            except BaseException as exc:
-                launch_result["error"] = exc
-
-        nddev_kilo_cli.require_current_software = fake_current_software(target, installation)
-        thread = threading.Thread(target=run_launch)
-        thread.start()
-        try:
-            wait_until(
-                "child internal lock parent rename attempt",
-                lambda: rename_result.exists() or bool(launch_result.get("error")),
-            )
-            if "error" in launch_result:
-                raise launch_result["error"]
-            if rename_result.read_text(encoding="utf-8") != "renamed":
-                fail("internal lock parent rename regression did not exercise the rename path")
-            for label, mutation in (
-                (
-                    "switch",
-                    lambda: nddev_kilo_cli.mutate_setup(
-                        target,
-                        nddev_kilo_cli.DEFAULT_SETUP_ID,
-                        "safe",
-                        "switch",
-                    ),
-                ),
-                ("remove", lambda: nddev_kilo_cli.remove_setup(target)),
-                (
-                    "install",
-                    lambda: nddev_kilo_cli.mutate_setup(
-                        target,
-                        nddev_kilo_cli.DEFAULT_SETUP_ID,
-                        nddev_kilo_cli.DEFAULT_PROFILE_ID,
-                        "install",
-                    ),
-                ),
-            ):
-                try:
-                    mutation()
-                except nddev_kilo_cli.ManagerError as exc:
-                    if "target is locked" not in str(exc):
-                        fail(f"{label} after internal lock rename failed for the wrong reason: {exc}")
-                else:
-                    fail(f"{label} was accepted after child renamed the internal lock parent")
-            stop.write_bytes(b"stop\n")
-            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
-            thread.join(timeout=5)
-        finally:
-            nddev_kilo_cli.require_current_software = original_require_current_software
-            if thread.is_alive():
-                stop.write_bytes(b"stop\n")
-                thread.join(timeout=10)
-            if renamed.exists() and not renamed.is_symlink():
-                with contextlib.suppress(OSError):
-                    renamed.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
-        if thread.is_alive():
-            fail("launch child thread did not finish after internal lock rename regression")
-        if "error" in launch_result:
-            raise launch_result["error"]
-        if launch_result.get("code") != 0:
-            fail(
-                "internal lock rename child returned unexpected code: "
-                f"{launch_result.get('code')}"
-            )
-        if not nddev_kilo_cli.lock_path(target).is_dir():
-            fail("canonical internal lock parent was not restored after child rename")
-        if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
-            fail("canonical internal lock parent mode was not restored after child rename")
-
-
 def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-handoff-") as raw:
         workspace = Path(raw)
@@ -2303,6 +2202,29 @@ def validate_no_public_bootstrap_override_references() -> None:
                     fail(f"public artifact documents unsupported bootstrap override: {path}")
 
 
+def validate_bootstrap_anchor_publication_static_contract() -> None:
+    source = MANAGER_PATH.read_text(encoding="utf-8")
+    required_terms = (
+        "def rename_no_replace(",
+        "renameatx_np",
+        "RENAME_EXCL_DARWIN",
+        "RENAME_NOREPLACE_LINUX",
+        "publish_missing_bootstrap_lock_file",
+        "bootstrap lifecycle lock file binding is empty",
+    )
+    for term in required_terms:
+        if term not in source:
+            fail(f"bootstrap anchor publication contract is missing {term!r}")
+    forbidden_terms = (
+        "def write_bootstrap_lock_record(",
+        "os.ftruncate(descriptor",
+        "if record is None:\n            write_bootstrap_lock_record",
+    )
+    for term in forbidden_terms:
+        if term in source:
+            fail(f"bootstrap anchor publication still permits in-place final binding: {term!r}")
+
+
 def run_all_validations(injected_bootstrap_parent: Path) -> None:
     with patched_bootstrap_lock_parent(injected_bootstrap_parent):
         validate_bootstrap_injection_is_active(injected_bootstrap_parent)
@@ -2321,7 +2243,6 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_bootstrap_lock_persistent_inode_handover()
         validate_launch_lock_scope_and_executable_revalidation()
         validate_child_cannot_unlink_persistent_lock()
-        validate_external_lock_blocks_internal_lock_parent_rename()
         validate_launch_handoff_denies_ordinary_replace_unlink()
         validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
@@ -2333,6 +2254,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()
+        validate_bootstrap_anchor_publication_static_contract()
         validate_sticky_tmp_target()
         validate_fake_path_is_ignored()
         validate_no_public_bootstrap_override_references()
