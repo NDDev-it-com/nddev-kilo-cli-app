@@ -1732,6 +1732,55 @@ def product_bootstrap_anchor_exists_no_create() -> bool:
     return True
 
 
+def cold_bootstrap_product_namespace_state() -> tuple[str, tuple[int, int] | None, tuple[str, ...]]:
+    if product_bootstrap_anchor_exists_no_create():
+        raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
+    root = bootstrap_lock_root()
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return ("root-absent", None, ())
+    if stat.S_ISLNK(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must not be a symlink")
+    if not stat.S_ISDIR(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must be a real directory")
+    if not is_owner_private_directory(root_info):
+        fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+    first_identity = identity_of(root_info)
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(entries) > 256:
+        fail("bootstrap lifecycle lock root contains too many entries for bounded inspection")
+    names: list[str] = []
+    for entry in entries:
+        name = entry.name
+        if len(name) > 160:
+            fail("bootstrap lifecycle lock namespace entry name is too long")
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            raise BootstrapAnchorAppeared(
+                "bootstrap lifecycle lock namespace changed during cold read"
+            ) from None
+        if stat.S_ISLNK(info.st_mode):
+            fail("bootstrap lifecycle lock namespace entry must not be a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            fail("bootstrap lifecycle lock namespace entry must be a regular file")
+        if not is_owner_only_file(info):
+            fail(
+                "bootstrap lifecycle lock namespace entry must be owned by "
+                "the current user with mode 0600"
+            )
+        if info.st_nlink not in {1, 2}:
+            fail("bootstrap lifecycle lock namespace entry has unsafe hard-link state")
+        names.append(name)
+    second = root.lstat()
+    if identity_of(second) != first_identity:
+        raise BootstrapAnchorAppeared("bootstrap lifecycle lock root changed during cold read")
+    if names:
+        fail("bootstrap lifecycle lock namespace is not empty while product anchor is absent")
+    return ("root-empty", first_identity, tuple(names))
+
+
 def open_existing_bootstrap_lock_file_readonly(target: Path, lock_file: Path) -> os.stat_result:
     info = lock_file.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -1797,21 +1846,11 @@ def cold_bootstrap_target_anchor_state(
     target: Path,
     *,
     fail_on_anchor_present: bool,
-) -> tuple[str, tuple[int, int] | None]:
-    if product_bootstrap_anchor_exists_no_create():
-        raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
+) -> tuple[str, tuple[int, int] | None, tuple[str, ...]]:
+    namespace_state = cold_bootstrap_product_namespace_state()
     root = bootstrap_lock_root()
-    try:
-        root_info = root.lstat()
-    except FileNotFoundError:
-        return ("root-absent", None)
-    if stat.S_ISLNK(root_info.st_mode):
-        fail("bootstrap lifecycle lock root must not be a symlink")
-    if not stat.S_ISDIR(root_info.st_mode):
-        fail("bootstrap lifecycle lock root must be a real directory")
-    if not is_owner_private_directory(root_info):
-        fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
-    root_identity = identity_of(root_info)
+    if namespace_state[0] == "root-absent":
+        return namespace_state
     lock_file = root / f"{target_binding_sha256(target)}.lock"
     try:
         target_info = lock_file.lstat()
@@ -1822,7 +1861,7 @@ def cold_bootstrap_target_anchor_state(
                     "bootstrap lifecycle lock alias appeared during cold read"
                 )
             fail("bootstrap lifecycle lock publication alias is orphaned without final anchor")
-        return ("target-absent", root_identity)
+        return namespace_state
     if not fail_on_anchor_present:
         raise BootstrapAnchorAppeared("bootstrap lifecycle lock file appeared during cold read")
     target_info = open_existing_bootstrap_lock_file_readonly(target, lock_file)
@@ -1896,7 +1935,7 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
     acquired = False
     cold_read = False
     body_completed = False
-    cold_state: tuple[str, tuple[int, int] | None] | None = None
+    cold_state: tuple[str, tuple[int, int] | None, tuple[str, ...]] | None = None
     target: Path | None = None
     try:
         with product_bootstrap_coordination_lock(create=False, shared=True) as coordinated:

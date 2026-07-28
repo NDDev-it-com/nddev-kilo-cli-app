@@ -837,9 +837,22 @@ def validate_python_portability() -> None:
     cold_anchor = functions.get("cold_bootstrap_target_anchor_state")
     if cold_anchor is None:
         fail("manager is missing cold_bootstrap_target_anchor_state")
-    cold_source = ast.get_source_segment(manager_source, cold_anchor) or ""
+    namespace_anchor = functions.get("cold_bootstrap_product_namespace_state")
+    if namespace_anchor is None:
+        fail("manager is missing cold product namespace inspection helper")
+    namespace_source = ast.get_source_segment(manager_source, namespace_anchor) or ""
     for expected in (
         "product_bootstrap_anchor_exists_no_create",
+        "len(entries) > 256",
+        "names:",
+        "if names:",
+        "namespace is not empty",
+    ):
+        if expected not in namespace_source:
+            fail("cold product namespace inspection omits " + expected)
+    cold_source = ast.get_source_segment(manager_source, cold_anchor) or ""
+    for expected in (
+        "cold_bootstrap_product_namespace_state",
         "machine_bootstrap_publication_aliases",
         "fail_on_anchor_present",
     ):
