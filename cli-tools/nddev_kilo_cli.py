@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import ctypes
 import errno
 import hashlib
 import json
@@ -49,6 +50,15 @@ BACKUP_SCHEMA = 1
 MAX_BACKUPS = 10
 OWNER_FILE_MODE = 0o600
 OWNER_DIR_MODE = 0o700
+AT_FDCWD_BY_SYSTEM = {"darwin": -2, "linux": -100}
+RENAME_EXCL_DARWIN = 0x00000004
+RENAME_NOREPLACE_LINUX = 1
+RENAMEAT2_SYSCALL_BY_MACHINE = {
+    "x86_64": 316,
+    "amd64": 316,
+    "aarch64": 276,
+    "arm64": 276,
+}
 MANAGED_PAYLOAD_MAX_BYTES = 1024 * 1024
 METADATA_MAX_BYTES = 256 * 1024
 SOURCE_CONFIG = "config.json"
@@ -186,6 +196,8 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "file_mode": "0600",
     "filename": "sha256-product-namespace-and-canonical-target",
     "target_binding": "json-product-canonical-target-and-sha256",
+    "anchor_publication": "native-rename-no-replace-complete-binding",
+    "empty_or_partial_final_binding": "fail-closed",
     "binding_exact": True,
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
@@ -501,6 +513,19 @@ def require_directory(path: Path, label: str) -> os.stat_result:
     if not stat.S_ISDIR(info.st_mode):
         fail(f"{label} must be a real directory")
     return info
+
+
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def require_regular_file(
@@ -969,6 +994,17 @@ def bootstrap_lock_file_path(target: Path) -> Path:
     return bootstrap_lock_root() / f"{target_binding_sha256(target)}.lock"
 
 
+def bootstrap_lock_binding_payload(target: Path) -> bytes:
+    return canonical_json(
+        {
+            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "target": os.fspath(target),
+            "target_sha256": target_binding_sha256(target),
+        }
+    )
+
+
 def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
     opened = os.fstat(descriptor)
     current = lock_file.lstat()
@@ -979,6 +1015,125 @@ def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os
     if not is_owner_only_file(opened):
         fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
     return opened
+
+
+def write_bootstrap_lock_stage_file(path: Path, payload: bytes) -> None:
+    if len(payload) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap lifecycle lock staged binding exceeds the bounded write limit")
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("bootstrap lifecycle lock staged file requires O_NOFOLLOW support")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(path, flags, OWNER_FILE_MODE)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                fail("bootstrap lifecycle lock staged binding write made no forward progress")
+            offset += written
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lifecycle lock staged binding must be a regular file")
+    if info.st_nlink != 1:
+        fail("bootstrap lifecycle lock staged binding must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("bootstrap lifecycle lock staged binding must be owned by the current user with mode 0600")
+    if read_regular_file(
+        path,
+        "bootstrap lifecycle lock staged binding",
+        owner_only=True,
+        max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+    ) != payload:
+        fail("bootstrap lifecycle lock staged binding postcondition failed")
+
+
+def cleanup_bootstrap_lock_stage_file(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+        fsync_directory(path.parent)
+
+
+def rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+    system = platform.system().lower()
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if system == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = libc.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            source_bytes,
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            destination_bytes,
+            RENAME_EXCL_DARWIN,
+        )
+    elif system == "linux":
+        machine = platform.machine().lower()
+        syscall_number = RENAMEAT2_SYSCALL_BY_MACHINE.get(machine)
+        if syscall_number is None:
+            fail(f"{label} no-replace publication is unsupported on this architecture")
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(RENAME_NOREPLACE_LINUX),
+        )
+    else:
+        fail(f"{label} no-replace publication is unsupported on this platform")
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        fail(f"{label} no-replace publication primitive is unavailable")
+    fail(f"{label} no-replace publication failed: {os.strerror(error)}")
+
+
+def publish_missing_bootstrap_lock_file(path: Path, target: Path) -> None:
+    parent = path.parent
+    payload = bootstrap_lock_binding_payload(target)
+    for _attempt in range(4):
+        stage = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
+        if path_exists_no_follow(stage):
+            continue
+        published = False
+        try:
+            write_bootstrap_lock_stage_file(stage, payload)
+            if not rename_no_replace(stage, path, "bootstrap lifecycle lock file"):
+                cleanup_bootstrap_lock_stage_file(stage)
+                return
+            published = True
+            fsync_directory(parent)
+            return
+        except BaseException:
+            if path_exists_no_follow(stage):
+                with contextlib.suppress(BaseException):
+                    cleanup_bootstrap_lock_stage_file(stage)
+            if not published:
+                with contextlib.suppress(BaseException):
+                    fsync_directory(parent)
+            raise
+    fail("bootstrap lifecycle lock staged binding name could not be allocated")
 
 
 def ensure_bootstrap_lock_root() -> Path:
@@ -1009,21 +1164,12 @@ def open_bootstrap_lock_file(target: Path) -> int:
         fail("bootstrap lifecycle lock file requires O_NOFOLLOW support")
     root = ensure_bootstrap_lock_root()
     lock_file = root / f"{target_binding_sha256(target)}.lock"
-    for _attempt in range(2):
+    for _attempt in range(3):
         try:
             info = lock_file.lstat()
         except FileNotFoundError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            flags |= os.O_NOFOLLOW
-            try:
-                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
-            except FileExistsError:
-                continue
-            os.fchmod(descriptor, OWNER_FILE_MODE)
-            require_open_bootstrap_lock_identity(descriptor, lock_file)
-            return descriptor
+            publish_missing_bootstrap_lock_file(lock_file, target)
+            continue
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             fail("bootstrap lifecycle lock file must be a regular file")
         if info.st_nlink != 1:
@@ -1050,33 +1196,13 @@ def read_bootstrap_lock_record(descriptor: int) -> dict[str, Any] | None:
     if len(content) > BOOTSTRAP_LOCK_MAX_BYTES:
         fail("bootstrap lifecycle lock file exceeds the bounded read limit")
     if not content:
-        return None
+        fail("bootstrap lifecycle lock file binding is empty")
     return parse_json_object(content, "bootstrap lifecycle lock file")
-
-
-def write_bootstrap_lock_record(descriptor: int, target: Path) -> None:
-    content = canonical_json(
-        {
-            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
-            "product_name": PRODUCT_NAME,
-            "target": os.fspath(target),
-            "target_sha256": target_binding_sha256(target),
-        }
-    )
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    offset = 0
-    while offset < len(content):
-        written = os.write(descriptor, content[offset:])
-        if written <= 0:
-            fail("bootstrap lifecycle lock file write made no forward progress")
-        offset += written
-    os.ftruncate(descriptor, len(content))
-    os.fsync(descriptor)
 
 
 def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path) -> None:
     if record is None:
-        return
+        fail("bootstrap lifecycle lock file binding is missing")
     if set(record) != BOOTSTRAP_LOCK_BINDING_KEYS:
         fail("bootstrap lifecycle lock file binding keys mismatch")
     if record.get("schema_version") != BOOTSTRAP_LOCK_SCHEMA:
@@ -1111,12 +1237,6 @@ def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
         require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
         record = read_bootstrap_lock_record(descriptor)
         validate_bootstrap_lock_binding(record, target)
-        if record is None:
-            write_bootstrap_lock_record(descriptor, target)
-            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
-            record = read_bootstrap_lock_record(descriptor)
-            validate_bootstrap_lock_binding(record, target)
-            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
         yield target
     finally:
         if descriptor >= 0:
