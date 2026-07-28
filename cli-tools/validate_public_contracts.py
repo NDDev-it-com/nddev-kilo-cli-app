@@ -840,12 +840,25 @@ def validate_python_portability() -> None:
     namespace_anchor = functions.get("cold_bootstrap_product_namespace_state")
     if namespace_anchor is None:
         fail("manager is missing cold product namespace inspection helper")
+    bounded_namespace = functions.get("bounded_cold_bootstrap_namespace_entries")
+    if bounded_namespace is None:
+        fail("manager is missing bounded cold product namespace entry helper")
+    bounded_namespace_source = ast.get_source_segment(manager_source, bounded_namespace) or ""
+    for expected in (
+        "len(entries) > 256",
+        "len(entry.name) > 160",
+    ):
+        if expected not in bounded_namespace_source:
+            fail("bounded cold product namespace inspection omits " + expected)
     namespace_source = ast.get_source_segment(manager_source, namespace_anchor) or ""
     for expected in (
         "product_bootstrap_anchor_exists_no_create",
-        "len(entries) > 256",
+        "fail_on_namespace_entries",
+        "bounded_cold_bootstrap_namespace_entries",
         "names:",
-        "if names:",
+        "second_names",
+        "BootstrapAnchorAppeared",
+        "if names and fail_on_namespace_entries:",
         "namespace is not empty",
     ):
         if expected not in namespace_source:

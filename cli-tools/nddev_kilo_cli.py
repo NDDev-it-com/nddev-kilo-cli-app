@@ -1732,7 +1732,20 @@ def product_bootstrap_anchor_exists_no_create() -> bool:
     return True
 
 
-def cold_bootstrap_product_namespace_state() -> tuple[str, tuple[int, int] | None, tuple[str, ...]]:
+def bounded_cold_bootstrap_namespace_entries(root: Path) -> tuple[Path, ...]:
+    entries = tuple(sorted(root.iterdir(), key=lambda item: item.name))
+    if len(entries) > 256:
+        fail("bootstrap lifecycle lock root contains too many entries for bounded inspection")
+    for entry in entries:
+        if len(entry.name) > 160:
+            fail("bootstrap lifecycle lock namespace entry name is too long")
+    return entries
+
+
+def cold_bootstrap_product_namespace_state(
+    *,
+    fail_on_namespace_entries: bool = True,
+) -> tuple[str, tuple[int, int] | None, tuple[str, ...]]:
     if product_bootstrap_anchor_exists_no_create():
         raise BootstrapAnchorAppeared("bootstrap anchor appeared during cold read")
     root = bootstrap_lock_root()
@@ -1747,14 +1760,10 @@ def cold_bootstrap_product_namespace_state() -> tuple[str, tuple[int, int] | Non
     if not is_owner_private_directory(root_info):
         fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
     first_identity = identity_of(root_info)
-    entries = sorted(root.iterdir(), key=lambda item: item.name)
-    if len(entries) > 256:
-        fail("bootstrap lifecycle lock root contains too many entries for bounded inspection")
+    entries = bounded_cold_bootstrap_namespace_entries(root)
     names: list[str] = []
     for entry in entries:
         name = entry.name
-        if len(name) > 160:
-            fail("bootstrap lifecycle lock namespace entry name is too long")
         try:
             info = entry.lstat()
         except FileNotFoundError:
@@ -1773,12 +1782,18 @@ def cold_bootstrap_product_namespace_state() -> tuple[str, tuple[int, int] | Non
         if info.st_nlink not in {1, 2}:
             fail("bootstrap lifecycle lock namespace entry has unsafe hard-link state")
         names.append(name)
+    second_entries = bounded_cold_bootstrap_namespace_entries(root)
+    second_names = tuple(entry.name for entry in second_entries)
+    if second_names != tuple(names):
+        raise BootstrapAnchorAppeared(
+            "bootstrap lifecycle lock namespace changed during cold read"
+        )
     second = root.lstat()
     if identity_of(second) != first_identity:
         raise BootstrapAnchorAppeared("bootstrap lifecycle lock root changed during cold read")
-    if names:
+    if names and fail_on_namespace_entries:
         fail("bootstrap lifecycle lock namespace is not empty while product anchor is absent")
-    return ("root-empty", first_identity, tuple(names))
+    return ("root-nonempty" if names else "root-empty", first_identity, tuple(names))
 
 
 def open_existing_bootstrap_lock_file_readonly(target: Path, lock_file: Path) -> os.stat_result:
@@ -1846,8 +1861,11 @@ def cold_bootstrap_target_anchor_state(
     target: Path,
     *,
     fail_on_anchor_present: bool,
+    fail_on_namespace_entries: bool = True,
 ) -> tuple[str, tuple[int, int] | None, tuple[str, ...]]:
-    namespace_state = cold_bootstrap_product_namespace_state()
+    namespace_state = cold_bootstrap_product_namespace_state(
+        fail_on_namespace_entries=fail_on_namespace_entries,
+    )
     root = bootstrap_lock_root()
     if namespace_state[0] == "root-absent":
         return namespace_state
@@ -1987,6 +2005,7 @@ def bootstrap_read_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
             observed = cold_bootstrap_target_anchor_state(
                 target,
                 fail_on_anchor_present=False,
+                fail_on_namespace_entries=False,
             )
             if observed != cold_state:
                 raise BootstrapAnchorAppeared("bootstrap anchor changed during cold read")
