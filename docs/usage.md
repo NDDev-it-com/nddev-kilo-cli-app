@@ -12,7 +12,8 @@ file inventory and native config paths are owned by
 `plan --json` includes the same stable byte-diff `changed_paths` policy used by
 setup mutations.
 
-Lifecycle commands:
+The full command surface is owned by `cli-tools/nddev_kilo_cli.py`. Common
+setup examples:
 
 ```bash
 python3 cli-tools/nddev_kilo_cli.py list --json
@@ -20,19 +21,12 @@ python3 cli-tools/nddev_kilo_cli.py status --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py plan --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py switch --profile safe --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py migrate --profile safe --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py install-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py software-status --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py update-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py restore --backup 0 --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
 ```
 
 Use `launch` only against an already managed target:
 
 ```bash
-python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "inspect this repository"
+python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target -- "inspect this repository"
 ```
 
 Launch provides an isolated manager-controlled runtime for the child process,
@@ -47,13 +41,10 @@ profile-to-native-mode mapping are owned by `cli-tools/nddev_kilo_cli.py`,
 `profiles/`, and `config/nddev-contract.json`. Inspect live target state with
 `status --json` and installed CLI provenance with `software-status --json`.
 
-Production CLI install and launch support is host-scoped to `macos-arm64`,
-`macos-x64`, `ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Ubuntu desktop and
-server use the same `ID=ubuntu` glibc check, and the upstream Ubuntu/glibc
-version floor is recorded as `null` / `no-official-floor`. Windows,
-non-Ubuntu Linux, Linux musl, and unsupported architectures are rejected before
-network, staging, or runtime launch work; upstream npm artifact/package IDs stay
-in the baseline catalog and host mapping.
+Production CLI install and launch support is scoped to macOS and Ubuntu glibc
+desktop/server hosts. The exact host IDs, unsupported categories, official
+floor observation, and upstream artifact/package mapping are owned by
+`config/nddev-contract.json` and `references/kilo-cli-baseline.json`.
 
 The launch boundary is a manager-verified path handoff under a no-sandbox
 same-UID threat model. It does not claim portable file-descriptor execution or

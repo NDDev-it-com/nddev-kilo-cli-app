@@ -22,14 +22,10 @@ config location, and launch binary selection are source-owned by
 `cli-tools/nddev_kilo_cli.py`. Use `software-status --json` and
 `status --json` for target-specific state.
 
-Production install and launch support is limited to the canonical NDDev host
-IDs `macos-arm64`, `macos-x64`, `ubuntu-glibc-arm64`, and
-`ubuntu-glibc-x64`. Ubuntu desktop and server share the same `ID=ubuntu` glibc
-host check; upstream publishes no Ubuntu/glibc version floor, so the contract
-records that floor as `null` / `no-official-floor`. Windows, non-Ubuntu Linux,
-Linux musl, and unsupported architectures are rejected before network, staging,
-or runtime launch work. Exact upstream npm optional package names remain in the
-baseline catalog and host-to-package mapping.
+Production install and launch support is limited to macOS and Ubuntu glibc
+desktop/server hosts. The exact host IDs, unsupported categories, official
+floor observation, and upstream optional-package mapping are owned by
+`config/nddev-contract.json` and `references/kilo-cli-baseline.json`.
 
 ## Setup And Profiles
 
@@ -57,19 +53,15 @@ provider, network, MCP, or tool-behavior control plane.
 
 ## Usage
 
+The full command surface is owned by `cli-tools/nddev_kilo_cli.py`. Common
+read-only and lifecycle examples:
+
 ```bash
 python3 cli-tools/nddev_kilo_cli.py list --json
 python3 cli-tools/nddev_kilo_cli.py plan --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py switch --profile safe --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py migrate --profile full-auto --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py install-cli --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py software-status --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py update-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py restore --backup 0 --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "implement the task"
+python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target -- "implement the task"
 ```
 
 `install-cli` and `update-cli` maintain target-owned CLI software through the
