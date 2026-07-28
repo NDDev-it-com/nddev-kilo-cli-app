@@ -1518,6 +1518,91 @@ def validate_hardlink_materialization_bound() -> None:
             fail("failed hardlink materialization changed the target tree")
 
 
+def assert_first_install_failure_clean(
+    parent: Path,
+    target: Path,
+    before_parent: list[tuple[str, str, int, int, int, int, bytes | str | None]],
+    label: str,
+) -> None:
+    if target.exists() or target.is_symlink():
+        fail(f"{label} left a target after failed first install")
+    residue = sorted(path.name for path in parent.glob(f".{target.name}.nddev-kilo-cli-*"))
+    if residue:
+        fail(f"{label} left transaction residue: " + ", ".join(residue))
+    if snapshot_object_tree(parent) != before_parent:
+        fail(f"{label} did not restore exact target parent object state")
+
+
+def validate_first_install_failures_restore_parent_identity() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-first-install-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "targets"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        parent.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+
+        setup_target = parent / "setup-target"
+        before_parent = snapshot_object_tree(parent)
+        original_replace_managed_state = nddev_kilo_cli.replace_managed_state
+
+        def replace_then_fail(
+            observed_target: Path,
+            desired_state: dict[str, bytes | None],
+            expected: dict[str, str] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            original_replace_managed_state(observed_target, desired_state, expected, **kwargs)
+            raise RuntimeError("injected public first setup failure")
+
+        nddev_kilo_cli.replace_managed_state = replace_then_fail
+        try:
+            try:
+                nddev_kilo_cli.mutate_setup(
+                    setup_target,
+                    nddev_kilo_cli.DEFAULT_SETUP_ID,
+                    nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                    "install",
+                )
+            except RuntimeError as exc:
+                if "injected public first setup failure" not in str(exc):
+                    fail(f"first setup failure raised the wrong error: {exc}")
+            else:
+                fail("first setup failure was accepted")
+        finally:
+            nddev_kilo_cli.replace_managed_state = original_replace_managed_state
+        assert_first_install_failure_clean(
+            parent,
+            setup_target,
+            before_parent,
+            "failed first setup install",
+        )
+
+        software_target = parent / "software-target"
+        before_parent = snapshot_object_tree(parent)
+        original_run_npm_install = nddev_kilo_cli.run_npm_install
+
+        def fail_npm_install(_stage_root: Path, _live_stage: Path) -> None:
+            raise nddev_kilo_cli.ManagerError("injected public first software failure")
+
+        nddev_kilo_cli.run_npm_install = fail_npm_install
+        try:
+            try:
+                nddev_kilo_cli.install_or_update_cli(software_target, "install-cli")
+            except nddev_kilo_cli.ManagerError as exc:
+                if "injected public first software failure" not in str(exc):
+                    fail(f"first software failure raised the wrong error: {exc}")
+            else:
+                fail("first software failure was accepted")
+        finally:
+            nddev_kilo_cli.run_npm_install = original_run_npm_install
+        assert_first_install_failure_clean(
+            parent,
+            software_target,
+            before_parent,
+            "failed first software install",
+        )
+
+
 def write_public_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, parents=True, exist_ok=True)
     path.write_bytes(nddev_kilo_cli.canonical_json(value))
@@ -2118,6 +2203,93 @@ def validate_bootstrap_lock_precreation_guards() -> None:
             }
             if record != expected:
                 fail("bootstrap lock binding is not the canonical expected object")
+
+
+def validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock() -> None:
+    operations: tuple[tuple[str, Any], ...] = (
+        ("status", lambda target: nddev_kilo_cli.status_payload(target)),
+        (
+            "plan",
+            lambda target: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        ),
+        ("software-status", lambda target: nddev_kilo_cli.software_status_command(target)),
+    )
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-alias-parent-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        injected_bootstrap = workspace / "bootstrap"
+        injected_bootstrap.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        real_parent = workspace / "real-parent"
+        real_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        alias_parent = workspace / "alias-parent"
+        os.symlink(real_parent, alias_parent, target_is_directory=True)
+        with patched_bootstrap_lock_parent(injected_bootstrap):
+            for exists in (False, True):
+                target_name = "existing-target" if exists else "missing-target"
+                real_target = real_parent / target_name
+                canonical_target = real_parent.resolve(strict=True) / target_name
+                if exists:
+                    real_target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                    real_target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                alias_target = alias_parent / target_name
+                for command, operation in operations:
+                    observed: dict[str, tuple[str, str]] = {}
+                    for route, raw_target in (("real", real_target), ("alias", alias_target)):
+                        canonical_targets: list[Path] = []
+                        lock_paths: list[Path] = []
+                        original_canonical = nddev_kilo_cli.canonical_target_for_bootstrap_lock
+                        original_open = nddev_kilo_cli.open_bootstrap_lock_file
+
+                        def traced_canonical(raw_value: str | Path, **kwargs: Any) -> Path:
+                            canonical = original_canonical(raw_value, **kwargs)
+                            canonical_targets.append(canonical)
+                            return canonical
+
+                        def traced_open(canonical_target: Path) -> int:
+                            lock_paths.append(
+                                nddev_kilo_cli.bootstrap_lock_file_path(canonical_target)
+                            )
+                            return original_open(canonical_target)
+
+                        nddev_kilo_cli.canonical_target_for_bootstrap_lock = traced_canonical
+                        nddev_kilo_cli.open_bootstrap_lock_file = traced_open
+                        try:
+                            payload = operation(raw_target)
+                        finally:
+                            nddev_kilo_cli.canonical_target_for_bootstrap_lock = original_canonical
+                            nddev_kilo_cli.open_bootstrap_lock_file = original_open
+                        if payload.get("target") != str(canonical_target):
+                            fail(f"{command} {route} symlink-parent target was not canonicalized")
+                        if canonical_targets != [canonical_target]:
+                            fail(
+                                f"{command} {route} canonical target mismatch: {canonical_targets!r}"
+                            )
+                        if len(lock_paths) != 1:
+                            fail(f"{command} {route} did not acquire exactly one canonical lock")
+                        observed[route] = (str(canonical_targets[0]), str(lock_paths[0]))
+                    if observed["real"] != observed["alias"]:
+                        fail(f"{command} symlink-parent alias used a different canonical lock")
+
+            loop_parent = workspace / "loop-parent"
+            os.symlink(loop_parent, loop_parent, target_is_directory=True)
+            expect_manager_error(
+                "looping symlink target parent",
+                lambda: nddev_kilo_cli.status_payload(loop_parent / "target"),
+            )
+
+            unsafe_parent = workspace / "unsafe-parent"
+            unsafe_parent.mkdir(mode=0o777)
+            unsafe_parent.chmod(0o777)
+            unsafe_alias = workspace / "unsafe-alias"
+            os.symlink(unsafe_parent, unsafe_alias, target_is_directory=True)
+            expect_manager_error(
+                "unsafe symlink target parent",
+                lambda: nddev_kilo_cli.status_payload(unsafe_alias / "target"),
+            )
 
 
 def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
@@ -3045,13 +3217,11 @@ def validate_sticky_tmp_target() -> None:
     info = tmp.lstat()
     if not stat.S_ISDIR(info.st_mode) or not (info.st_mode & stat.S_ISVTX):
         return
-    target = Path(tempfile.mkdtemp(prefix="nddev-kilo-public-sticky-", dir=tmp))
-    try:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-sticky-", dir=tmp) as raw:
+        target = Path(raw)
         target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
         with nddev_kilo_cli.target_lock(target):
             pass
-    finally:
-        shutil.rmtree(target, ignore_errors=True)
 
 
 def validate_fake_path_is_ignored() -> None:
@@ -3119,6 +3289,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_python_portability()
         validate_launch_guard()
         validate_bootstrap_lock_precreation_guards()
+        validate_safe_symlink_parent_aliases_share_canonical_bootstrap_lock()
         validate_bootstrap_lock_persistent_inode_handover()
         validate_launch_lock_scope_and_executable_revalidation()
         validate_child_cannot_unlink_persistent_lock()
@@ -3127,6 +3298,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
         validate_hardlink_materialization_bound()
+        validate_first_install_failures_restore_parent_identity()
         validate_remove_exhausts_managed_files()
         validate_plan_changed_paths_match_mutations()
         validate_backup_schema_and_payload_are_exact_before_restore()
@@ -3147,12 +3319,16 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
 def main() -> int:
     real_bootstrap_before: list[dict[str, Any]] | None = None
     try:
-        validate_public_bootstrap_override_denial()
         real_bootstrap_before = snapshot_real_bootstrap_state()
+        validate_public_bootstrap_override_denial()
+        injected_root: Path | None = None
         with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-root-") as raw:
             injected = Path(raw)
+            injected_root = injected
             injected.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
             run_all_validations(injected)
+        if injected_root is not None and injected_root.exists():
+            fail("public validator left injected bootstrap root residue")
         validate_real_bootstrap_state_unchanged(real_bootstrap_before)
     except ValidationError as exc:
         if real_bootstrap_before is not None:

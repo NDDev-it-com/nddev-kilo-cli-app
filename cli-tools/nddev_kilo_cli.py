@@ -243,6 +243,7 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "file_mode": "0600",
     "filename": "sha256-product-namespace-and-canonical-target",
     "target_binding": "json-product-canonical-target-and-sha256",
+    "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
     "binding_exact": True,
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
@@ -625,6 +626,7 @@ def ensure_directory_chain(path: Path, transaction: DirectoryTransaction, label:
         directory.mkdir(mode=OWNER_DIR_MODE)
         directory.chmod(OWNER_DIR_MODE)
         transaction.created.append(directory)
+        fsync_parent_directory(directory, f"{label} parent {directory.parent}")
 
 
 def require_directory(path: Path, label: str) -> os.stat_result:
@@ -1070,6 +1072,7 @@ def ensure_private_directory(
         require_directory(path.parent, f"{path} parent")
         path.mkdir(mode=OWNER_DIR_MODE)
         path.chmod(OWNER_DIR_MODE)
+        fsync_parent_directory(path, f"{path} parent")
         if transaction is not None:
             transaction.created.append(path)
         return True
@@ -1131,11 +1134,14 @@ def canonical_target_for_bootstrap_lock(
     raw: str | Path, *, lexical_validated: bool = False
 ) -> Path:
     path = Path(raw) if lexical_validated else lexical_target_for_bootstrap_lock(raw)
-    reject_absolute_symlink_ancestors(path.parent)
     try:
         parent = path.parent.resolve(strict=True)
     except FileNotFoundError:
         fail("target parent must exist before acquiring the bootstrap lifecycle lock")
+    except RuntimeError as exc:
+        raise ManagerError("target parent symlink resolution failed") from exc
+    except OSError as exc:
+        raise ManagerError("target parent could not be safely resolved") from exc
     reject_absolute_symlink_ancestors(parent)
     reject_unsafe_target_ancestors(parent / path.name)
     return parent / path.name
@@ -1585,27 +1591,60 @@ def restore_lock_path_after_failed_transaction(
         fail("failed target lock path did not restore exact pre-state")
 
 
-def snapshot_target_root_state(target: Path) -> dict[str, ObjectEntry] | None:
-    try:
-        info = target.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        fail("target root must be a real directory")
-    return {
-        ".": ObjectEntry(
-            "directory",
-            stat.S_IMODE(info.st_mode),
-            identity_of(info),
-            info.st_mtime_ns,
-            info.st_size,
-        )
-    }
+def snapshot_target_root_state(target: Path) -> ObjectEntry | None:
+    return snapshot_directory_metadata(target, "target root")
 
 
-def restore_target_root_metadata(target: Path, expected: dict[str, ObjectEntry] | None) -> None:
-    if expected is not None and path_exists_no_follow(target):
-        restore_object_metadata(target, expected)
+def snapshot_target_parent_state(target: Path) -> ObjectEntry | None:
+    return snapshot_directory_metadata(target.parent, "target parent")
+
+
+def verify_directory_metadata(
+    path: Path,
+    expected: ObjectEntry | None,
+    label: str,
+) -> None:
+    observed = snapshot_directory_metadata(path, label)
+    if observed != expected:
+        fail(f"{label} metadata did not restore exact pre-state")
+
+
+def restore_directory_metadata(
+    path: Path,
+    expected: ObjectEntry | None,
+    label: str,
+    *,
+    fsync_after: bool,
+) -> None:
+    if expected is None:
+        if path_exists_no_follow(path):
+            fail(f"{label} should be absent after rollback")
+        return
+    if not path_exists_no_follow(path):
+        fail(f"{label} is missing after rollback")
+    path.chmod(expected.mode)
+    with contextlib.suppress(OSError, NotImplementedError):
+        os.utime(path, ns=(expected.mtime_ns, expected.mtime_ns), follow_symlinks=False)
+    if fsync_after:
+        fsync_directory(path, f"{label} metadata {path}")
+    verify_directory_metadata(path, expected, label)
+
+
+def restore_target_after_failed_transaction(
+    target: Path,
+    transaction: DirectoryTransaction,
+    expected: ObjectEntry | None,
+) -> None:
+    if expected is None and target in transaction.created:
+        remove_path_durable_retry(target, "failed created target")
+    restore_directory_metadata(target, expected, "target root", fsync_after=False)
+
+
+def restore_target_parent_metadata(
+    target: Path,
+    expected: ObjectEntry | None,
+) -> None:
+    restore_directory_metadata(target.parent, expected, "target parent", fsync_after=True)
 
 
 def restore_stale_launch_protection_modes(target: Path) -> None:
@@ -1767,6 +1806,8 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
     if fcntl is None:
         fail("target lifecycle locks require fcntl.flock on this platform")
     transaction = DirectoryTransaction([])
+    pre_parent_state = snapshot_target_parent_state(target)
+    pre_target_state = snapshot_target_root_state(target)
     if create_parent:
         ensure_directory_chain(target.parent, transaction, "canonical target parent")
         require_safe_target_ancestor(target.parent, "canonical target parent")
@@ -1774,7 +1815,6 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
     else:
         if not ensure_private_directory(target, create=False, transaction=transaction):
             fail("target is missing")
-    pre_target_state = snapshot_target_root_state(target)
     lock = lock_path(target)
     pre_lock_state = snapshot_lock_path_state(target)
     descriptor = -1
@@ -1819,7 +1859,8 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
                 os.close(descriptor)
         try:
             restore_lock_path_after_failed_transaction(target, pre_lock_state)
-            restore_target_root_metadata(target, pre_target_state)
+            restore_target_after_failed_transaction(target, transaction, pre_target_state)
+            restore_target_parent_metadata(target, pre_parent_state)
         except BaseException as exc:
             if restore_error is None:
                 restore_error = exc
@@ -1860,7 +1901,8 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
                     cleanup_error = exc
             try:
                 restore_lock_path_after_failed_transaction(target, pre_lock_state)
-                restore_target_root_metadata(target, pre_target_state)
+                restore_target_after_failed_transaction(target, transaction, pre_target_state)
+                restore_target_parent_metadata(target, pre_parent_state)
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
@@ -5673,6 +5715,7 @@ def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
     try:
         if target.exists() and target.is_dir() and not any(target.iterdir()):
             target.rmdir()
+            fsync_parent_directory(target, f"created software target parent {target.parent}")
     except OSError:
         pass
 

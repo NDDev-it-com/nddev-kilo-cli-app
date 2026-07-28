@@ -29,6 +29,7 @@
       "file_mode": "0600",
       "filename": "sha256-product-namespace-and-canonical-target",
       "target_binding": "json-product-canonical-target-and-sha256",
+      "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
       "binding_exact": true,
       "binding_revalidated_before_yield": true,
       "fd_path_inode_revalidated_before_yield": true,
