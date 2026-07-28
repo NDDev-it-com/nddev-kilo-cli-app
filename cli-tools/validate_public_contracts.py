@@ -785,6 +785,7 @@ def validate_python_portability() -> None:
     }
     for function_name in (
         "publish_bootstrap_anchor_file",
+        "publish_cleanup_intent_file",
         "publish_cleanup_journal_file",
     ):
         publish = functions.get(function_name)
@@ -814,9 +815,9 @@ def validate_python_portability() -> None:
     ]
     if "recover_bootstrap_publication_alias" in read_calls:
         fail("read-only bootstrap lifecycle lock must not recover publication aliases")
-    cleanup_graph = functions.get("validate_cleanup_graph_records")
+    cleanup_graph = functions.get("validate_cleanup_graph_record_schema")
     if cleanup_graph is None:
-        fail("manager is missing validate_cleanup_graph_records")
+        fail("manager is missing validate_cleanup_graph_record_schema")
     cleanup_graph_source = ast.get_source_segment(manager_source, cleanup_graph) or ""
     for expected in (
         "len(graph) > CLEANUP_MAX_PATHS",
@@ -824,9 +825,9 @@ def validate_python_portability() -> None:
     ):
         if expected not in cleanup_graph_source:
             fail("cleanup journal graph validation must enforce declared bounds")
-    read_journal = functions.get("read_cleanup_journal_file")
+    read_journal = functions.get("read_cleanup_bound_json_file")
     if read_journal is None:
-        fail("manager is missing read_cleanup_journal_file")
+        fail("manager is missing read_cleanup_bound_json_file")
     read_journal_source = ast.get_source_segment(manager_source, read_journal) or ""
     if "CLEANUP_JOURNAL_MAX_BYTES" not in read_journal_source:
         fail("cleanup journal reader must use the journal serialized-byte bound")
@@ -840,9 +841,18 @@ def validate_python_portability() -> None:
     ]
     if "ensure_cleanup_journal_serialized_bound" not in publish_journal_calls:
         fail("cleanup journal writer must enforce the serialized-byte bound")
+    publish_intent = functions.get("publish_cleanup_intent_file")
+    if publish_intent is None:
+        fail("manager is missing publish_cleanup_intent_file")
+    publish_intent_calls = [
+        dotted_name(node.func) for node in ast.walk(publish_intent) if isinstance(node, ast.Call)
+    ]
+    if "ensure_cleanup_journal_serialized_bound" not in publish_intent_calls:
+        fail("cleanup intent writer must enforce the serialized-byte bound")
     promote_cleanup = functions.get("promote_cleanup_tombstone")
     if promote_cleanup is None:
         fail("manager is missing promote_cleanup_tombstone")
+    promote_source = ast.get_source_segment(manager_source, promote_cleanup) or ""
     promote_calls = [
         dotted_name(node.func) for node in ast.walk(promote_cleanup) if isinstance(node, ast.Call)
     ]
@@ -850,6 +860,27 @@ def validate_python_portability() -> None:
         fail("cleanup journal builder must preflight projected serialized size")
     if "cleanup_journal_content" not in promote_calls:
         fail("cleanup journal builder must share the serialized-byte bound")
+    for required_call in (
+        "cleanup_intent_content",
+        "publish_cleanup_intent_file",
+        "validate_cleanup_intent",
+    ):
+        if required_call not in promote_calls:
+            fail("cleanup tombstone promotion must publish durable intent before moves")
+    for function_name in (
+        "cleanup_intent_source_binding",
+        "cleanup_intent_source_from_binding",
+    ):
+        if function_name not in functions:
+            fail("cleanup intent must bind sources by fixed anchor and relative path")
+    if '"source": str(source)' in manager_source:
+        fail("cleanup intent must not serialize unbound absolute source paths")
+    intent_publish_index = promote_source.find("publish_cleanup_intent_file")
+    first_move_index = promote_source.find("os.replace(source, destination)")
+    if intent_publish_index < 0 or first_move_index < 0 or intent_publish_index > first_move_index:
+        fail("cleanup tombstone promotion must publish durable intent before source moves")
+    if "allow_intent_residue=True" not in promote_source:
+        fail("cleanup journal final validation must tolerate exact intent residue")
     launch_locked = functions.get("_launch_locked")
     if launch_locked is None:
         fail("manager is missing _launch_locked")
@@ -924,6 +955,33 @@ def validate_bootstrap_publication_eexist_preserves_destination() -> None:
         residue = sorted(path.name for path in root.iterdir() if path.name != final.name)
         if residue:
             fail("cleanup journal EEXIST publication left temp residue: " + ", ".join(residue))
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-intent-eexist-") as raw:
+        root = Path(raw)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        final = root / nddev_kilo_cli.CLEANUP_INTENT_NAME
+        original_content = b"preexisting intent\n"
+        final.write_bytes(original_content)
+        final.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = final.lstat()
+        expect_manager_error(
+            "cleanup intent EEXIST publication",
+            lambda: nddev_kilo_cli.publish_cleanup_intent_file(
+                root,
+                b"replacement intent\n",
+            ),
+        )
+        after = final.lstat()
+        if (
+            final.read_bytes() != original_content
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(before.st_mode)
+            or nddev_kilo_cli.identity_of(after) != nddev_kilo_cli.identity_of(before)
+            or after.st_nlink != before.st_nlink
+        ):
+            fail("cleanup intent EEXIST publication changed the pre-existing final")
+        residue = sorted(path.name for path in root.iterdir() if path.name != final.name)
+        if residue:
+            fail("cleanup intent EEXIST publication left temp residue: " + ", ".join(residue))
 
 
 def validate_launch_guard() -> None:
