@@ -22,6 +22,15 @@ config location, and launch binary selection are source-owned by
 `cli-tools/nddev_kilo_cli.py`. Use `software-status --json` and
 `status --json` for target-specific state.
 
+Production install and launch support is limited to the canonical NDDev host
+IDs `macos-arm64`, `macos-x64`, `ubuntu-glibc-arm64`, and
+`ubuntu-glibc-x64`. Ubuntu desktop and server share the same `ID=ubuntu` glibc
+host check; upstream publishes no Ubuntu/glibc version floor, so the contract
+records that floor as `null` / `no-official-floor`. Windows, non-Ubuntu Linux,
+Linux musl, and unsupported architectures are rejected before network, staging,
+or runtime launch work. Exact upstream npm optional package names remain in the
+baseline catalog and host-to-package mapping.
+
 ## Setup And Profiles
 
 This public module currently ships the `nddev-builder` setup. The exact active

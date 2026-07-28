@@ -150,6 +150,56 @@ NPM_LOCK_ARGV = (
     f"--registry={NPM_REGISTRY}",
     KILO_PACKAGE_SPEC,
 )
+PRODUCTION_HOSTS = {
+    "macos-arm64": {
+        "os": "darwin",
+        "cpu": "arm64",
+        "libc": None,
+        "distribution": None,
+    },
+    "macos-x64": {
+        "os": "darwin",
+        "cpu": "x64",
+        "libc": None,
+        "distribution": None,
+    },
+    "ubuntu-glibc-arm64": {
+        "os": "linux",
+        "cpu": "arm64",
+        "libc": "glibc",
+        "distribution": "ubuntu",
+        "ubuntu_version_floor": None,
+        "ubuntu_version_floor_source": "no-official-floor",
+    },
+    "ubuntu-glibc-x64": {
+        "os": "linux",
+        "cpu": "x64",
+        "libc": "glibc",
+        "distribution": "ubuntu",
+        "ubuntu_version_floor": None,
+        "ubuntu_version_floor_source": "no-official-floor",
+    },
+}
+UNSUPPORTED_PLATFORM_CATEGORIES = (
+    "windows",
+    "non-ubuntu-linux",
+    "linux-musl",
+    "unsupported-architecture",
+)
+VENDOR_NATIVE_PACKAGE_PREFERENCES = {
+    "macos-arm64": ("@kilocode/cli-darwin-arm64",),
+    "macos-x64": ("@kilocode/cli-darwin-x64-baseline", "@kilocode/cli-darwin-x64"),
+    "ubuntu-glibc-arm64": ("@kilocode/cli-linux-arm64",),
+    "ubuntu-glibc-x64": ("@kilocode/cli-linux-x64-baseline", "@kilocode/cli-linux-x64"),
+}
+PRODUCTION_NATIVE_PACKAGES = (
+    "@kilocode/cli-darwin-arm64",
+    "@kilocode/cli-darwin-x64-baseline",
+    "@kilocode/cli-darwin-x64",
+    "@kilocode/cli-linux-arm64",
+    "@kilocode/cli-linux-x64-baseline",
+    "@kilocode/cli-linux-x64",
+)
 CONTROLLED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 TRUSTED_NPM_CANDIDATES = (
     "/opt/homebrew/bin/npm",
@@ -605,11 +655,16 @@ def native_package_matrix() -> tuple[dict[str, dict[str, Any]], dict[str, dict[s
     native = baseline().get("npm", {}).get("native_packages")
     if not isinstance(native, dict):
         fail("Kilo CLI baseline omits native package records")
-    supported = native.get("supported")
-    unsupported = native.get("unsupported")
-    if not isinstance(supported, dict) or not isinstance(unsupported, dict):
+    production = native.get("production")
+    catalog = native.get("catalog")
+    if not isinstance(production, dict) or not isinstance(catalog, dict):
         fail("Kilo CLI baseline native package records are invalid")
-    return supported, unsupported
+    return production, catalog
+
+
+def native_package_catalog() -> dict[str, dict[str, Any]]:
+    _production, catalog = native_package_matrix()
+    return catalog
 
 
 def package_name_from_lock_path(path: str) -> str | None:
@@ -651,92 +706,168 @@ def normalize_arch(value: str | None = None) -> str:
     return raw
 
 
-def detect_linux_libc() -> str | None:
-    if normalize_os_name() != "linux":
+def parse_os_release(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def detect_linux_distribution(
+    *,
+    os_name: str | None = None,
+    os_release_path: Path = Path("/etc/os-release"),
+) -> dict[str, Any] | None:
+    if normalize_os_name(os_name) != "linux":
+        return None
+    try:
+        raw = os_release_path.read_text(encoding="utf-8")
+    except OSError:
+        return {"id": None, "id_like": [], "version_id": None, "source": str(os_release_path)}
+    parsed = parse_os_release(raw)
+    distro_id = parsed.get("id")
+    return {
+        "id": distro_id.lower() if isinstance(distro_id, str) else None,
+        "id_like": [item.lower() for item in parsed.get("id_like", "").split() if item],
+        "version_id": parsed.get("version_id"),
+        "source": str(os_release_path),
+    }
+
+
+def detect_linux_libc(os_name: str | None = None) -> str | None:
+    if normalize_os_name(os_name) != "linux":
         return None
     if Path("/etc/alpine-release").exists():
         return "musl"
     libc_name, _libc_version = platform.libc_ver()
     if libc_name.lower() == "musl":
         return "musl"
-    return None
+    return "glibc"
 
 
-def host_native_platform() -> dict[str, str | None]:
+def host_native_platform(
+    *,
+    system_name: str | None = None,
+    machine_name: str | None = None,
+    os_release_path: Path = Path("/etc/os-release"),
+) -> dict[str, Any]:
+    os_name = normalize_os_name(system_name)
     return {
-        "os": normalize_os_name(),
-        "cpu": normalize_arch(),
-        "libc": detect_linux_libc(),
+        "os": os_name,
+        "cpu": normalize_arch(machine_name),
+        "libc": detect_linux_libc(os_name),
+        "linux_distribution": detect_linux_distribution(
+            os_name=os_name,
+            os_release_path=os_release_path,
+        ),
     }
 
 
-def native_record_matches_platform(record: dict[str, Any], host: dict[str, str | None]) -> bool:
+def platform_label(host: dict[str, Any]) -> str:
+    distro = host.get("linux_distribution")
+    distro_id = None
+    if isinstance(distro, dict):
+        distro_id = distro.get("id")
+    return (
+        f"{host.get('os')}/{host.get('cpu')}/"
+        f"{host.get('libc') or 'none'}/{distro_id or 'none'}"
+    )
+
+
+def unsupported_platform_category(host: dict[str, Any]) -> str:
+    os_name = host.get("os")
+    cpu = host.get("cpu")
+    libc = host.get("libc")
+    if os_name == "win32":
+        return "windows"
+    if os_name == "linux":
+        if cpu not in {"arm64", "x64"}:
+            return "unsupported-architecture"
+        if libc == "musl":
+            return "linux-musl"
+        distro = host.get("linux_distribution")
+        distro_id = distro.get("id") if isinstance(distro, dict) else None
+        if distro_id != "ubuntu":
+            return "non-ubuntu-linux"
+    return "unsupported-architecture"
+
+
+def canonical_product_host_id(host: dict[str, Any]) -> str:
+    os_name = host.get("os")
+    cpu = host.get("cpu")
+    libc = host.get("libc")
+    if os_name == "darwin":
+        if cpu in {"arm64", "x64"} and libc is None:
+            return f"macos-{cpu}"
+    if os_name == "linux":
+        distro = host.get("linux_distribution")
+        distro_id = distro.get("id") if isinstance(distro, dict) else None
+        if distro_id == "ubuntu" and libc == "glibc" and cpu in {"arm64", "x64"}:
+            return f"ubuntu-glibc-{cpu}"
+    category = unsupported_platform_category(host)
+    fail(
+        "Kilo CLI production host is unsupported "
+        f"({category}); supported hosts are {', '.join(PRODUCTION_HOSTS)}"
+    )
+
+
+def require_supported_production_platform(host: dict[str, Any] | None = None) -> dict[str, Any]:
+    observed = host_native_platform() if host is None else dict(host)
+    observed["product_host_id"] = canonical_product_host_id(observed)
+    return observed
+
+
+def native_record_matches_platform(record: dict[str, Any], host: dict[str, Any]) -> bool:
     os_values = record.get("os")
     cpu_values = record.get("cpu")
     libc_values = record.get("libc")
     if os_values != [host["os"]] or cpu_values != [host["cpu"]]:
         return False
     if host["os"] == "linux":
-        if host["libc"] == "musl":
-            return libc_values == ["musl"]
-        return libc_values is None
+        return host["libc"] == "glibc" and libc_values is None
     return libc_values is None
 
 
 def expected_native_records_for_host() -> dict[str, dict[str, Any]]:
-    supported, _unsupported = native_package_matrix()
-    host = host_native_platform()
-    if host["os"] not in {"darwin", "linux"} or host["cpu"] not in {"x64", "arm64"}:
-        fail(
-            "Kilo CLI native package installation is supported only on macOS and Ubuntu-compatible Linux"
-        )
+    production, _catalog = native_package_matrix()
+    host = require_supported_production_platform()
     matches = {
         package: record
-        for package, record in supported.items()
+        for package, record in production.items()
         if isinstance(record, dict) and native_record_matches_platform(record, host)
     }
     if not matches:
         fail(
             "Kilo CLI baseline has no supported native package for "
-            f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
+            f"{platform_label(host)}"
         )
     return matches
 
 
-def native_package_preference_order(host: dict[str, str | None]) -> tuple[str, ...]:
-    os_name = host["os"]
-    cpu = host["cpu"]
-    libc = host["libc"]
-    if os_name == "darwin":
-        if cpu == "arm64":
-            return ("@kilocode/cli-darwin-arm64",)
-        if cpu == "x64":
-            return ("@kilocode/cli-darwin-x64-baseline", "@kilocode/cli-darwin-x64")
-    if os_name == "linux":
-        if cpu == "arm64":
-            if libc == "musl":
-                return ("@kilocode/cli-linux-arm64-musl", "@kilocode/cli-linux-arm64")
-            return ("@kilocode/cli-linux-arm64",)
-        if cpu == "x64":
-            if libc == "musl":
-                return (
-                    "@kilocode/cli-linux-x64-baseline-musl",
-                    "@kilocode/cli-linux-x64-musl",
-                )
-            return ("@kilocode/cli-linux-x64-baseline", "@kilocode/cli-linux-x64")
-    fail(
-        "Kilo CLI native package installation is supported only on macOS and Ubuntu-compatible Linux"
-    )
+def native_package_preference_order(host: dict[str, Any]) -> tuple[str, ...]:
+    host = require_supported_production_platform(host)
+    host_id = host["product_host_id"]
+    if host_id in VENDOR_NATIVE_PACKAGE_PREFERENCES:
+        return VENDOR_NATIVE_PACKAGE_PREFERENCES[host_id]
+    fail(f"Kilo CLI baseline has no selected native package for {platform_label(host)}")
 
 
-def selected_native_package_name_for_host(host: dict[str, str | None]) -> str:
-    supported, _unsupported = native_package_matrix()
+def selected_native_package_name_for_host(host: dict[str, Any]) -> str:
+    production, _catalog = native_package_matrix()
     for package in native_package_preference_order(host):
-        if package in supported:
+        if package in production:
             return package
     fail(
         "Kilo CLI baseline has no selected native package for "
-        f"{host['os']}/{host['cpu']}/{host['libc'] or 'glibc'}"
+        f"{platform_label(host)}"
     )
 
 
@@ -3541,6 +3672,7 @@ def generate_package_lock(stage_root: Path, live_stage: Path, npm: str, env: dic
 
 
 def run_npm_install(stage_root: Path, live_stage: Path) -> None:
+    require_supported_production_platform()
     npm, path_entries = find_npm_executable()
     registry_metadata = fetch_registry_metadata()
     verify_registry_metadata(registry_metadata)
@@ -3577,6 +3709,7 @@ def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
 
 
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _install_or_update_cli_locked(target, command)
@@ -3836,6 +3969,7 @@ def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str
 
 
 def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _launch_locked(target, child_args, timeout_seconds=timeout_seconds)

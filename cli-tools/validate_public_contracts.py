@@ -40,6 +40,44 @@ MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
+EXPECTED_PLATFORM_SCOPE = {
+    "supported_hosts": [
+        {"id": "macos-arm64", "os": "darwin", "cpu": "arm64", "libc": None, "distribution": None},
+        {"id": "macos-x64", "os": "darwin", "cpu": "x64", "libc": None, "distribution": None},
+        {
+            "id": "ubuntu-glibc-arm64",
+            "os": "linux",
+            "cpu": "arm64",
+            "libc": "glibc",
+            "distribution": "ubuntu",
+            "ubuntu_version_floor": None,
+            "ubuntu_version_floor_source": "no-official-floor",
+        },
+        {
+            "id": "ubuntu-glibc-x64",
+            "os": "linux",
+            "cpu": "x64",
+            "libc": "glibc",
+            "distribution": "ubuntu",
+            "ubuntu_version_floor": None,
+            "ubuntu_version_floor_source": "no-official-floor",
+        },
+    ],
+    "unsupported_categories": [
+        "windows",
+        "non-ubuntu-linux",
+        "linux-musl",
+        "unsupported-architecture",
+    ],
+    "reject_before": ["network", "staging", "runtime-launch"],
+    "vendor_package_preferences": {
+        "macos-arm64": ["@kilocode/cli-darwin-arm64"],
+        "macos-x64": ["@kilocode/cli-darwin-x64-baseline", "@kilocode/cli-darwin-x64"],
+        "ubuntu-glibc-arm64": ["@kilocode/cli-linux-arm64"],
+        "ubuntu-glibc-x64": ["@kilocode/cli-linux-x64-baseline", "@kilocode/cli-linux-x64"],
+    },
+    "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog",
+}
 CONTRACT_KEYS = {
     "contract_version",
     "product_name",
@@ -169,6 +207,8 @@ def validate_versions() -> None:
         fail("manifest software path bound mismatch")
     if "stage_version_probe_timeout_seconds" in software.get("bounds", {}):
         fail("manifest must not declare an install-time target binary probe")
+    if software.get("platform_scope") != EXPECTED_PLATFORM_SCOPE:
+        fail("manifest platform scope must be macOS plus Ubuntu glibc only")
 
 
 def validate_contract() -> None:
@@ -257,6 +297,8 @@ def validate_contract() -> None:
         fail("software lifecycle entrypoint kind mismatch")
     if software.get("native_executable_policy") != "selected-native-package-bin-kilo":
         fail("software lifecycle native executable policy mismatch")
+    if software.get("platform_scope") != EXPECTED_PLATFORM_SCOPE:
+        fail("software lifecycle platform scope must be macOS plus Ubuntu glibc only")
     builder = contract.get("builder", {})
     if builder.get("projection") != nddev_kilo_cli.BUILDER_PROJECTION:
         fail("builder projection mismatch")
@@ -306,11 +348,16 @@ def validate_baseline() -> None:
     if native_surfaces.get("plugins") is None:
         fail("native plugin surface must be recorded")
     native_packages = npm.get("native_packages", {})
-    supported = native_packages.get("supported", {})
-    unsupported = native_packages.get("unsupported", {})
-    if not isinstance(supported, dict) or not isinstance(unsupported, dict):
-        fail("native package baseline must include supported and unsupported maps")
-    for package, record in {**supported, **unsupported}.items():
+    catalog = native_packages.get("catalog", {})
+    production = native_packages.get("production", {})
+    if not isinstance(catalog, dict) or not isinstance(production, dict):
+        fail("native package baseline must include catalog and production maps")
+    expected_production = set(nddev_kilo_cli.PRODUCTION_NATIVE_PACKAGES)
+    if set(production) != expected_production:
+        fail("native package production map is not the macOS/Ubuntu glibc allowlist")
+    if not set(production).issubset(catalog):
+        fail("native package production map is not a subset of the vendor catalog")
+    for package, record in catalog.items():
         if not package.startswith("@kilocode/cli-"):
             fail(f"native package baseline has unexpected package identity: {package}")
         if record.get("version") != KILO_VERSION:
@@ -324,12 +371,22 @@ def validate_baseline() -> None:
             fail(f"native package integrity is missing: {package}")
         if not isinstance(dist.get("shasum"), str) or not dist["shasum"]:
             fail(f"native package shasum is missing: {package}")
-    for package, record in supported.items():
-        if record.get("os") not in (["darwin"], ["linux"]):
-            fail(f"supported native package is not macOS or Linux: {package}")
-    for package, record in unsupported.items():
-        if record.get("os") != ["win32"]:
-            fail(f"unsupported native package must be explicitly Windows today: {package}")
+    for package, record in production.items():
+        if record.get("os") == ["darwin"]:
+            if record.get("cpu") not in (["arm64"], ["x64"]) or record.get("libc") is not None:
+                fail(f"macOS production native package has invalid metadata: {package}")
+        elif record.get("os") == ["linux"]:
+            if record.get("cpu") not in (["arm64"], ["x64"]) or record.get("libc") is not None:
+                fail(f"Ubuntu production native package must be glibc x64/arm64: {package}")
+            if "musl" in package:
+                fail(f"musl native package must not be production-selected: {package}")
+        else:
+            fail(f"production native package is not macOS or Ubuntu Linux: {package}")
+    for package, record in catalog.items():
+        if package in production:
+            continue
+        if record.get("os") not in (["linux"], ["win32"]):
+            fail(f"non-production vendor catalog package has unexpected OS: {package}")
     observation = baseline.get("latest_release_observation", {})
     if observation.get("cli_source") != "https://registry.npmjs.org/@kilocode/cli":
         fail("baseline must use npm dist-tags as CLI latest source")
@@ -1441,8 +1498,10 @@ def scoped_package_path(root: Path, package: str) -> Path:
 
 
 def expected_optional_native_versions() -> dict[str, str]:
-    supported, unsupported = nddev_kilo_cli.native_package_matrix()
-    return {package: nddev_kilo_cli.KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    return {
+        package: nddev_kilo_cli.KILO_CURRENT_VERSION
+        for package in nddev_kilo_cli.native_package_catalog()
+    }
 
 
 def lock_record(package: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -1460,8 +1519,7 @@ def lock_record(package: str, record: dict[str, Any]) -> dict[str, Any]:
 
 def valid_package_lock(native_packages: tuple[str, ...]) -> dict[str, Any]:
     baseline = nddev_kilo_cli.baseline()
-    supported, unsupported = nddev_kilo_cli.native_package_matrix()
-    matrix = {**supported, **unsupported}
+    matrix = nddev_kilo_cli.native_package_catalog()
     root_dist = baseline["npm"]["dist"]
     packages: dict[str, Any] = {
         "": {
@@ -1868,8 +1926,8 @@ def validate_bootstrap_lock_persistent_inode_handover() -> None:
 
 
 def validate_package_lock_regressions() -> None:
-    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
-    package = next(iter(supported))
+    production, _catalog = nddev_kilo_cli.native_package_matrix()
+    package = next(iter(production))
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-lock-") as raw:
         root = Path(raw)
         root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
@@ -1980,15 +2038,26 @@ def validate_native_selection_and_wrapper_regressions() -> None:
     cases = (
         ({"os": "darwin", "cpu": "arm64", "libc": None}, "@kilocode/cli-darwin-arm64"),
         ({"os": "darwin", "cpu": "x64", "libc": None}, "@kilocode/cli-darwin-x64-baseline"),
-        ({"os": "linux", "cpu": "arm64", "libc": None}, "@kilocode/cli-linux-arm64"),
-        ({"os": "linux", "cpu": "arm64", "libc": "musl"}, "@kilocode/cli-linux-arm64-musl"),
-        ({"os": "linux", "cpu": "x64", "libc": None}, "@kilocode/cli-linux-x64-baseline"),
         (
-            {"os": "linux", "cpu": "x64", "libc": "musl"},
-            "@kilocode/cli-linux-x64-baseline-musl",
+            {
+                "os": "linux",
+                "cpu": "arm64",
+                "libc": "glibc",
+                "linux_distribution": {"id": "ubuntu", "id_like": [], "version_id": "24.04"},
+            },
+            "@kilocode/cli-linux-arm64",
+        ),
+        (
+            {
+                "os": "linux",
+                "cpu": "x64",
+                "libc": "glibc",
+                "linux_distribution": {"id": "ubuntu", "id_like": [], "version_id": "24.04"},
+            },
+            "@kilocode/cli-linux-x64-baseline",
         ),
     )
-    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    production, _catalog = nddev_kilo_cli.native_package_matrix()
     for host, expected in cases:
         with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-select-") as raw:
             root = Path(raw)
@@ -2001,7 +2070,7 @@ def validate_native_selection_and_wrapper_regressions() -> None:
             write_fake_native_package(
                 root,
                 expected,
-                supported[expected],
+                production[expected],
                 binary,
                 tree_sitter=(host["os"] == "linux" and host["cpu"] == "x64"),
             )
@@ -2031,8 +2100,56 @@ def validate_native_selection_and_wrapper_regressions() -> None:
             with_host_platform(host, inspect_selection)
 
 
+def validate_unsupported_platforms_reject_before_side_effects() -> None:
+    rejected_hosts = (
+        {
+            "os": "linux",
+            "cpu": "x64",
+            "libc": "musl",
+            "linux_distribution": {"id": "ubuntu", "id_like": [], "version_id": "24.04"},
+        },
+        {
+            "os": "linux",
+            "cpu": "x64",
+            "libc": "glibc",
+            "linux_distribution": {"id": "debian", "id_like": [], "version_id": "12"},
+        },
+        {"os": "win32", "cpu": "x64", "libc": None, "linux_distribution": None},
+        {"os": "darwin", "cpu": "armv7", "libc": None, "linux_distribution": None},
+    )
+    for host in rejected_hosts:
+        with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-platform-deny-") as raw:
+            root = Path(raw)
+            target = root / "target"
+            before = set(root.iterdir())
+
+            def no_stage(*_args: Any, **_kwargs: Any) -> Path:
+                fail("unsupported platform reached staging")
+
+            def no_network() -> dict[str, Any]:
+                fail("unsupported platform reached network metadata fetch")
+
+            original_host_native_platform = nddev_kilo_cli.host_native_platform
+            original_mkdtemp = nddev_kilo_cli.tempfile.mkdtemp
+            original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
+            nddev_kilo_cli.host_native_platform = lambda: dict(host)
+            nddev_kilo_cli.tempfile.mkdtemp = no_stage
+            nddev_kilo_cli.fetch_registry_metadata = no_network
+            try:
+                expect_manager_error(
+                    f"unsupported production platform {host}",
+                    lambda: nddev_kilo_cli.install_or_update_cli(target, "install-cli"),
+                )
+            finally:
+                nddev_kilo_cli.host_native_platform = original_host_native_platform
+                nddev_kilo_cli.tempfile.mkdtemp = original_mkdtemp
+                nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
+            if set(root.iterdir()) != before:
+                fail(f"unsupported platform changed filesystem before rejection: {host}")
+
+
 def validate_npm_install_ignores_lifecycle_scripts() -> None:
-    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    production, _catalog = nddev_kilo_cli.native_package_matrix()
     host = nddev_kilo_cli.host_native_platform()
     selected = nddev_kilo_cli.selected_native_package_name_for_host(host)
     commands: list[tuple[list[str], dict[str, str], Path]] = []
@@ -2078,7 +2195,7 @@ def validate_npm_install_ignores_lifecycle_scripts() -> None:
                 write_fake_native_package(
                     live_stage,
                     selected,
-                    supported[selected],
+                    production[selected],
                     b"fake selected native\n",
                     tree_sitter=True,
                 )
@@ -2118,9 +2235,9 @@ def validate_npm_install_ignores_lifecycle_scripts() -> None:
 
 
 def validate_wrong_platform_native_regression() -> None:
-    supported, _unsupported = nddev_kilo_cli.native_package_matrix()
+    production, _catalog = nddev_kilo_cli.native_package_matrix()
     allowed = nddev_kilo_cli.expected_native_records_for_host()
-    wrong = next((package for package in supported if package not in allowed), None)
+    wrong = next((package for package in production if package not in allowed), None)
     if wrong is None:
         fail("wrong-platform regression has no unsupported supported-platform package")
     with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-native-") as raw:
@@ -2131,7 +2248,7 @@ def validate_wrong_platform_native_regression() -> None:
             root / nddev_kilo_cli.SOFTWARE_LOCK_RELATIVE,
             valid_package_lock((wrong,)),
         )
-        write_fake_native_package(root, wrong, supported[wrong], binary)
+        write_fake_native_package(root, wrong, production[wrong], binary)
         expect_manager_error(
             "wrong-platform installed native package",
             lambda: nddev_kilo_cli.installed_native_packages(root),
@@ -2329,6 +2446,7 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_remove_exhausts_managed_files()
         validate_package_lock_regressions()
         validate_native_selection_and_wrapper_regressions()
+        validate_unsupported_platforms_reject_before_side_effects()
         validate_npm_install_ignores_lifecycle_scripts()
         validate_wrong_platform_native_regression()
         validate_private_target_required()

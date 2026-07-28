@@ -94,6 +94,70 @@
     "bounds": {
       "max_paths": 120000,
       "max_bytes": 1073741824
+    },
+    "platform_scope": {
+      "supported_hosts": [
+        {
+          "id": "macos-arm64",
+          "os": "darwin",
+          "cpu": "arm64",
+          "libc": null,
+          "distribution": null
+        },
+        {
+          "id": "macos-x64",
+          "os": "darwin",
+          "cpu": "x64",
+          "libc": null,
+          "distribution": null
+        },
+        {
+          "id": "ubuntu-glibc-arm64",
+          "os": "linux",
+          "cpu": "arm64",
+          "libc": "glibc",
+          "distribution": "ubuntu",
+          "ubuntu_version_floor": null,
+          "ubuntu_version_floor_source": "no-official-floor"
+        },
+        {
+          "id": "ubuntu-glibc-x64",
+          "os": "linux",
+          "cpu": "x64",
+          "libc": "glibc",
+          "distribution": "ubuntu",
+          "ubuntu_version_floor": null,
+          "ubuntu_version_floor_source": "no-official-floor"
+        }
+      ],
+      "unsupported_categories": [
+        "windows",
+        "non-ubuntu-linux",
+        "linux-musl",
+        "unsupported-architecture"
+      ],
+      "reject_before": [
+        "network",
+        "staging",
+        "runtime-launch"
+      ],
+      "vendor_package_preferences": {
+        "macos-arm64": [
+          "@kilocode/cli-darwin-arm64"
+        ],
+        "macos-x64": [
+          "@kilocode/cli-darwin-x64-baseline",
+          "@kilocode/cli-darwin-x64"
+        ],
+        "ubuntu-glibc-arm64": [
+          "@kilocode/cli-linux-arm64"
+        ],
+        "ubuntu-glibc-x64": [
+          "@kilocode/cli-linux-x64-baseline",
+          "@kilocode/cli-linux-x64"
+        ]
+      },
+      "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog"
     }
   },
   "setups": [
