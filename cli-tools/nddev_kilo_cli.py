@@ -1785,9 +1785,7 @@ def cold_bootstrap_product_namespace_state(
     second_entries = bounded_cold_bootstrap_namespace_entries(root)
     second_names = tuple(entry.name for entry in second_entries)
     if second_names != tuple(names):
-        raise BootstrapAnchorAppeared(
-            "bootstrap lifecycle lock namespace changed during cold read"
-        )
+        raise BootstrapAnchorAppeared("bootstrap lifecycle lock namespace changed during cold read")
     second = root.lstat()
     if identity_of(second) != first_identity:
         raise BootstrapAnchorAppeared("bootstrap lifecycle lock root changed during cold read")
