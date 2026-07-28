@@ -206,6 +206,24 @@
       "network",
       "launch"
     ],
+    "cleanup_journal": {
+      "kind": "bounded-target-owned-cleanup-journal",
+      "root": ".nddev-kilo-cli-cleanup",
+      "journal": "journal.json",
+      "tombstone": "tombstone",
+      "schema_version": 1,
+      "root_mode": "0700",
+      "journal_mode": "0600",
+      "publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
+      "hardlink_publication_alias_recovery": "mutation-only-under-exclusive-target-lock",
+      "read_only_policy": "fail-closed-no-repair-on-incomplete-or-invalid",
+      "deletion_paths": "journal-relative-tombstone-names-only",
+      "absolute_deletion_paths": false,
+      "top_level_cleanup_pending": true,
+      "pending_noop_policy": "drain-is-lifecycle-work",
+      "max_paths": 121328,
+      "max_bytes": 1356857344
+    },
     "plan_changed_paths": "actual-byte-diff",
     "mutation_changed_paths": "actual-byte-diff"
   },

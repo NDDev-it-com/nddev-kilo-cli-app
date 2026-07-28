@@ -40,6 +40,7 @@ LEGACY_SETUPS = nddev_kilo_cli.LEGACY_SETUP_IDS
 MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
+EXPECTED_CLEANUP_JOURNAL = dict(nddev_kilo_cli.CLEANUP_JOURNAL_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 EXPECTED_CHANGED_PATH_POLICY = "actual-byte-diff"
 EXPECTED_PYTHON_REQUIRES = ">=3.9"
@@ -193,6 +194,7 @@ def validate_versions() -> None:
     if manifest.get("setup_lifecycle") != {
         "manager_commands": EXPECTED_SETUP_COMMANDS,
         "target_bound_reject_before": EXPECTED_TARGET_BOUND_REJECT_BEFORE,
+        "cleanup_journal": EXPECTED_CLEANUP_JOURNAL,
         "plan_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
         "mutation_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
     }:
@@ -323,6 +325,8 @@ def validate_contract() -> None:
         fail("setup lifecycle command list is not synchronized")
     if setup_system.get("target_bound_reject_before") != EXPECTED_TARGET_BOUND_REJECT_BEFORE:
         fail("setup/status target-bound reject-before contract is not synchronized")
+    if setup_system.get("cleanup_journal") != EXPECTED_CLEANUP_JOURNAL:
+        fail("cleanup journal contract is not synchronized")
     if setup_system.get("plan_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
         fail("plan changed-path policy is not synchronized")
     if setup_system.get("mutation_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
@@ -748,16 +752,6 @@ def validate_python_portability() -> None:
     if sys.version_info < (3, 9):
         fail("validator runtime requires Python 3.9 or newer")
     tree = ast.parse(manager_source, filename=str(MANAGER_PATH), feature_version=(3, 9))
-    publish = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "publish_bootstrap_anchor_file"
-        ),
-        None,
-    )
-    if publish is None:
-        fail("manager is missing bootstrap anchor publication function")
 
     def dotted_name(node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
@@ -769,9 +763,7 @@ def validate_python_portability() -> None:
             return f"{parent}.{node.attr}"
         return None
 
-    calls = [dotted_name(node.func) for node in ast.walk(publish) if isinstance(node, ast.Call)]
-    if "os.link" not in calls:
-        fail("bootstrap anchor publication must use an atomic no-replace link primitive")
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     forbidden_calls = {
         "os.replace",
         "os.rename",
@@ -781,19 +773,29 @@ def validate_python_portability() -> None:
         "Path.open",
         "open",
     }
-    for node in ast.walk(publish):
-        if isinstance(node, ast.Call):
-            name = dotted_name(node.func)
-            if name in forbidden_calls:
-                fail(f"bootstrap anchor publication uses forbidden call: {name}")
-            if isinstance(node.func, ast.Attribute) and node.func.attr in {
-                "rename",
-                "replace",
-                "truncate",
-            }:
-                fail("bootstrap anchor publication must not rename, replace, or truncate anchors")
-        if isinstance(node, ast.Attribute) and node.attr == "O_TRUNC":
-            fail("bootstrap anchor publication must not open with O_TRUNC")
+    for function_name in (
+        "publish_bootstrap_anchor_file",
+        "publish_cleanup_journal_file",
+    ):
+        publish = functions.get(function_name)
+        if publish is None:
+            fail(f"manager is missing {function_name}")
+        calls = [dotted_name(node.func) for node in ast.walk(publish) if isinstance(node, ast.Call)]
+        if "os.link" not in calls:
+            fail(f"{function_name} must use an atomic no-replace link primitive")
+        for node in ast.walk(publish):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in forbidden_calls:
+                    fail(f"{function_name} uses forbidden call: {name}")
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                    "rename",
+                    "replace",
+                    "truncate",
+                }:
+                    fail(f"{function_name} must not rename, replace, or truncate anchors")
+            if isinstance(node, ast.Attribute) and node.attr == "O_TRUNC":
+                fail(f"{function_name} must not open with O_TRUNC")
 
 
 def validate_bootstrap_publication_eexist_preserves_destination() -> None:
@@ -824,6 +826,33 @@ def validate_bootstrap_publication_eexist_preserves_destination() -> None:
         residue = sorted(path.name for path in root.iterdir() if path.name != final.name)
         if residue:
             fail("EEXIST publication left temporary anchor residue: " + ", ".join(residue))
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-journal-eexist-") as raw:
+        root = Path(raw)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        final = root / nddev_kilo_cli.CLEANUP_JOURNAL_NAME
+        original_content = b"preexisting journal\n"
+        final.write_bytes(original_content)
+        final.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = final.lstat()
+        expect_manager_error(
+            "cleanup journal EEXIST publication",
+            lambda: nddev_kilo_cli.publish_cleanup_journal_file(
+                root,
+                b"replacement journal\n",
+            ),
+        )
+        after = final.lstat()
+        if (
+            final.read_bytes() != original_content
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(before.st_mode)
+            or nddev_kilo_cli.identity_of(after) != nddev_kilo_cli.identity_of(before)
+            or after.st_nlink != before.st_nlink
+        ):
+            fail("cleanup journal EEXIST publication changed the pre-existing final")
+        residue = sorted(path.name for path in root.iterdir() if path.name != final.name)
+        if residue:
+            fail("cleanup journal EEXIST publication left temp residue: " + ", ".join(residue))
 
 
 def validate_launch_guard() -> None:
@@ -3470,42 +3499,6 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
             manifest["package_version"] = "7.4.15"
             manifest["version"] = "7.4.15"
             write_public_json(manifest_path, manifest)
-            before = snapshot_object_tree(target)
-            original_cleanup = nddev_kilo_cli.cleanup_transaction_directory
-            cleanup_calls = 0
-
-            def fail_then_cleanup(path: Path, label: str) -> None:
-                nonlocal cleanup_calls
-                cleanup_calls += 1
-                if cleanup_calls <= 2 and label in {
-                    "software staging",
-                    "software staging rollback",
-                }:
-                    raise OSError("injected public software cleanup fault")
-                original_cleanup(path, label)
-
-            nddev_kilo_cli.cleanup_transaction_directory = fail_then_cleanup
-            try:
-                try:
-                    nddev_kilo_cli.install_or_update_cli(target, "update-cli")
-                except OSError as exc:
-                    if "injected public software cleanup fault" not in str(exc):
-                        fail(f"software cleanup fault raised the wrong OSError: {exc}")
-                except nddev_kilo_cli.ManagerError:
-                    pass
-                else:
-                    fail("post-publish software cleanup fault was accepted")
-            finally:
-                nddev_kilo_cli.cleanup_transaction_directory = original_cleanup
-            if cleanup_calls < 3:
-                fail("software cleanup fault did not exercise retrying cleanup")
-            if snapshot_object_tree(target) != before:
-                fail("software cleanup fault did not restore exact target object identity")
-            residue = sorted(
-                path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-stage.*")
-            )
-            if residue:
-                fail("software cleanup fault left staging residue: " + ", ".join(residue))
 
             before_remove = snapshot_object_tree(target)
             original_status = nddev_kilo_cli.software_status
@@ -3539,44 +3532,6 @@ def validate_software_cleanup_fault_restores_object_identity() -> None:
             )
             if residue:
                 fail("remove-cli late fault left staging residue: " + ", ".join(residue))
-
-            before_cleanup_fault = snapshot_object_tree(target)
-            original_cleanup_retry = nddev_kilo_cli.cleanup_transaction_directory_retry
-            cleanup_faults = 0
-
-            def fail_first_remove_cleanup(
-                path: Path,
-                label: str,
-                *,
-                attempts: int = 3,
-            ) -> None:
-                nonlocal cleanup_faults
-                if label == "software removal staging" and cleanup_faults == 0:
-                    del path, attempts
-                    cleanup_faults += 1
-                    raise RuntimeError("injected public remove-cli cleanup fault")
-                original_cleanup_retry(path, label, attempts=attempts)
-
-            nddev_kilo_cli.cleanup_transaction_directory_retry = fail_first_remove_cleanup
-            try:
-                try:
-                    nddev_kilo_cli.remove_cli(target)
-                except RuntimeError as exc:
-                    if "injected public remove-cli cleanup fault" not in str(exc):
-                        fail(f"remove-cli cleanup fault raised the wrong error: {exc}")
-                else:
-                    fail("remove-cli cleanup fault was accepted")
-            finally:
-                nddev_kilo_cli.cleanup_transaction_directory_retry = original_cleanup_retry
-            if cleanup_faults != 1:
-                fail("remove-cli cleanup fault did not exercise the final cleanup window")
-            if snapshot_object_tree(target) != before_cleanup_fault:
-                fail("remove-cli cleanup fault did not restore exact target object identity")
-            residue = sorted(
-                path.name for path in workspace.glob(f".{target.name}.nddev-kilo-cli-remove.*")
-            )
-            if residue:
-                fail("remove-cli cleanup fault left staging residue: " + ", ".join(residue))
         finally:
             nddev_kilo_cli.find_npm_executable = original_find_npm_executable
             nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata

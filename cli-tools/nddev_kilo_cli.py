@@ -215,6 +215,14 @@ SOFTWARE_PREFIX_RELATIVE = Path("install") / "npm-prefix"
 SOFTWARE_GLOBAL_DIR_RELATIVE = SOFTWARE_PREFIX_RELATIVE / "lib"
 SOFTWARE_LOCK_RELATIVE = Path("software") / "package-lock.json"
 BACKUP_POOL_RELATIVE = Path(".nddev-kilo-cli-backups")
+CLEANUP_RELATIVE = Path(".nddev-kilo-cli-cleanup")
+CLEANUP_JOURNAL_NAME = "journal.json"
+CLEANUP_TOMBSTONE_NAME = "tombstone"
+CLEANUP_SCHEMA = 1
+CLEANUP_MAX_PATHS = SOFTWARE_TREE_MAX_PATHS + MAX_BACKUPS * (len(MANAGED_FILES) * 4 + 16) + 128
+CLEANUP_MAX_BYTES = SOFTWARE_TREE_MAX_BYTES + MAX_BACKUPS * (
+    (len(MANAGED_FILES) + 1) * MANAGED_PAYLOAD_MAX_BYTES
+)
 LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 LOCK_FILE_NAME = "lock"
 LOCK_OWNER_NAME = "owner.json"
@@ -271,6 +279,24 @@ BOOTSTRAP_LOCK_CONTRACT = {
 BOOTSTRAP_LOCK_BINDING_KEYS = frozenset(
     {"schema_version", "product_name", "target", "target_sha256"}
 )
+CLEANUP_JOURNAL_CONTRACT = {
+    "kind": "bounded-target-owned-cleanup-journal",
+    "root": CLEANUP_RELATIVE.as_posix(),
+    "journal": CLEANUP_JOURNAL_NAME,
+    "tombstone": CLEANUP_TOMBSTONE_NAME,
+    "schema_version": CLEANUP_SCHEMA,
+    "root_mode": "0700",
+    "journal_mode": "0600",
+    "publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
+    "hardlink_publication_alias_recovery": "mutation-only-under-exclusive-target-lock",
+    "read_only_policy": "fail-closed-no-repair-on-incomplete-or-invalid",
+    "deletion_paths": "journal-relative-tombstone-names-only",
+    "absolute_deletion_paths": False,
+    "top_level_cleanup_pending": True,
+    "pending_noop_policy": "drain-is-lifecycle-work",
+    "max_paths": CLEANUP_MAX_PATHS,
+    "max_bytes": CLEANUP_MAX_BYTES,
+}
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
@@ -2929,10 +2955,21 @@ def rollback_managed_object_transaction(transaction: ManagedObjectTransaction) -
     fail("managed object rollback did not restore exact pre-state")
 
 
-def commit_managed_object_transaction(transaction: ManagedObjectTransaction) -> None:
-    remove_path_durable_retry(transaction.hold_root, "managed hold")
+def commit_managed_object_transaction(
+    transaction: ManagedObjectTransaction,
+    *,
+    cleanup_paths: list[tuple[str, Path]] | None = None,
+) -> None:
+    if path_exists_no_follow(transaction.hold_root):
+        if not any(transaction.hold_root.iterdir()):
+            remove_empty_directory_durable_retry(transaction.hold_root, "managed hold")
+            return
+        if cleanup_paths is None:
+            remove_path_durable_retry(transaction.hold_root, "managed hold")
+        else:
+            cleanup_paths.append(("managed-hold", transaction.hold_root))
     residue = managed_object_transaction_residue(transaction)
-    if residue:
+    if residue and cleanup_paths is None:
         fail("managed transaction left hold residue: " + ", ".join(residue))
 
 
@@ -3627,17 +3664,26 @@ def backup_transaction_residue(pool: Path) -> list[str]:
     return sorted(residue)
 
 
-def commit_backup_transactions(transactions: list[BackupSlotTransaction]) -> None:
+def commit_backup_transactions(
+    transactions: list[BackupSlotTransaction],
+    *,
+    cleanup_paths: list[tuple[str, Path]] | None = None,
+) -> None:
     for transaction in transactions:
         fsync_directory(transaction.pool, f"backup pool {transaction.pool}")
         if transaction.previous_dir is not None:
-            remove_path_durable_retry(
-                transaction.previous_dir,
-                f"retired backup slot {transaction.slot}",
-            )
+            if cleanup_paths is None:
+                remove_path_durable_retry(
+                    transaction.previous_dir,
+                    f"retired backup slot {transaction.slot}",
+                )
+            else:
+                cleanup_paths.append(
+                    (f"retired-backup-slot-{transaction.slot}", transaction.previous_dir)
+                )
         fsync_directory(transaction.pool, f"backup pool {transaction.pool}")
         residue = backup_transaction_residue(transaction.pool)
-        if residue:
+        if residue and cleanup_paths is None:
             fail("backup transaction left temp/hold residue: " + ", ".join(residue))
         validate_backup_slot_directory(transaction.target, transaction.slot_dir, transaction.slot)
 
@@ -3922,7 +3968,13 @@ def setup_mutation_result(
     operation: str,
     preflight: SetupMutationPreflight,
     backup_slot: int | None,
+    *,
+    cleanup_pending: bool = False,
 ) -> dict[str, Any]:
+    _pending, cleanup_pending_detail = cleanup_pending_summary(
+        target,
+        allow_publication_alias=cleanup_pending,
+    )
     return {
         "operation": operation,
         "setup_id": preflight.setup_id,
@@ -3931,6 +3983,8 @@ def setup_mutation_result(
         "backup_slot": backup_slot,
         "changed_paths": preflight.changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
     }
 
 
@@ -3943,6 +3997,9 @@ def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
+        cleanup_pending = path_exists_no_follow(cleanup_root_path(target))
+        if cleanup_pending:
+            return _mutate_setup_locked(target, setup_id, profile_id, operation, backup_slot)
         preflight = setup_mutation_preflight(target, setup_id, profile_id, operation)
         if not preflight.changed_paths:
             return setup_mutation_result(target, operation, preflight, backup_slot)
@@ -3954,6 +4011,15 @@ def update_setup(target: Path) -> dict[str, Any]:
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
+        cleanup_pending = path_exists_no_follow(cleanup_root_path(target))
+        if cleanup_pending:
+            return _mutate_setup_locked(
+                target,
+                DEFAULT_SETUP_ID,
+                None,
+                "update",
+                backup_slot,
+            )
         preflight = setup_mutation_preflight(target, DEFAULT_SETUP_ID, None, "update")
         if not preflight.changed_paths:
             return setup_mutation_result(target, "update", preflight, backup_slot)
@@ -3975,6 +4041,14 @@ def _mutate_setup_locked(
 ) -> dict[str, Any]:
     with target_lock(target, create_parent=(operation == "install")) as transaction:
         ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                operation,
+                operation=operation,
+                setup_id=setup_id,
+                profile_id=profile_id,
+            )
         preflight = setup_mutation_preflight(target, setup_id, profile_id, operation)
         backup_transactions: list[BackupSlotTransaction] = []
         if (
@@ -4003,12 +4077,20 @@ def _mutate_setup_locked(
                 changed_paths=preflight.changed_paths,
                 managed_transaction=managed_transaction,
             )
-            commit_backup_transactions(backup_transactions)
-            commit_managed_object_transaction(managed_transaction)
+            cleanup_paths: list[tuple[str, Path]] = []
+            commit_backup_transactions(backup_transactions, cleanup_paths=cleanup_paths)
+            commit_managed_object_transaction(managed_transaction, cleanup_paths=cleanup_paths)
+            cleanup_pending = finish_post_commit_cleanup(target, operation, cleanup_paths)
         except Exception:
             rollback_lifecycle_state(target, [managed_transaction], backup_transactions)
             raise
-    return setup_mutation_result(target, operation, preflight, backup_slot)
+    return setup_mutation_result(
+        target,
+        operation,
+        preflight,
+        backup_slot,
+        cleanup_pending=cleanup_pending,
+    )
 
 
 def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -> str:
@@ -4037,6 +4119,12 @@ def _migrate_setup_locked(
     target: Path, profile_id: str | None, backup_slot: int | None
 ) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                "migrate",
+                operation="migrate",
+            )
         stamp = require_clean_installed(target)
         if stamp_is_active(stamp):
             profile = profile_id or stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
@@ -4063,8 +4151,10 @@ def _migrate_setup_locked(
                 changed_paths=changed_paths,
                 managed_transaction=managed_transaction,
             )
-            commit_backup_transactions(backup_transactions)
-            commit_managed_object_transaction(managed_transaction)
+            cleanup_paths: list[tuple[str, Path]] = []
+            commit_backup_transactions(backup_transactions, cleanup_paths=cleanup_paths)
+            commit_managed_object_transaction(managed_transaction, cleanup_paths=cleanup_paths)
+            cleanup_pending = finish_post_commit_cleanup(target, "migrate", cleanup_paths)
         except Exception:
             rollback_lifecycle_state(target, [managed_transaction], backup_transactions)
             raise
@@ -4076,6 +4166,11 @@ def _migrate_setup_locked(
         "backup_slot": backup_slot,
         "changed_paths": changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_summary(
+            target,
+            allow_publication_alias=cleanup_pending,
+        )[1],
     }
 
 
@@ -4090,6 +4185,12 @@ def restore_setup(target: Path, slot: int) -> dict[str, Any]:
 
 def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                "restore",
+                operation="restore",
+            )
         require_private_target_directory_for_software(target, allow_missing=False)
         setup_id, desired = desired_for_backup(target, slot)
         changed_paths = stable_changed_paths_for_desired(target, desired)
@@ -4107,7 +4208,9 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
                 changed_paths=changed_paths,
                 managed_transaction=managed_transaction,
             )
-            commit_managed_object_transaction(managed_transaction)
+            cleanup_paths: list[tuple[str, Path]] = []
+            commit_managed_object_transaction(managed_transaction, cleanup_paths=cleanup_paths)
+            cleanup_pending = finish_post_commit_cleanup(target, "restore", cleanup_paths)
         except Exception:
             rollback_lifecycle_state(target, [managed_transaction], [])
             raise
@@ -4118,6 +4221,11 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
         "backup_slot": slot,
         "changed_paths": changed_paths,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_summary(
+            target,
+            allow_publication_alias=cleanup_pending,
+        )[1],
     }
 
 
@@ -4130,6 +4238,12 @@ def remove_setup(target: Path) -> dict[str, Any]:
 
 def _remove_setup_locked(target: Path) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                "remove",
+                operation="remove",
+            )
         stamp = require_clean_installed(target)
         desired = desired_for_remove(target)
         changed_paths = stable_changed_paths_for_desired(target, desired)
@@ -4147,7 +4261,9 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
                 changed_paths=changed_paths,
                 managed_transaction=managed_transaction,
             )
-            commit_managed_object_transaction(managed_transaction)
+            cleanup_paths: list[tuple[str, Path]] = []
+            commit_managed_object_transaction(managed_transaction, cleanup_paths=cleanup_paths)
+            cleanup_pending = finish_post_commit_cleanup(target, "remove", cleanup_paths)
         except Exception:
             rollback_lifecycle_state(target, [managed_transaction], [])
             raise
@@ -4157,6 +4273,11 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
         "target": str(target),
         "changed_paths": changed_paths,
         "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_summary(
+            target,
+            allow_publication_alias=cleanup_pending,
+        )[1],
     }
 
 
@@ -4167,6 +4288,7 @@ def status_payload(target: Path) -> dict[str, Any]:
             with bootstrap_read_lifecycle_lock(target) as locked_target:
                 target = resolve_target(locked_target, create=False)
                 software = software_status(target)
+                cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
                 stamp = read_stamp(target)
                 if stamp is None:
                     return {
@@ -4174,6 +4296,8 @@ def status_payload(target: Path) -> dict[str, Any]:
                         "target": str(target),
                         "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
                         "software": software,
+                        "cleanup_pending": cleanup_pending,
+                        "cleanup_pending_detail": cleanup_pending_detail,
                     }
                 drift = drift_paths(target, stamp)
                 active = stamp_is_active(stamp)
@@ -4192,6 +4316,8 @@ def status_payload(target: Path) -> dict[str, Any]:
                     ),
                     "backup_pool": str(backup_pool(target)),
                     "software": software,
+                    "cleanup_pending": cleanup_pending,
+                    "cleanup_pending_detail": cleanup_pending_detail,
                 }
         except BootstrapAnchorAppeared:
             continue
@@ -4209,6 +4335,7 @@ def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
                 stamp = read_stamp(target) if target.exists() else None
                 operation = "install" if stamp is None else "switch"
                 desired = desired_for_setup(target, setup_id, profile_id)
+                cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
                 return {
                     "operation": operation,
                     "setup_id": setup_id,
@@ -4218,6 +4345,8 @@ def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
                     "managed_files": list(MANAGED_FILES),
                     "changed_paths": stable_changed_paths_for_desired(target, desired),
                     "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
+                    "cleanup_pending": cleanup_pending,
+                    "cleanup_pending_detail": cleanup_pending_detail,
                 }
         except BootstrapAnchorAppeared:
             continue
@@ -5419,6 +5548,7 @@ def software_presence(target: Path) -> dict[str, Any]:
 
 
 def software_status(target: Path) -> dict[str, Any]:
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     if not require_private_target_directory_for_software(target, allow_missing=True):
         return {
             "schema_version": 1,
@@ -5432,6 +5562,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "partial": False,
             "replace_paths_present": [],
             "owned_parent_paths_present": [],
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     presence = software_presence(target)
     executable = kilo_executable(target)
@@ -5445,6 +5577,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "version": None,
             "executable": str(executable),
             **presence,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     try:
         manifest = read_json_file(
@@ -5463,6 +5597,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "executable": str(executable),
             **presence,
             "validation_error": str(exc),
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     try:
         expected = build_software_manifest(target)
@@ -5495,6 +5631,8 @@ def software_status(target: Path) -> dict[str, Any]:
         "selected_native_package_path": manifest.get("selected_native_package_path"),
         "runtime_resource_contract": manifest.get("runtime_resource_contract"),
         **presence,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
     }
     if validation_error is not None:
         result["validation_error"] = validation_error
@@ -6133,6 +6271,719 @@ def cleanup_transaction_directory_retry(path: Path, label: str, *, attempts: int
     fail(f"{label} cleanup left residue: {path}")
 
 
+def cleanup_root_path(target: Path) -> Path:
+    return target / CLEANUP_RELATIVE
+
+
+def cleanup_journal_path(target: Path) -> Path:
+    return cleanup_root_path(target) / CLEANUP_JOURNAL_NAME
+
+
+def cleanup_tombstone_path(target: Path) -> Path:
+    return cleanup_root_path(target) / CLEANUP_TOMBSTONE_NAME
+
+
+def cleanup_graph_records(root: Path) -> list[dict[str, Any]]:
+    require_directory(root, "cleanup tombstone")
+    records: list[dict[str, Any]] = []
+    path_counter = {"value": 0}
+    byte_counter = {"value": 0}
+
+    def add_record(path: Path, relative: str) -> None:
+        path_counter["value"] += 1
+        if path_counter["value"] > CLEANUP_MAX_PATHS:
+            fail("cleanup tombstone exceeds the bounded path limit")
+        info = path.lstat()
+        record: dict[str, Any] = {
+            "path": relative,
+            "uid": owner_of(info),
+            "mode": stat.S_IMODE(info.st_mode),
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "mtime_ns": info.st_mtime_ns,
+            "nlink": info.st_nlink,
+            "size": info.st_size,
+        }
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"cleanup tombstone must not contain symlinks: {path}")
+        elif stat.S_ISDIR(info.st_mode):
+            record["kind"] = "directory"
+            if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+                fail(f"cleanup tombstone directory is not owned by the current user: {path}")
+        elif stat.S_ISREG(info.st_mode):
+            record["kind"] = "file"
+            record["sha256"] = digest_regular_file(
+                path, f"cleanup tombstone {relative}", byte_counter
+            )
+            if byte_counter["value"] > CLEANUP_MAX_BYTES:
+                fail("cleanup tombstone exceeds the bounded byte limit")
+        else:
+            fail(f"cleanup tombstone contains unsupported path type: {path}")
+        records.append(record)
+
+    add_record(root, ".")
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        current_path = Path(current)
+        for directory in directories:
+            path = current_path / directory
+            add_record(path, path.relative_to(root).as_posix())
+        for filename in files:
+            path = current_path / filename
+            add_record(path, path.relative_to(root).as_posix())
+    return records
+
+
+def cleanup_journal_publication_aliases(target: Path) -> list[Path]:
+    root = cleanup_root_path(target)
+    journal = cleanup_journal_path(target)
+    try:
+        journal_info = journal.lstat()
+    except FileNotFoundError:
+        return []
+    aliases: list[Path] = []
+    prefix = f".{CLEANUP_JOURNAL_NAME}.tmp-"
+    for entry in sorted(root.iterdir(), key=lambda item: item.name):
+        if entry.name in {CLEANUP_JOURNAL_NAME, CLEANUP_TOMBSTONE_NAME}:
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(info) == identity_of(journal_info):
+            if entry.name.startswith(prefix) and stat.S_ISREG(info.st_mode):
+                aliases.append(entry)
+                continue
+            fail("cleanup pending journal has an unknown hard-link alias")
+        fail("cleanup pending root object set is not exact")
+    if journal_info.st_nlink == 1:
+        if aliases:
+            fail("cleanup pending journal alias does not match final link count")
+        return []
+    if journal_info.st_nlink == 2 and len(aliases) == 1:
+        return aliases
+    fail("cleanup pending journal hard-link alias set is not exact")
+
+
+def cleanup_record_matches(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    allow_directory_drain_metadata: bool = False,
+) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        fail("cleanup tombstone must not contain symlinks")
+    if (
+        owner_of(info) != record.get("uid")
+        or stat.S_IMODE(info.st_mode) != record.get("mode")
+        or info.st_dev != record.get("dev")
+        or info.st_ino != record.get("ino")
+    ):
+        return False
+    kind = record.get("kind")
+    if kind == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if allow_directory_drain_metadata:
+            return True
+        if (
+            info.st_nlink != record.get("nlink")
+            or info.st_size != record.get("size")
+            or info.st_mtime_ns != record.get("mtime_ns")
+        ):
+            return False
+        return stat.S_ISDIR(info.st_mode) and (
+            not hasattr(os, "geteuid") or owner_of(info) == os.geteuid()
+        )
+    if (
+        info.st_nlink != record.get("nlink")
+        or info.st_size != record.get("size")
+        or info.st_mtime_ns != record.get("mtime_ns")
+    ):
+        return False
+    if kind == "file":
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        expected_digest = record.get("sha256")
+        if not isinstance(expected_digest, str):
+            fail("cleanup journal file digest is invalid")
+        observed = digest_regular_file(path, "cleanup pending file", {"value": 0})
+        return observed == expected_digest
+    fail("cleanup journal object kind is unsupported")
+
+
+def cleanup_record_path(target: Path, relative: str) -> Path:
+    root = cleanup_tombstone_path(target)
+    return root if relative == "." else root / safe_relative_path(relative)
+
+
+def cleanup_record_parent(relative: str) -> str | None:
+    if relative == ".":
+        return None
+    parts = Path(relative).parts
+    if not parts:
+        fail("cleanup pending journal graph path is invalid")
+    if len(parts) == 1:
+        return "."
+    return Path(*parts[:-1]).as_posix()
+
+
+def cleanup_declared_children(records: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    children = {
+        relative: set() for relative, record in records.items() if record.get("kind") == "directory"
+    }
+    for relative, record in records.items():
+        if relative == ".":
+            continue
+        parent = cleanup_record_parent(relative)
+        if parent not in records or records[parent].get("kind") != "directory":
+            fail("cleanup pending journal graph omits a parent directory")
+        name = Path(relative).name
+        if not name:
+            fail("cleanup pending journal graph path is invalid")
+        children.setdefault(parent, set()).add(name)
+        if record.get("kind") == "directory":
+            children.setdefault(relative, set())
+    return children
+
+
+def cleanup_directory_stable_matches(path: Path, record: dict[str, Any]) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and owner_of(info) == record.get("uid")
+        and stat.S_IMODE(info.st_mode) == record.get("mode")
+        and info.st_dev == record.get("dev")
+        and info.st_ino == record.get("ino")
+    )
+
+
+def validate_cleanup_remaining_child_set(
+    target: Path,
+    relative: str,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    path = cleanup_record_path(target, relative)
+    if not path_exists_no_follow(path):
+        return
+    record = records[relative]
+    if record.get("kind") != "directory":
+        return
+    if not cleanup_directory_stable_matches(path, record):
+        fail("cleanup pending tombstone directory identity mismatch")
+    current_names = {entry.name for entry in path.iterdir()}
+    expected_names = {
+        name
+        for name in children.get(relative, set())
+        if path_exists_no_follow(
+            cleanup_record_path(
+                target,
+                name if relative == "." else f"{relative}/{name}",
+            )
+        )
+    }
+    if current_names != expected_names:
+        fail("cleanup pending tombstone child set is not journal-declared")
+
+
+def validate_cleanup_remaining_shape(
+    target: Path,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    for relative, record in records.items():
+        path = cleanup_record_path(target, relative)
+        if not path_exists_no_follow(path):
+            continue
+        if record.get("kind") == "file":
+            if not cleanup_record_matches(path, record):
+                fail("cleanup pending tombstone object identity mismatch")
+            continue
+        if record.get("kind") == "directory":
+            validate_cleanup_remaining_child_set(target, relative, records, children)
+            continue
+        fail("cleanup pending journal object kind is unsupported")
+
+
+def cleanup_ancestor_relatives(relative: str) -> list[str]:
+    ancestors: list[str] = []
+    parent = cleanup_record_parent(relative)
+    while parent is not None:
+        ancestors.append(parent)
+        parent = cleanup_record_parent(parent)
+    return ancestors
+
+
+def validate_cleanup_ancestors_before_delete(
+    target: Path,
+    relative: str,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    for ancestor in cleanup_ancestor_relatives(relative):
+        if ancestor in records:
+            validate_cleanup_remaining_child_set(target, ancestor, records, children)
+
+
+def validate_cleanup_graph_records(
+    journal: dict[str, Any], target: Path
+) -> dict[str, dict[str, Any]]:
+    graph = journal["graph"]
+    if not isinstance(graph, list) or not graph:
+        fail("cleanup pending journal graph is invalid")
+    records: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(graph):
+        if not isinstance(record, dict):
+            fail(f"cleanup pending journal graph record {index} is invalid")
+        kind = record.get("kind")
+        expected_keys = {
+            "path",
+            "kind",
+            "uid",
+            "mode",
+            "dev",
+            "ino",
+            "mtime_ns",
+            "nlink",
+            "size",
+        }
+        if kind == "file":
+            expected_keys.add("sha256")
+        require_exact_keys(record, expected_keys, f"cleanup journal graph record {index}")
+        relative = record["path"]
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or any(part in {"", ".."} for part in Path(relative).parts)
+        ):
+            fail(f"cleanup pending journal graph path {index} is invalid")
+        if relative in records:
+            fail(f"cleanup pending journal graph path is duplicated: {relative}")
+        if kind not in {"directory", "file"}:
+            fail(f"cleanup pending journal graph kind {index} is unsupported")
+        for key in ("uid", "mode", "dev", "ino", "mtime_ns", "nlink", "size"):
+            value = record[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                fail(f"cleanup pending journal graph {relative} {key} is invalid")
+        if kind == "file" and not is_sha256_hex(record["sha256"]):
+            fail(f"cleanup pending journal graph {relative} digest is invalid")
+        records[relative] = record
+    if "." not in records:
+        fail("cleanup pending journal graph omits the tombstone root")
+    entry_tombstones = {entry["tombstone"] for entry in journal["entries"]}
+    for tombstone in entry_tombstones:
+        if tombstone not in records:
+            fail("cleanup pending journal omits a declared tombstone root")
+    children = cleanup_declared_children(records)
+    tombstone_root = cleanup_tombstone_path(target)
+    if path_exists_no_follow(tombstone_root):
+        for current, directories, files in os.walk(tombstone_root):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for name in [*directories, *files]:
+                path = current_path / name
+                relative = path.relative_to(tombstone_root).as_posix()
+                if relative not in records:
+                    fail("cleanup pending tombstone contains an unjournaled object")
+    all_present = all(
+        path_exists_no_follow(cleanup_record_path(target, relative)) for relative in records
+    )
+    if all_present:
+        for relative, record in records.items():
+            path = cleanup_record_path(target, relative)
+            if not cleanup_record_matches(path, record):
+                fail("cleanup pending tombstone object identity mismatch")
+    else:
+        validate_cleanup_remaining_shape(target, records, children)
+    return records
+
+
+def read_cleanup_journal_file(path: Path) -> dict[str, Any]:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        fail("cleanup pending journal must be a regular non-symlink file")
+    if before.st_nlink not in {1, 2}:
+        fail("cleanup pending journal has unexpected hard-link aliases")
+    if not is_owner_only_file(before):
+        fail("cleanup pending journal must be owned by the current user with mode 0600")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(before):
+            raise ConcurrentTargetChange("cleanup pending journal changed while it was opened")
+        content = os.read(descriptor, METADATA_MAX_BYTES + 1)
+        if len(content) > METADATA_MAX_BYTES:
+            fail("cleanup pending journal exceeds the bounded read limit")
+    finally:
+        os.close(descriptor)
+    return parse_json_object(content, "cleanup pending journal")
+
+
+def validate_cleanup_journal(
+    target: Path, *, allow_publication_alias: bool = False
+) -> dict[str, Any]:
+    root = cleanup_root_path(target)
+    root_info = require_directory(root, "cleanup pending root")
+    if not is_owner_private_directory(root_info):
+        fail("cleanup pending root must be private to the current user with mode 0700")
+    aliases = cleanup_journal_publication_aliases(target)
+    if aliases and not allow_publication_alias:
+        fail("cleanup pending journal publication is incomplete")
+    if not allow_publication_alias:
+        try:
+            info = cleanup_journal_path(target).lstat()
+        except FileNotFoundError:
+            fail("cleanup pending journal is missing")
+        if info.st_nlink != 1:
+            fail("cleanup pending journal must be fully published for read-only inspection")
+    journal = read_cleanup_journal_file(cleanup_journal_path(target))
+    require_exact_keys(
+        journal,
+        {
+            "schema_version",
+            "product_name",
+            "build_version",
+            "target",
+            "command",
+            "root",
+            "tombstone",
+            "entries",
+            "graph",
+        },
+        "cleanup pending journal",
+    )
+    if journal["schema_version"] != CLEANUP_SCHEMA:
+        fail("cleanup pending journal schema is unsupported")
+    if journal["product_name"] != PRODUCT_NAME or journal["build_version"] != VERSION:
+        fail("cleanup pending journal belongs to another product/build")
+    if journal["target"] != str(target):
+        fail("cleanup pending journal is bound to a different target")
+    target_info = require_directory(target, "target")
+    if not is_owner_private_directory(target_info):
+        fail("cleanup pending target must be private to the current user with mode 0700")
+    if not isinstance(journal["command"], str) or not journal["command"]:
+        fail("cleanup pending journal command is invalid")
+    if journal["root"] != CLEANUP_RELATIVE.as_posix():
+        fail("cleanup pending journal root is invalid")
+    if journal["tombstone"] != CLEANUP_TOMBSTONE_NAME:
+        fail("cleanup pending journal tombstone is invalid")
+    entries = journal["entries"]
+    if not isinstance(entries, list) or not entries:
+        fail("cleanup pending journal entries are invalid")
+    seen_tombstones: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            fail(f"cleanup pending journal entry {index} is invalid")
+        require_exact_keys(entry, {"kind", "tombstone"}, f"cleanup journal entry {index}")
+        if not isinstance(entry["kind"], str) or not entry["kind"]:
+            fail(f"cleanup pending journal entry {index} kind is invalid")
+        tombstone = entry["tombstone"]
+        if (
+            not isinstance(tombstone, str)
+            or tombstone in seen_tombstones
+            or Path(tombstone).is_absolute()
+            or any(part in {"", ".", ".."} for part in Path(tombstone).parts)
+        ):
+            fail(f"cleanup pending journal entry {index} tombstone is invalid")
+        seen_tombstones.add(tombstone)
+    validate_cleanup_graph_records(journal, target)
+    return journal
+
+
+def cleanup_pending_payload(
+    target: Path, *, allow_publication_alias: bool = False
+) -> dict[str, Any]:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return {"entry_count": 0, "kinds": [], "command": None}
+    journal = validate_cleanup_journal(
+        target,
+        allow_publication_alias=allow_publication_alias,
+    )
+    kinds = sorted({entry["kind"] for entry in journal["entries"]})
+    return {
+        "entry_count": len(journal["entries"]),
+        "kinds": kinds,
+        "command": journal["command"],
+        "max_paths": CLEANUP_MAX_PATHS,
+        "max_bytes": CLEANUP_MAX_BYTES,
+    }
+
+
+def cleanup_pending_summary(
+    target: Path, *, allow_publication_alias: bool = False
+) -> tuple[bool, dict[str, Any]]:
+    pending = path_exists_no_follow(cleanup_root_path(target))
+    return pending, cleanup_pending_payload(
+        target,
+        allow_publication_alias=allow_publication_alias,
+    )
+
+
+def ensure_no_unknown_cleanup_pending(target: Path) -> None:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return
+    validate_cleanup_journal(target, allow_publication_alias=True)
+
+
+def recover_cleanup_journal_publication_alias(target: Path) -> None:
+    root = cleanup_root_path(target)
+    journal = cleanup_journal_path(target)
+    try:
+        journal_info = journal.lstat()
+    except FileNotFoundError:
+        return
+    if journal_info.st_nlink == 1:
+        return
+    aliases = cleanup_journal_publication_aliases(target)
+    aliases[0].unlink()
+    fsync_directory(root, f"cleanup pending root {root}")
+    require_regular_file(journal, "cleanup pending journal", owner_only=True)
+
+
+def remove_exact_cleanup_entry(path: Path, record: dict[str, Any]) -> None:
+    if not path_exists_no_follow(path):
+        return
+    if record["kind"] == "file":
+        if not cleanup_record_matches(path, record):
+            fail("cleanup pending tombstone object changed before deletion")
+        path.unlink()
+        fsync_parent_directory(path, f"cleanup tombstone parent {path.parent}")
+        return
+    if record["kind"] == "directory":
+        if not cleanup_directory_stable_matches(path, record):
+            fail("cleanup pending tombstone directory changed before deletion")
+        if any(path.iterdir()):
+            fail("cleanup pending directory is not empty")
+        try:
+            path.rmdir()
+        except OSError as exc:
+            raise ManagerError("cleanup pending directory is not empty") from exc
+        fsync_parent_directory(path, f"cleanup tombstone parent {path.parent}")
+        return
+    fail("cleanup pending tombstone object kind is unsupported")
+
+
+def republish_cleanup_journal(target: Path, content: bytes) -> None:
+    journal = cleanup_journal_path(target)
+    if path_exists_no_follow(journal):
+        return
+    root = cleanup_root_path(target)
+    if not path_exists_no_follow(root):
+        root.mkdir(mode=OWNER_DIR_MODE)
+        root.chmod(OWNER_DIR_MODE)
+        fsync_parent_directory(root, "cleanup pending parent")
+    post_publish_issue = publish_cleanup_journal_file(root, content)
+    if post_publish_issue:
+        recover_cleanup_journal_publication_alias(target)
+
+
+def drain_cleanup_pending(target: Path) -> tuple[bool, bool]:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return False, False
+    recover_cleanup_journal_publication_alias(target)
+    journal = validate_cleanup_journal(target, allow_publication_alias=True)
+    journal_content = canonical_json(journal)
+    records = validate_cleanup_graph_records(journal, target)
+    children = cleanup_declared_children(records)
+    try:
+        tombstone_root = cleanup_tombstone_path(target)
+        for relative, record in sorted(
+            records.items(),
+            key=lambda item: len(Path(item[0]).parts),
+            reverse=True,
+        ):
+            validate_cleanup_ancestors_before_delete(target, relative, records, children)
+            path = (
+                tombstone_root if relative == "." else tombstone_root / safe_relative_path(relative)
+            )
+            remove_exact_cleanup_entry(path, record)
+        cleanup_journal_path(target).unlink()
+        fsync_directory(
+            cleanup_root_path(target), f"cleanup pending root {cleanup_root_path(target)}"
+        )
+        cleanup_root_path(target).rmdir()
+        fsync_parent_directory(cleanup_root_path(target), "cleanup pending parent")
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            republish_cleanup_journal(target, journal_content)
+        return False, True
+    if path_exists_no_follow(cleanup_root_path(target)):
+        fail("cleanup pending tombstone drain left residue")
+    return True, False
+
+
+def publish_cleanup_journal_file(root: Path, content: bytes) -> bool:
+    journal = root / CLEANUP_JOURNAL_NAME
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{CLEANUP_JOURNAL_NAME}.tmp-",
+        dir=root,
+    )
+    temporary = Path(temporary_name)
+    linked = False
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                fail("cleanup pending journal write made no forward progress")
+            offset += written
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary, journal)
+        except FileExistsError:
+            fail("cleanup pending journal already exists")
+        linked = True
+        try:
+            remove_path_durable_retry(temporary, "cleanup pending journal temporary")
+            fsync_directory(root, f"cleanup pending root {root}")
+        except BaseException:
+            return True
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not linked:
+            remove_path_durable(temporary)
+
+
+def promote_cleanup_tombstone(
+    target: Path,
+    command: str,
+    cleanup_paths: list[tuple[str, Path]],
+) -> bool | None:
+    present = [(kind, path) for kind, path in cleanup_paths if path_exists_no_follow(path)]
+    if not present:
+        return None
+    ensure_no_unknown_cleanup_pending(target)
+    root = cleanup_root_path(target)
+    if path_exists_no_follow(root):
+        fail("cleanup pending journal already exists")
+    root.mkdir(mode=OWNER_DIR_MODE)
+    root.chmod(OWNER_DIR_MODE)
+    tombstone_root = cleanup_tombstone_path(target)
+    tombstone_root.mkdir(mode=OWNER_DIR_MODE)
+    moved: list[dict[str, str]] = []
+    source_by_tombstone: dict[str, Path] = {}
+    try:
+        for index, (kind, source) in enumerate(present):
+            destination_name = f"{index}-{kind}"
+            destination = tombstone_root / destination_name
+            if path_exists_no_follow(destination):
+                fail("cleanup tombstone destination already exists")
+            source_parent = source.parent
+            os.replace(source, destination)
+            fsync_directory(tombstone_root, f"cleanup tombstone {tombstone_root}")
+            if path_exists_no_follow(source_parent):
+                fsync_directory(source_parent, f"cleanup source parent {source_parent}")
+            moved.append(
+                {
+                    "kind": kind,
+                    "tombstone": destination_name,
+                }
+            )
+            source_by_tombstone[destination_name] = source
+        journal = {
+            "schema_version": CLEANUP_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "build_version": VERSION,
+            "target": str(target),
+            "command": command,
+            "root": CLEANUP_RELATIVE.as_posix(),
+            "tombstone": CLEANUP_TOMBSTONE_NAME,
+            "entries": moved,
+            "graph": cleanup_graph_records(tombstone_root),
+        }
+        post_publish_issue = publish_cleanup_journal_file(root, canonical_json(journal))
+        if post_publish_issue:
+            return True
+        validate_cleanup_journal(target)
+        return False
+    except BaseException:
+        if moved:
+            if path_exists_no_follow(cleanup_journal_path(target)):
+                return True
+            for entry in reversed(moved):
+                destination = tombstone_root / entry["tombstone"]
+                source = source_by_tombstone[entry["tombstone"]]
+                if path_exists_no_follow(destination):
+                    os.replace(destination, source)
+                    fsync_parent_directory(source, f"cleanup source parent {source.parent}")
+            cleanup_transaction_directory_retry(root, "failed cleanup pending root")
+            raise
+        cleanup_transaction_directory_retry(root, "failed cleanup pending root")
+        raise
+
+
+def finish_post_commit_cleanup(
+    target: Path,
+    command: str,
+    cleanup_paths: list[tuple[str, Path]],
+) -> bool:
+    post_publish_issue = promote_cleanup_tombstone(target, command, cleanup_paths)
+    if post_publish_issue is None:
+        return False
+    if post_publish_issue:
+        return True
+    _drained, pending = drain_cleanup_pending(target)
+    return pending
+
+
+def drain_cleanup_before_mutation(target: Path) -> bool:
+    _drained, pending = drain_cleanup_pending(target)
+    return pending
+
+
+def cleanup_pending_mutation_result(
+    target: Path,
+    command: str,
+    *,
+    operation: str | None = None,
+    setup_id: str | None = None,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(
+        target,
+        allow_publication_alias=True,
+    )
+    result: dict[str, Any] = {
+        "target": str(target),
+        "changed": False,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
+    }
+    if operation is not None:
+        result["operation"] = operation
+        result["changed_paths"] = []
+        result["builder"] = {"enabled": True, "projection": BUILDER_PROJECTION}
+    else:
+        result["schema_version"] = 1
+        result["command"] = command
+    if setup_id is not None:
+        result["setup_id"] = setup_id
+    if profile_id is not None:
+        result["permission_profile"] = profile_id
+    return result
+
+
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
     require_supported_production_platform()
     if command not in {"install-cli", "update-cli"}:
@@ -6144,30 +6995,37 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
 
 def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
     target_existed_before = path_exists_no_follow(target)
-    preflight = software_status(target)
-    if command == "install-cli":
-        if preflight.get("partial"):
-            fail("partial target-owned Kilo CLI software state exists; use update-cli")
-        if preflight.get("replace_paths_present") or preflight.get("owned_parent_paths_present"):
-            fail("Kilo CLI software already exists; use update-cli")
-    if command == "update-cli":
-        if preflight["software_state"] == "absent":
-            fail("Kilo CLI is not installed at the selected target; use install-cli")
-        if preflight["installed"] and preflight["current"]:
-            return {
-                "schema_version": 1,
-                "command": command,
-                "target": str(target),
-                "changed": False,
-                "version": preflight["version"],
-                "executable": preflight["executable"],
-                "selected_native_package": preflight.get("selected_native_package"),
-                "native_executable": preflight.get("native_executable"),
-                "wrapper_sha256": preflight.get("wrapper_sha256"),
-            }
+    cleanup_pending_exists = path_exists_no_follow(cleanup_root_path(target))
+    if not cleanup_pending_exists:
+        preflight = software_status(target)
+        if command == "install-cli":
+            if preflight.get("partial"):
+                fail("partial target-owned Kilo CLI software state exists; use update-cli")
+            if preflight.get("replace_paths_present") or preflight.get(
+                "owned_parent_paths_present"
+            ):
+                fail("Kilo CLI software already exists; use update-cli")
+        if command == "update-cli":
+            if preflight["software_state"] == "absent":
+                fail("Kilo CLI is not installed at the selected target; use install-cli")
+            if preflight["installed"] and preflight["current"]:
+                return {
+                    "schema_version": 1,
+                    "command": command,
+                    "target": str(target),
+                    "changed": False,
+                    "version": preflight["version"],
+                    "executable": preflight["executable"],
+                    "selected_native_package": preflight.get("selected_native_package"),
+                    "native_executable": preflight.get("native_executable"),
+                    "wrapper_sha256": preflight.get("wrapper_sha256"),
+                    "cleanup_pending": False,
+                    "cleanup_pending_detail": cleanup_pending_summary(target)[1],
+                }
     staging: Path | None = None
     software_transaction: SoftwareReplaceTransaction | None = None
     published = False
+    cleanup_pending = False
     with target_lock(target, create_parent=(command == "install-cli")) as transaction:
         try:
             ensure_private_directory(
@@ -6175,6 +7033,8 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                 create=(command == "install-cli"),
                 transaction=transaction,
             )
+            if drain_cleanup_before_mutation(target):
+                return cleanup_pending_mutation_result(target, command)
             status = software_status(target)
             if command == "install-cli":
                 if status.get("partial"):
@@ -6196,6 +7056,8 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                         "selected_native_package": status.get("selected_native_package"),
                         "native_executable": status.get("native_executable"),
                         "wrapper_sha256": status.get("wrapper_sha256"),
+                        "cleanup_pending": False,
+                        "cleanup_pending_detail": cleanup_pending_summary(target)[1],
                     }
             staging = Path(
                 tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-stage.")
@@ -6209,10 +7071,11 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             software_transaction = replace_software_state(target, live_stage, staging)
             published = True
             installation = require_current_software(target)
-            try:
-                cleanup_transaction_directory(staging, "software staging")
-            except BaseException:
-                raise
+            cleanup_pending = finish_post_commit_cleanup(
+                target,
+                command,
+                [("software-staging", staging)],
+            )
             staging = None
         except BaseException as original:
             rollback_error: BaseException | None = None
@@ -6250,6 +7113,11 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
         "selected_native_package": installation.get("selected_native_package"),
         "native_executable": installation.get("native_executable"),
         "wrapper_sha256": installation.get("wrapper_sha256"),
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_summary(
+            target,
+            allow_publication_alias=cleanup_pending,
+        )[1],
     }
 
 
@@ -6261,13 +7129,19 @@ def remove_cli(target: Path) -> dict[str, Any]:
 
 
 def _remove_cli_locked(target: Path) -> dict[str, Any]:
-    status = software_status(target)
-    if status["software_state"] == "absent":
+    cleanup_pending_exists = path_exists_no_follow(cleanup_root_path(target))
+    if not cleanup_pending_exists:
+        status = software_status(target)
+    else:
+        status = None
+    if status is not None and status["software_state"] == "absent":
         return {
             "schema_version": 1,
             "command": "remove-cli",
             "target": str(target),
             "changed": False,
+            "cleanup_pending": False,
+            "cleanup_pending_detail": cleanup_pending_summary(target)[1],
         }
     staging: Path | None = None
     hold: Path | None = None
@@ -6275,8 +7149,21 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
     expected_state: dict[str, TreeEntry] | None = None
     expected_object_state: dict[str, dict[str, ObjectEntry] | None] | None = None
     changed = False
+    cleanup_pending = False
     try:
         with target_lock(target):
+            if drain_cleanup_before_mutation(target):
+                return cleanup_pending_mutation_result(target, "remove-cli")
+            status = software_status(target)
+            if status["software_state"] == "absent":
+                return {
+                    "schema_version": 1,
+                    "command": "remove-cli",
+                    "target": str(target),
+                    "changed": False,
+                    "cleanup_pending": False,
+                    "cleanup_pending_detail": cleanup_pending_summary(target)[1],
+                }
             staging = Path(
                 tempfile.mkdtemp(
                     dir=target.parent,
@@ -6297,7 +7184,11 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
                 final_status = software_status(target)
                 if final_status["software_state"] != "absent":
                     fail("removed Kilo CLI left target-owned software residue")
-                cleanup_transaction_directory_retry(staging, "software removal staging")
+                cleanup_pending = finish_post_commit_cleanup(
+                    target,
+                    "remove-cli",
+                    [("software-removal", staging)],
+                )
                 staging = None
             except BaseException as original:
                 rollback_error: BaseException | None = None
@@ -6346,6 +7237,11 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
             "command": "remove-cli",
             "target": str(target),
             "changed": changed,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_summary(
+                target,
+                allow_publication_alias=cleanup_pending,
+            )[1],
         }
     finally:
         if staging is not None:
