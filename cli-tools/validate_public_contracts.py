@@ -132,6 +132,16 @@ def validate_versions() -> None:
         fail("manifest launch executable revalidation must be enabled")
     if runtime.get("denies_lifecycle_mutations_while_running") is not True:
         fail("manifest launch mutation denial contract mismatch")
+    expected_workspace_scope = {
+        "target_role": "managed-runtime-home",
+        "default": "captured-caller-cwd",
+        "manager_flag": "--workspace",
+        "native_form": ["run", "--dir", "<workspace>"],
+        "child_cwd": "same-resolved-workspace",
+        "explicit_workspace": "absolute-existing-directory-final-component-not-symlink",
+    }
+    if runtime.get("workspace_scope") != expected_workspace_scope:
+        fail("manifest launch workspace scope contract mismatch")
     if runtime.get("executable_handoff") != {
         "kind": "write-protected-verified-path",
         "portable_fd_execution": False,
@@ -200,6 +210,16 @@ def validate_contract() -> None:
         fail("runtime launch must revalidate the executable before child start")
     if runtime_launch.get("denies_lifecycle_mutations_while_running") is not True:
         fail("runtime launch must deny lifecycle mutations while running")
+    expected_workspace_scope = {
+        "target_role": "managed-runtime-home",
+        "default": "captured-caller-cwd",
+        "manager_flag": "--workspace",
+        "native_form": ["run", "--dir", "<workspace>"],
+        "child_cwd": "same-resolved-workspace",
+        "explicit_workspace": "absolute-existing-directory-final-component-not-symlink",
+    }
+    if runtime_launch.get("workspace_scope") != expected_workspace_scope:
+        fail("runtime launch workspace scope contract mismatch")
     handoff = runtime_launch.get("executable_handoff")
     if handoff != {
         "kind": "write-protected-verified-path",
@@ -595,21 +615,38 @@ def validate_manager_parse_args() -> None:
     nddev_kilo_cli.parse_args(["migrate", "--profile", "safe", "--target", "/tmp/nddev-kilo-check"])
     nddev_kilo_cli.parse_args(["status", "--target", "/tmp/nddev-kilo-check", "--json"])
     nddev_kilo_cli.parse_args(["software-status", "--target", "/tmp/nddev-kilo-check", "--json"])
+    nddev_kilo_cli.parse_args(
+        [
+            "launch",
+            "--target",
+            "/tmp/nddev-kilo-check",
+            "--workspace",
+            "/tmp",
+            "--",
+            "prompt",
+        ]
+    )
 
 
 def validate_launch_guard() -> None:
     executable = "/tmp/nddev-kilo-check/bin/kilo"
+    workspace = ROOT
     expected = {
-        "full-auto": [executable, "run", "--auto", "prompt"],
-        "safe": [executable, "run", "prompt"],
+        "full-auto": [executable, "run", "--dir", str(ROOT), "--auto", "prompt"],
+        "safe": [executable, "run", "--dir", str(ROOT), "prompt"],
     }
     for profile_id, command in expected.items():
-        observed = nddev_kilo_cli.launch_command_for_profile(executable, profile_id, ["prompt"])
+        observed = nddev_kilo_cli.launch_command_for_profile(
+            executable,
+            profile_id,
+            ["prompt"],
+            workspace,
+        )
         if observed != command:
             fail(f"{profile_id}: launch argv mismatch")
     for setup_id in LEGACY_SETUPS:
         try:
-            nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"])
+            nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"], workspace)
         except nddev_kilo_cli.ManagerError:
             continue
         fail(f"legacy setup launch helper accepted {setup_id}")
@@ -631,6 +668,7 @@ def validate_launch_guard() -> None:
         ["--", "-f/tmp/secret"],
         ["--", "--", "--auto"],
         ["--", "prompt", "--", "--dangerously-skip-permissions"],
+        ["--", "--dir", "/tmp/other"],
         ["--", "--dir=/tmp/other"],
         ["--", "--attach", "http://127.0.0.1:4096"],
         ["--", "--share"],

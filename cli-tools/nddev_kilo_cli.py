@@ -3942,26 +3942,86 @@ def normalize_launch_child_args(child_args: list[str]) -> list[str]:
     return forwarded
 
 
-def launch_command_for_profile(executable: str, profile_id: str, forwarded: list[str]) -> list[str]:
+def resolve_launch_workspace(raw_workspace: str | Path | None) -> Path:
+    if raw_workspace is None:
+        try:
+            raw = Path.cwd()
+        except OSError as exc:
+            raise ManagerError("launch workspace cannot be captured from the current directory") from exc
+    else:
+        raw = Path(raw_workspace)
+        if not raw.is_absolute():
+            fail("launch workspace must be an absolute path")
+    try:
+        raw_info = raw.lstat()
+    except FileNotFoundError:
+        fail("launch workspace is missing")
+    if stat.S_ISLNK(raw_info.st_mode):
+        fail("launch workspace final path component must not be a symlink")
+    if not stat.S_ISDIR(raw_info.st_mode):
+        fail("launch workspace must be a directory")
+    try:
+        resolved = raw.resolve(strict=True)
+    except FileNotFoundError:
+        fail("launch workspace disappeared during resolution")
+    resolved_info = require_directory(resolved, "launch workspace")
+    if not os.access(resolved, os.R_OK | os.X_OK):
+        fail("launch workspace is not accessible to the current user")
+    if identity_of(raw_info) != identity_of(resolved_info):
+        raise ConcurrentTargetChange("launch workspace changed during resolution")
+    return resolved
+
+
+def launch_command_for_profile(
+    executable: str,
+    profile_id: str,
+    forwarded: list[str],
+    workspace: Path | str | None = None,
+) -> list[str]:
+    resolved_workspace = resolve_launch_workspace(workspace)
+    base = [executable, "run", "--dir", os.fspath(resolved_workspace)]
     if profile_id == "full-auto":
-        return [executable, "run", "--auto", *forwarded]
-    return [executable, "run", *forwarded]
+        return [*base, "--auto", *forwarded]
+    return [*base, *forwarded]
 
 
-def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str]) -> list[str]:
+def launch_command_for_setup(
+    executable: str,
+    setup_id: str,
+    forwarded: list[str],
+    workspace: Path | str | None = None,
+) -> list[str]:
     """Backward-compatible helper for callers that passed legacy setup ids."""
     if setup_id == DEFAULT_SETUP_ID:
-        return launch_command_for_profile(executable, DEFAULT_PROFILE_ID, forwarded)
+        return launch_command_for_profile(executable, DEFAULT_PROFILE_ID, forwarded, workspace)
     fail(f"legacy setup cannot be launched: {setup_id}")
 
 
-def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+def launch(
+    target: Path,
+    child_args: list[str],
+    *,
+    timeout_seconds: int = 3600,
+    workspace: str | Path | None = None,
+) -> int:
+    resolved_workspace = resolve_launch_workspace(workspace)
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
-        return _launch_locked(target, child_args, timeout_seconds=timeout_seconds)
+        return _launch_locked(
+            target,
+            child_args,
+            timeout_seconds=timeout_seconds,
+            workspace=resolved_workspace,
+        )
 
 
-def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+def _launch_locked(
+    target: Path,
+    child_args: list[str],
+    *,
+    timeout_seconds: int = 3600,
+    workspace: Path,
+) -> int:
     if timeout_seconds <= 0:
         fail("launch timeout must be positive")
     forwarded = normalize_launch_child_args(child_args)
@@ -3976,10 +4036,12 @@ def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int 
                 revalidate_launch_executable(target, installation),
                 profile_id,
                 forwarded,
+                workspace,
             )
             try:
                 process = subprocess.Popen(
                     command,
+                    cwd=workspace,
                     env=env,
                     start_new_session=(os.name == "posix"),
                 )
@@ -4077,6 +4139,10 @@ def build_parser() -> argparse.ArgumentParser:
         "launch", help="launch Kilo with isolated HOME and KILO_CONFIG"
     )
     launch_parser.add_argument("--target", required=True)
+    launch_parser.add_argument(
+        "--workspace",
+        help="absolute project workspace passed to Kilo run --dir and used as the child cwd",
+    )
     launch_parser.add_argument("--timeout-seconds", type=int, default=3600)
     launch_parser.add_argument("child_args", nargs=argparse.REMAINDER)
 
@@ -4128,7 +4194,12 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_cli(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "launch":
-        return launch(Path(args.target), args.child_args, timeout_seconds=args.timeout_seconds)
+        return launch(
+            Path(args.target),
+            args.child_args,
+            timeout_seconds=args.timeout_seconds,
+            workspace=args.workspace,
+        )
     fail(f"unknown command: {args.command}")
 
 

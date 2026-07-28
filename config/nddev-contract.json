@@ -22,6 +22,18 @@
     "auto_for_profiles": [
       "full-auto"
     ],
+    "workspace_scope": {
+      "target_role": "managed-runtime-home",
+      "default": "captured-caller-cwd",
+      "manager_flag": "--workspace",
+      "native_form": [
+        "run",
+        "--dir",
+        "<workspace>"
+      ],
+      "child_cwd": "same-resolved-workspace",
+      "explicit_workspace": "absolute-existing-directory-final-component-not-symlink"
+    },
     "config_env": "KILO_CONFIG",
     "config_path": "xdg-config/kilo/kilo.jsonc",
     "isolated_child_home": true,
