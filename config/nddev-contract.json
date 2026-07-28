@@ -103,6 +103,15 @@
     ],
     "explicit_absolute_target": true,
     "target_bound_backup_slots": 10,
+    "target_bound_reject_before": [
+      "target",
+      "setup",
+      "bootstrap-lock",
+      "internal-lock",
+      "staging",
+      "network",
+      "launch"
+    ],
     "plan_changed_paths": "actual-byte-diff",
     "mutation_changed_paths": "actual-byte-diff"
   },

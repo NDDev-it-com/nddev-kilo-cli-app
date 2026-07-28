@@ -58,6 +58,15 @@ EXPECTED_SOFTWARE_COMMANDS = [
     "update-cli",
     "remove-cli",
 ]
+EXPECTED_TARGET_BOUND_REJECT_BEFORE = [
+    "target",
+    "setup",
+    "bootstrap-lock",
+    "internal-lock",
+    "staging",
+    "network",
+    "launch",
+]
 EXPECTED_PLATFORM_SCOPE = {
     "supported_hosts": [
         {"id": "macos-arm64", "os": "darwin", "cpu": "arm64", "libc": None, "distribution": None},
@@ -175,6 +184,7 @@ def validate_versions() -> None:
         fail("manifest managed state list is not synchronized")
     if manifest.get("setup_lifecycle") != {
         "manager_commands": EXPECTED_SETUP_COMMANDS,
+        "target_bound_reject_before": EXPECTED_TARGET_BOUND_REJECT_BEFORE,
         "plan_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
         "mutation_changed_paths": EXPECTED_CHANGED_PATH_POLICY,
     }:
@@ -300,6 +310,8 @@ def validate_contract() -> None:
     expected_lifecycle = [*EXPECTED_SETUP_COMMANDS, *EXPECTED_SOFTWARE_COMMANDS, "launch"]
     if setup_system.get("lifecycle") != expected_lifecycle:
         fail("setup lifecycle command list is not synchronized")
+    if setup_system.get("target_bound_reject_before") != EXPECTED_TARGET_BOUND_REJECT_BEFORE:
+        fail("setup/status target-bound reject-before contract is not synchronized")
     if setup_system.get("plan_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
         fail("plan changed-path policy is not synchronized")
     if setup_system.get("mutation_changed_paths") != EXPECTED_CHANGED_PATH_POLICY:
@@ -2364,6 +2376,37 @@ def validate_unsupported_platforms_reject_before_side_effects() -> None:
         },
     }
     operations = (
+        ("status", lambda target: nddev_kilo_cli.status_payload(target)),
+        (
+            "plan",
+            lambda target: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        ),
+        (
+            "install",
+            lambda target: nddev_kilo_cli.mutate_setup(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                "install",
+            ),
+        ),
+        (
+            "switch",
+            lambda target: nddev_kilo_cli.mutate_setup(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+                "switch",
+            ),
+        ),
+        ("update", lambda target: nddev_kilo_cli.update_setup(target)),
+        ("migrate", lambda target: nddev_kilo_cli.migrate_setup(target, None)),
+        ("restore", lambda target: nddev_kilo_cli.restore_setup(target, 0)),
+        ("remove", lambda target: nddev_kilo_cli.remove_setup(target)),
         (
             "software-status",
             lambda target: nddev_kilo_cli.software_status_command(target),
@@ -2385,12 +2428,21 @@ def validate_unsupported_platforms_reject_before_side_effects() -> None:
             for command, operation in operations:
                 target = root / f"target-{category}-{command}"
                 before = sorted(path.name for path in root.iterdir())
+                before_bootstrap = snapshot_bootstrap_root_shallow(
+                    nddev_kilo_cli.bootstrap_lock_root()
+                )
 
                 def no_lock(*_args: Any, **_kwargs: Any) -> Any:
                     fail(f"{command} reached bootstrap lock on unsupported {category}")
 
                 def no_target_inspection(*_args: Any, **_kwargs: Any) -> bool:
                     fail(f"{command} inspected target on unsupported {category}")
+
+                def no_setup_read(*_args: Any, **_kwargs: Any) -> Any:
+                    fail(f"{command} read setup/profile on unsupported {category}")
+
+                def no_internal_lock(*_args: Any, **_kwargs: Any) -> Any:
+                    fail(f"{command} reached internal lock on unsupported {category}")
 
                 def no_stage(*_args: Any, **_kwargs: Any) -> Path:
                     fail(f"{command} reached staging on unsupported {category}")
@@ -2403,11 +2455,19 @@ def validate_unsupported_platforms_reject_before_side_effects() -> None:
                 original_private_target = (
                     nddev_kilo_cli.require_private_target_directory_for_software
                 )
+                original_resolve_target = nddev_kilo_cli.resolve_target
+                original_load_setup = nddev_kilo_cli.load_setup
+                original_load_profile = nddev_kilo_cli.load_profile
+                original_target_lock = nddev_kilo_cli.target_lock
                 original_mkdtemp = nddev_kilo_cli.tempfile.mkdtemp
                 original_fetch_registry_metadata = nddev_kilo_cli.fetch_registry_metadata
                 nddev_kilo_cli.host_native_platform = lambda: dict(host)
                 nddev_kilo_cli.bootstrap_lifecycle_lock = no_lock
                 nddev_kilo_cli.require_private_target_directory_for_software = no_target_inspection
+                nddev_kilo_cli.resolve_target = no_target_inspection
+                nddev_kilo_cli.load_setup = no_setup_read
+                nddev_kilo_cli.load_profile = no_setup_read
+                nddev_kilo_cli.target_lock = no_internal_lock
                 nddev_kilo_cli.tempfile.mkdtemp = no_stage
                 nddev_kilo_cli.fetch_registry_metadata = no_network
                 try:
@@ -2421,12 +2481,23 @@ def validate_unsupported_platforms_reject_before_side_effects() -> None:
                     nddev_kilo_cli.require_private_target_directory_for_software = (
                         original_private_target
                     )
+                    nddev_kilo_cli.resolve_target = original_resolve_target
+                    nddev_kilo_cli.load_setup = original_load_setup
+                    nddev_kilo_cli.load_profile = original_load_profile
+                    nddev_kilo_cli.target_lock = original_target_lock
                     nddev_kilo_cli.tempfile.mkdtemp = original_mkdtemp
                     nddev_kilo_cli.fetch_registry_metadata = original_fetch_registry_metadata
                 if sorted(path.name for path in root.iterdir()) != before:
                     fail(
                         f"{command} left target/lock/stage residue before unsupported "
                         f"{category} rejection"
+                    )
+                if (
+                    snapshot_bootstrap_root_shallow(nddev_kilo_cli.bootstrap_lock_root())
+                    != before_bootstrap
+                ):
+                    fail(
+                        f"{command} left bootstrap residue before unsupported {category} rejection"
                     )
 
 

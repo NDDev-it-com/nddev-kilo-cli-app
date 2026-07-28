@@ -181,6 +181,15 @@
       "restore",
       "remove"
     ],
+    "target_bound_reject_before": [
+      "target",
+      "setup",
+      "bootstrap-lock",
+      "internal-lock",
+      "staging",
+      "network",
+      "launch"
+    ],
     "plan_changed_paths": "actual-byte-diff",
     "mutation_changed_paths": "actual-byte-diff"
   },

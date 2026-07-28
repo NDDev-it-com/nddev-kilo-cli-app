@@ -398,6 +398,23 @@ class TreeEntry:
     content: bytes | str | None = None
 
 
+@dataclass(frozen=True)
+class ObjectEntry:
+    kind: str
+    mode: int
+    identity: tuple[int, int]
+    mtime_ns: int
+    size: int
+    content: bytes | str | None = None
+
+
+@dataclass
+class LockOwnerTransaction:
+    target: Path
+    hold_path: Path
+    pre_state: dict[str, ObjectEntry] | None
+
+
 @dataclass
 class BackupSlotTransaction:
     target: Path
@@ -416,6 +433,27 @@ class SetupMutationPreflight:
     stamp: dict[str, Any] | None
     desired: dict[str, bytes | None]
     changed_paths: list[str]
+
+
+@dataclass
+class ManagedObjectTransaction:
+    target: Path
+    hold_root: Path
+    pre_states: dict[str, dict[str, ObjectEntry] | None]
+    parent_states: dict[str, ObjectEntry | None]
+    changed_paths: list[str]
+
+
+@dataclass
+class SoftwareReplaceTransaction:
+    target: Path
+    hold: Path
+    live_stage: Path
+    moved_old: list[Path]
+    installed_new: list[Path]
+    preexisting_parent_paths: set[Path]
+    expected_state: dict[str, TreeEntry]
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None]
 
 
 def fail(message: str) -> NoReturn:
@@ -1294,6 +1332,141 @@ def lock_owner_path(target: Path) -> Path:
     return lock_path(target) / LOCK_OWNER_NAME
 
 
+def lock_owner_hold_path(target: Path) -> Path:
+    return lock_path(target) / f".{LOCK_OWNER_NAME}.hold-{os.getpid()}-{time.time_ns()}"
+
+
+def begin_lock_owner_transaction(target: Path) -> LockOwnerTransaction:
+    owner = lock_owner_path(target)
+    hold = lock_owner_hold_path(target)
+    pre_state = snapshot_object_tree_state(
+        owner,
+        "target lock owner",
+        max_file_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_tree_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_paths=1,
+    )
+    if path_exists_no_follow(hold):
+        remove_path_durable_retry(hold, "preexisting target lock owner hold")
+    if pre_state is not None:
+        os.replace(owner, hold)
+        fsync_directory(owner.parent, f"target lock parent {owner.parent}")
+    return LockOwnerTransaction(target, hold, pre_state)
+
+
+def lock_owner_transaction_matches_pre(transaction: LockOwnerTransaction) -> bool:
+    return object_tree_state_matches(
+        lock_owner_path(transaction.target),
+        transaction.pre_state,
+        "target lock owner",
+        max_file_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_tree_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_paths=1,
+    ) and not path_exists_no_follow(transaction.hold_path)
+
+
+def restore_lock_owner_transaction(transaction: LockOwnerTransaction) -> None:
+    owner = lock_owner_path(transaction.target)
+    first_error: BaseException | None = None
+    for _attempt in range(3):
+        try:
+            if path_exists_no_follow(owner):
+                remove_path_durable(owner)
+            if path_exists_no_follow(transaction.hold_path):
+                os.replace(transaction.hold_path, owner)
+                fsync_directory(owner.parent, f"target lock parent {owner.parent}")
+            elif transaction.pre_state is not None and not object_tree_state_matches(
+                owner,
+                transaction.pre_state,
+                "target lock owner",
+                max_file_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+                max_tree_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+                max_paths=1,
+            ):
+                fail("target lock owner hold is missing during rollback")
+            if transaction.pre_state is None and path_exists_no_follow(owner):
+                remove_path_durable(owner)
+            if path_exists_no_follow(transaction.hold_path):
+                remove_path_durable(transaction.hold_path)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if lock_owner_transaction_matches_pre(transaction):
+            return
+    if first_error is not None:
+        raise ManagerError("target lock owner rollback failed") from first_error
+    fail("target lock owner rollback did not restore the exact pre-state")
+
+
+def commit_lock_owner_transaction(transaction: LockOwnerTransaction) -> None:
+    remove_path_durable_retry(transaction.hold_path, "target lock owner hold")
+
+
+def snapshot_lock_path_state(target: Path) -> dict[str, ObjectEntry] | None:
+    return snapshot_object_tree_state(
+        lock_path(target),
+        "target lock path",
+        max_file_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_tree_bytes=BOOTSTRAP_LOCK_MAX_BYTES * 4,
+        max_paths=8,
+    )
+
+
+def restore_object_metadata(root: Path, expected: dict[str, ObjectEntry]) -> None:
+    for relative, entry in sorted(
+        expected.items(), key=lambda item: item[0].count("/"), reverse=True
+    ):
+        path = root if relative == "." else root / safe_relative_path(relative)
+        if not path_exists_no_follow(path):
+            continue
+        if entry.kind != "symlink":
+            path.chmod(entry.mode)
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.utime(path, ns=(entry.mtime_ns, entry.mtime_ns), follow_symlinks=False)
+
+
+def restore_lock_path_after_failed_transaction(
+    target: Path, expected: dict[str, ObjectEntry] | None
+) -> None:
+    lock = lock_path(target)
+    if expected is None:
+        remove_path_durable_retry(lock, "failed target lock path")
+        return
+    restore_object_metadata(lock, expected)
+    if not object_tree_state_matches(
+        lock,
+        expected,
+        "target lock path",
+        max_file_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        max_tree_bytes=BOOTSTRAP_LOCK_MAX_BYTES * 4,
+        max_paths=8,
+    ):
+        fail("failed target lock path did not restore exact pre-state")
+
+
+def snapshot_target_root_state(target: Path) -> dict[str, ObjectEntry] | None:
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("target root must be a real directory")
+    return {
+        ".": ObjectEntry(
+            "directory",
+            stat.S_IMODE(info.st_mode),
+            identity_of(info),
+            info.st_mtime_ns,
+            info.st_size,
+        )
+    }
+
+
+def restore_target_root_metadata(target: Path, expected: dict[str, ObjectEntry] | None) -> None:
+    if expected is not None and path_exists_no_follow(target):
+        restore_object_metadata(target, expected)
+
+
 def restore_stale_launch_protection_modes(target: Path) -> None:
     candidates = {target / relative for relative in SOFTWARE_PARENT_PATHS}
     install_root = target / SOFTWARE_PREFIX_RELATIVE
@@ -1460,9 +1633,12 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
     else:
         if not ensure_private_directory(target, create=False, transaction=transaction):
             fail("target is missing")
+    pre_target_state = snapshot_target_root_state(target)
     lock = lock_path(target)
+    pre_lock_state = snapshot_lock_path_state(target)
     descriptor = -1
     acquired = False
+    owner_transaction: LockOwnerTransaction | None = None
     try:
         descriptor = ensure_lock_file(target)
         try:
@@ -1478,18 +1654,39 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
         current_lock_file = lock_file_path(target).lstat()
         if identity_of(lock_file_info) != identity_of(current_lock_file):
             raise ConcurrentTargetChange("target lock file changed after it was locked")
+        owner_transaction = begin_lock_owner_transaction(target)
         write_lock_owner(target, held=True)
         restore_stale_launch_protection_modes(target)
         chmod_directory_no_follow(lock, LOCK_HELD_PARENT_MODE, "target lock parent")
-    except BaseException:
-        cleanup_lock_artifacts_for_created_target(target, transaction)
-        transaction.cleanup()
-        if descriptor >= 0:
-            if acquired:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
-        raise
+    except BaseException as original:
+        restore_error: BaseException | None = None
+        if owner_transaction is not None:
+            with contextlib.suppress(BaseException):
+                chmod_directory_no_follow(lock, OWNER_DIR_MODE, "target lock parent")
+            try:
+                restore_lock_owner_transaction(owner_transaction)
+            except BaseException as exc:
+                restore_error = exc
+        try:
+            cleanup_lock_artifacts_for_created_target(target, transaction)
+            transaction.cleanup()
+        finally:
+            if descriptor >= 0:
+                if acquired:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+        try:
+            restore_lock_path_after_failed_transaction(target, pre_lock_state)
+            restore_target_root_metadata(target, pre_target_state)
+        except BaseException as exc:
+            if restore_error is None:
+                restore_error = exc
+        if restore_error is not None:
+            raise ManagerError(
+                "target lock owner rollback failed during acquire"
+            ) from restore_error
+        raise original
     failed = False
     try:
         yield transaction
@@ -1497,10 +1694,16 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
         failed = True
         raise
     finally:
+        cleanup_error: BaseException | None = None
         try:
             if acquired and descriptor >= 0:
                 restore_internal_lock_path_for_cleanup(target)
-                write_lock_owner(target, held=False)
+                if failed and owner_transaction is not None:
+                    restore_lock_owner_transaction(owner_transaction)
+                else:
+                    write_lock_owner(target, held=False)
+                    if owner_transaction is not None:
+                        commit_lock_owner_transaction(owner_transaction)
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError as exc:
             raise ManagerError(f"target lock cleanup failed: {lock}") from exc
@@ -1508,8 +1711,22 @@ def target_lock(target: Path, *, create_parent: bool = False) -> Iterator[Direct
             if descriptor >= 0:
                 os.close(descriptor)
         if failed:
-            cleanup_lock_artifacts_for_created_target(target, transaction)
-            transaction.cleanup()
+            try:
+                cleanup_lock_artifacts_for_created_target(target, transaction)
+                transaction.cleanup()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            try:
+                restore_lock_path_after_failed_transaction(target, pre_lock_state)
+                restore_target_root_metadata(target, pre_target_state)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                raise ManagerError(
+                    "target lock failure cleanup did not restore pre-state"
+                ) from cleanup_error
 
 
 def stamp_path(target: Path) -> Path:
@@ -1877,6 +2094,290 @@ def restore_path_states(target: Path, snapshot: dict[str, ManagedPathState]) -> 
         raise
 
 
+def snapshot_managed_object_state(target: Path, relative: str) -> dict[str, ObjectEntry] | None:
+    reject_relative_symlink_ancestors(target, relative)
+    return snapshot_object_tree_state(
+        target / safe_relative_path(relative),
+        f"managed object {relative}",
+        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_tree_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_paths=1,
+    )
+
+
+def snapshot_managed_object_states(
+    target: Path, relatives: list[str]
+) -> dict[str, dict[str, ObjectEntry] | None]:
+    return {relative: snapshot_managed_object_state(target, relative) for relative in relatives}
+
+
+def managed_parent_relatives(relatives: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for relative in relatives:
+        parent = safe_relative_path(relative).parent
+        while parent != Path("."):
+            parent_relative = parent.as_posix()
+            if parent_relative not in seen:
+                seen.add(parent_relative)
+                ordered.append(parent_relative)
+            parent = parent.parent
+    return sorted(ordered, key=lambda item: (item.count("/"), item))
+
+
+def snapshot_directory_metadata(path: Path, label: str) -> ObjectEntry | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a real directory")
+    return ObjectEntry(
+        "directory",
+        stat.S_IMODE(info.st_mode),
+        identity_of(info),
+        info.st_mtime_ns,
+        info.st_size,
+    )
+
+
+def directory_metadata_matches(path: Path, expected: ObjectEntry | None) -> bool:
+    if expected is None:
+        return not path_exists_no_follow(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    actual = ObjectEntry(
+        "directory",
+        stat.S_IMODE(info.st_mode),
+        identity_of(info),
+        info.st_mtime_ns,
+        info.st_size,
+    )
+    return actual == expected
+
+
+def snapshot_managed_parent_states(
+    target: Path, relatives: list[str]
+) -> dict[str, ObjectEntry | None]:
+    return {
+        relative: snapshot_directory_metadata(
+            target / safe_relative_path(relative), f"managed parent {relative}"
+        )
+        for relative in managed_parent_relatives(relatives)
+    }
+
+
+def managed_object_state_matches(
+    target: Path, relative: str, expected: dict[str, ObjectEntry] | None
+) -> bool:
+    reject_relative_symlink_ancestors(target, relative)
+    return object_tree_state_matches(
+        target / safe_relative_path(relative),
+        expected,
+        f"managed object {relative}",
+        max_file_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_tree_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        max_paths=1,
+    )
+
+
+def managed_object_transaction_residue(transaction: ManagedObjectTransaction) -> list[str]:
+    if not path_exists_no_follow(transaction.hold_root):
+        return []
+    return [
+        ".",
+        *sorted(
+            path.relative_to(transaction.hold_root).as_posix()
+            for path in transaction.hold_root.rglob("*")
+        ),
+    ]
+
+
+def verify_managed_object_transaction_pre(transaction: ManagedObjectTransaction) -> None:
+    mismatches = [
+        relative
+        for relative, state in transaction.pre_states.items()
+        if not managed_object_state_matches(transaction.target, relative, state)
+    ]
+    parent_mismatches = [
+        relative
+        for relative, state in transaction.parent_states.items()
+        if not directory_metadata_matches(transaction.target / safe_relative_path(relative), state)
+    ]
+    residue = managed_object_transaction_residue(transaction)
+    if mismatches or parent_mismatches or residue:
+        details = []
+        if mismatches:
+            details.append("managed paths " + ", ".join(mismatches))
+        if parent_mismatches:
+            details.append("managed parents " + ", ".join(parent_mismatches))
+        if residue:
+            details.append("transaction residue " + ", ".join(residue))
+        fail("managed rollback did not restore exact object state: " + "; ".join(details))
+
+
+def managed_hold_path(transaction: ManagedObjectTransaction, relative: str) -> Path:
+    return transaction.hold_root / safe_relative_path(relative)
+
+
+def remove_empty_directory_durable_retry(path: Path, label: str, *, attempts: int = 3) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        try:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"{label} must be an absent or real directory")
+            path.rmdir()
+            fsync_parent_directory(path, f"parent of removed {label}")
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if not path_exists_no_follow(path):
+            return
+    if first_error is not None:
+        raise ManagerError(f"{label} cleanup failed") from first_error
+    fail(f"{label} cleanup left residue: {path}")
+
+
+def restore_managed_parent_states(transaction: ManagedObjectTransaction) -> None:
+    for relative, expected in sorted(
+        transaction.parent_states.items(),
+        key=lambda item: item[0].count("/"),
+        reverse=True,
+    ):
+        path = transaction.target / safe_relative_path(relative)
+        if expected is None:
+            remove_empty_directory_durable_retry(path, f"managed parent {relative}")
+            continue
+        if not path_exists_no_follow(path):
+            fail(f"managed parent is missing during rollback: {relative}")
+        restore_object_metadata(path, {".": expected})
+        if not directory_metadata_matches(path, expected):
+            fail(f"managed parent did not restore exact pre-state: {relative}")
+
+
+def prepare_managed_object_transaction(
+    target: Path,
+    desired: dict[str, bytes | None],
+    expected: dict[str, str] | None,
+    changed_paths: list[str],
+) -> ManagedObjectTransaction:
+    require_directory(target, "target")
+    if expected is not None:
+        for relative, expected_digest in expected.items():
+            content = snapshot_paths(target, {relative})[relative]
+            actual = "<missing>" if content is None else digest_for_content(relative, content)
+            if actual != expected_digest:
+                raise ConcurrentTargetChange(f"managed path changed before replacement: {relative}")
+    for relative in desired:
+        preflight_destination(target, relative)
+    ordered = [
+        relative for relative in stable_desired_path_order(desired) if relative in changed_paths
+    ]
+    hold_root = target / f".nddev-kilo-cli-managed-hold-{os.getpid()}-{time.time_ns()}"
+    if path_exists_no_follow(hold_root):
+        remove_path_durable_retry(hold_root, "preexisting managed hold")
+    hold_root.mkdir(mode=OWNER_DIR_MODE)
+    hold_root.chmod(OWNER_DIR_MODE)
+    transaction = ManagedObjectTransaction(
+        target=target,
+        hold_root=hold_root,
+        pre_states=snapshot_managed_object_states(target, ordered),
+        parent_states=snapshot_managed_parent_states(target, ordered),
+        changed_paths=ordered,
+    )
+    try:
+        for relative in ordered:
+            path = target / safe_relative_path(relative)
+            if not path_exists_no_follow(path):
+                continue
+            saved = managed_hold_path(transaction, relative)
+            saved.parent.mkdir(mode=OWNER_DIR_MODE, parents=True, exist_ok=True)
+            saved.parent.chmod(OWNER_DIR_MODE)
+            os.replace(path, saved)
+            fsync_directory(saved.parent, f"managed hold parent {saved.parent}")
+            fsync_directory(path.parent, f"managed parent {path.parent}")
+    except BaseException:
+        rollback_managed_object_transaction(transaction)
+        raise
+    return transaction
+
+
+def restore_managed_object_from_hold(
+    transaction: ManagedObjectTransaction,
+    relative: str,
+) -> None:
+    path = transaction.target / safe_relative_path(relative)
+    saved = managed_hold_path(transaction, relative)
+    expected = transaction.pre_states[relative]
+    if expected is None:
+        if not path_exists_no_follow(path):
+            cleanup_empty_parents(transaction.target, relative)
+            return
+    elif managed_object_state_matches(transaction.target, relative, expected):
+        cleanup_empty_parents(transaction.target, relative)
+        return
+    if path_exists_no_follow(path):
+        remove_path_durable(path)
+    if path_exists_no_follow(saved):
+        ensure_parent(transaction.target, relative)
+        os.replace(saved, path)
+        fsync_directory(path.parent, f"managed parent {path.parent}")
+        if saved.parent.exists():
+            fsync_directory(saved.parent, f"managed hold parent {saved.parent}")
+    elif expected is not None and not managed_object_state_matches(
+        transaction.target, relative, expected
+    ):
+        fail(f"managed hold is missing during rollback: {relative}")
+    if expected is None and path_exists_no_follow(path):
+        remove_path_durable(path)
+    cleanup_empty_parents(transaction.target, relative)
+
+
+def rollback_managed_object_transaction(transaction: ManagedObjectTransaction) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(3):
+        for relative in reversed(transaction.changed_paths):
+            try:
+                restore_managed_object_from_hold(transaction, relative)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if all(
+            managed_object_state_matches(transaction.target, relative, state)
+            for relative, state in transaction.pre_states.items()
+        ):
+            try:
+                remove_path_durable_retry(transaction.hold_root, "managed hold")
+                restore_managed_parent_states(transaction)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            verify_managed_object_transaction_pre(transaction)
+            return
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise ManagerError("managed object rollback failed") from first_error
+    fail("managed object rollback did not restore exact pre-state")
+
+
+def commit_managed_object_transaction(transaction: ManagedObjectTransaction) -> None:
+    remove_path_durable_retry(transaction.hold_root, "managed hold")
+    residue = managed_object_transaction_residue(transaction)
+    if residue:
+        fail("managed transaction left hold residue: " + ", ".join(residue))
+
+
 def desired_path_state(content: bytes | None) -> ManagedPathState:
     if content is None:
         return ManagedPathState(None, None)
@@ -1929,39 +2430,45 @@ def replace_managed_state(
     desired: dict[str, bytes | None],
     expected: dict[str, str] | None = None,
     changed_paths: list[str] | None = None,
+    managed_transaction: ManagedObjectTransaction | None = None,
     **_kwargs: Any,
 ) -> None:
-    require_directory(target, "target")
-    if expected is not None:
-        for relative, expected_digest in expected.items():
-            content = snapshot_paths(target, {relative})[relative]
-            actual = "<missing>" if content is None else digest_for_content(relative, content)
-            if actual != expected_digest:
-                raise ConcurrentTargetChange(f"managed path changed before replacement: {relative}")
-    for relative in desired:
-        preflight_destination(target, relative)
     changed = set(
         changed_paths
         if changed_paths is not None
         else stable_changed_paths_for_desired(target, desired)
     )
     ordered = [relative for relative in stable_desired_path_order(desired) if relative in changed]
-    for relative in ordered:
-        content = desired[relative]
-        path = target / safe_relative_path(relative)
-        if content is None:
-            preflight_destination(target, relative)
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+    owns_transaction = managed_transaction is None
+    transaction = managed_transaction or prepare_managed_object_transaction(
+        target,
+        desired,
+        expected,
+        ordered,
+    )
+    try:
+        for relative in ordered:
+            content = desired[relative]
+            path = target / safe_relative_path(relative)
+            if content is None:
+                preflight_destination(target, relative)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                else:
+                    fsync_directory(path.parent, f"managed parent {path.parent}")
+                cleanup_empty_parents(target, relative)
             else:
-                fsync_directory(path.parent, f"managed parent {path.parent}")
-            cleanup_empty_parents(target, relative)
-        else:
-            preflight_destination(target, relative)
-            atomic_write(target, relative, content)
-    verify_desired_state(target, desired)
+                preflight_destination(target, relative)
+                atomic_write(target, relative, content)
+        verify_desired_state(target, desired)
+    except BaseException:
+        if owns_transaction:
+            rollback_managed_object_transaction(transaction)
+        raise
+    if owns_transaction:
+        commit_managed_object_transaction(transaction)
 
 
 def snapshot_paths(target: Path, relatives: set[str]) -> dict[str, bytes | None]:
@@ -2110,6 +2617,110 @@ def snapshot_tree_state(
                 current_path / filename, (current_path / filename).relative_to(root).as_posix()
             )
     return snapshot
+
+
+def snapshot_object_tree_state(
+    root: Path,
+    label: str,
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+    max_paths: int,
+) -> dict[str, ObjectEntry] | None:
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return None
+    snapshot: dict[str, ObjectEntry] = {}
+    total_bytes = 0
+    path_count = 0
+
+    def add_entry(path: Path, relative: str) -> None:
+        nonlocal path_count, total_bytes
+        path_count += 1
+        if path_count > max_paths:
+            fail(f"{label} exceeds the {max_paths}-path limit")
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        identity = identity_of(info)
+        if stat.S_ISLNK(info.st_mode):
+            snapshot[relative] = ObjectEntry(
+                "symlink",
+                mode,
+                identity,
+                info.st_mtime_ns,
+                info.st_size,
+                os.readlink(path),
+            )
+            return
+        if stat.S_ISDIR(info.st_mode):
+            snapshot[relative] = ObjectEntry(
+                "directory",
+                mode,
+                identity,
+                info.st_mtime_ns,
+                info.st_size,
+            )
+            return
+        if stat.S_ISREG(info.st_mode):
+            if info.st_size > max_file_bytes:
+                fail(f"{label} file exceeds the {max_file_bytes}-byte limit: {path}")
+            content = read_regular_file(path, f"{label} {relative}", max_bytes=max_file_bytes)
+            total_bytes += len(content)
+            if total_bytes > max_tree_bytes:
+                fail(f"{label} exceeds the {max_tree_bytes}-byte limit")
+            snapshot[relative] = ObjectEntry(
+                "file",
+                mode,
+                identity,
+                info.st_mtime_ns,
+                info.st_size,
+                content,
+            )
+            return
+        fail(f"{label} contains unsupported path type: {path}")
+
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        add_entry(root, ".")
+        return snapshot
+    add_entry(root, ".")
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        current_path = Path(current)
+        for directory in directories:
+            add_entry(
+                current_path / directory, (current_path / directory).relative_to(root).as_posix()
+            )
+        for filename in files:
+            add_entry(
+                current_path / filename, (current_path / filename).relative_to(root).as_posix()
+            )
+    return snapshot
+
+
+def object_tree_state_matches(
+    root: Path,
+    expected: dict[str, ObjectEntry] | None,
+    label: str,
+    *,
+    max_file_bytes: int,
+    max_tree_bytes: int,
+    max_paths: int,
+) -> bool:
+    try:
+        return (
+            snapshot_object_tree_state(
+                root,
+                label,
+                max_file_bytes=max_file_bytes,
+                max_tree_bytes=max_tree_bytes,
+                max_paths=max_paths,
+            )
+            == expected
+        )
+    except ManagerError:
+        return False
 
 
 def tree_state_matches(
@@ -2476,23 +3087,25 @@ def backup_transactions_match_pre(transactions: list[BackupSlotTransaction]) -> 
 
 def rollback_lifecycle_state(
     target: Path,
-    managed_snapshot: dict[str, ManagedPathState],
+    managed_transactions: list[ManagedObjectTransaction],
     backup_transactions: list[BackupSlotTransaction],
 ) -> None:
     first_error: BaseException | None = None
     for _attempt in range(3):
-        try:
-            restore_path_states(target, managed_snapshot)
-        except BaseException as exc:
-            if first_error is None:
-                first_error = exc
+        for transaction in reversed(managed_transactions):
+            try:
+                rollback_managed_object_transaction(transaction)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
         try:
             rollback_backup_transactions(backup_transactions)
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
         try:
-            verify_path_states(target, managed_snapshot, "managed rollback")
+            for transaction in managed_transactions:
+                verify_managed_object_transaction_pre(transaction)
             if backup_transactions_match_pre(backup_transactions):
                 return
         except BaseException as exc:
@@ -2731,6 +3344,7 @@ def setup_mutation_result(
 
 
 def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -> dict[str, Any]:
+    require_supported_production_platform()
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
@@ -2741,6 +3355,7 @@ def mutate_setup(target: Path, setup_id: str, profile_id: str, operation: str) -
 
 
 def update_setup(target: Path) -> dict[str, Any]:
+    require_supported_production_platform()
     backup_slot: int | None = None
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
@@ -2779,17 +3394,24 @@ def _mutate_setup_locked(
             backup_slot = backup_current_state(
                 target, preflight.stamp, transactions=backup_transactions
             )
-        snapshot = snapshot_path_states(target, set(preflight.desired))
+        expected_digests = snapshot_digests(snapshot_paths(target, set(preflight.desired)))
+        managed_transaction = prepare_managed_object_transaction(
+            target,
+            preflight.desired,
+            expected_digests,
+            preflight.changed_paths,
+        )
         try:
             replace_managed_state(
                 target,
                 preflight.desired,
-                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
                 changed_paths=preflight.changed_paths,
+                managed_transaction=managed_transaction,
             )
             commit_backup_transactions(backup_transactions)
+            commit_managed_object_transaction(managed_transaction)
         except Exception:
-            rollback_lifecycle_state(target, snapshot, backup_transactions)
+            rollback_lifecycle_state(target, [managed_transaction], backup_transactions)
             raise
     return setup_mutation_result(target, operation, preflight, backup_slot)
 
@@ -2807,6 +3429,7 @@ def infer_legacy_profile(stamp: dict[str, Any], requested_profile: str | None) -
 
 
 def migrate_setup(target: Path, profile_id: str | None) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         backup_slot: int | None = None
@@ -2829,17 +3452,24 @@ def _migrate_setup_locked(
         backup_transactions: list[BackupSlotTransaction] = []
         if stamp_is_legacy(stamp) and changed_paths:
             backup_slot = backup_current_state(target, stamp, transactions=backup_transactions)
-        snapshot = snapshot_path_states(target, set(desired))
+        expected_digests = snapshot_digests(snapshot_paths(target, set(desired)))
+        managed_transaction = prepare_managed_object_transaction(
+            target,
+            desired,
+            expected_digests,
+            changed_paths,
+        )
         try:
             replace_managed_state(
                 target,
                 desired,
-                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
                 changed_paths=changed_paths,
+                managed_transaction=managed_transaction,
             )
             commit_backup_transactions(backup_transactions)
+            commit_managed_object_transaction(managed_transaction)
         except Exception:
-            rollback_lifecycle_state(target, snapshot, backup_transactions)
+            rollback_lifecycle_state(target, [managed_transaction], backup_transactions)
             raise
     return {
         "operation": "migrate",
@@ -2853,6 +3483,7 @@ def _migrate_setup_locked(
 
 
 def restore_setup(target: Path, slot: int) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _restore_setup_locked(target, slot)
@@ -2863,16 +3494,23 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
         require_private_target_directory_for_software(target, allow_missing=False)
         setup_id, desired = desired_for_backup(target, slot)
         changed_paths = stable_changed_paths_for_desired(target, desired)
-        snapshot = snapshot_path_states(target, set(desired))
+        expected_digests = snapshot_digests(snapshot_paths(target, set(desired)))
+        managed_transaction = prepare_managed_object_transaction(
+            target,
+            desired,
+            expected_digests,
+            changed_paths,
+        )
         try:
             replace_managed_state(
                 target,
                 desired,
-                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
                 changed_paths=changed_paths,
+                managed_transaction=managed_transaction,
             )
+            commit_managed_object_transaction(managed_transaction)
         except Exception:
-            rollback_lifecycle_state(target, snapshot, [])
+            rollback_lifecycle_state(target, [managed_transaction], [])
             raise
     return {
         "operation": "restore",
@@ -2885,6 +3523,7 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
 
 
 def remove_setup(target: Path) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         return _remove_setup_locked(target)
@@ -2895,16 +3534,23 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
         stamp = require_clean_installed(target)
         desired = desired_for_remove(target)
         changed_paths = stable_changed_paths_for_desired(target, desired)
-        snapshot = snapshot_path_states(target, set(desired))
+        expected_digests = snapshot_digests(snapshot_paths(target, set(desired)))
+        managed_transaction = prepare_managed_object_transaction(
+            target,
+            desired,
+            expected_digests,
+            changed_paths,
+        )
         try:
             replace_managed_state(
                 target,
                 desired,
-                snapshot_digests({relative: state.content for relative, state in snapshot.items()}),
                 changed_paths=changed_paths,
+                managed_transaction=managed_transaction,
             )
+            commit_managed_object_transaction(managed_transaction)
         except Exception:
-            rollback_lifecycle_state(target, snapshot, [])
+            rollback_lifecycle_state(target, [managed_transaction], [])
             raise
     return {
         "operation": "remove",
@@ -2916,6 +3562,7 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
 
 
 def status_payload(target: Path) -> dict[str, Any]:
+    require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
         software = software_status(target)
@@ -2946,6 +3593,7 @@ def status_payload(target: Path) -> dict[str, Any]:
 
 
 def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
+    require_supported_production_platform()
     load_setup(setup_id)
     load_profile(profile_id)
     with bootstrap_lifecycle_lock(target) as locked_target:
@@ -4439,12 +5087,48 @@ def restore_software_root_states(
         fail(f"{label} left target-owned software residue: {', '.join(map(str, residue))}")
 
 
+def snapshot_software_object_state(target: Path) -> dict[str, dict[str, ObjectEntry] | None]:
+    return {
+        relative.as_posix(): snapshot_object_tree_state(
+            target / relative,
+            f"software object root {relative}",
+            max_file_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_tree_bytes=SOFTWARE_TREE_MAX_BYTES,
+            max_paths=SOFTWARE_TREE_MAX_PATHS,
+        )
+        for relative in SOFTWARE_PARENT_PATHS
+    }
+
+
+def verify_software_object_state(
+    target: Path,
+    expected: dict[str, dict[str, ObjectEntry] | None],
+    label: str,
+) -> None:
+    if snapshot_software_object_state(target) != expected:
+        fail(f"{label} did not restore exact target-owned software object state")
+
+
+def restore_software_object_metadata(
+    target: Path,
+    expected: dict[str, dict[str, ObjectEntry] | None],
+) -> None:
+    for relative, snapshot in sorted(
+        expected.items(), key=lambda item: len(Path(item[0]).parts), reverse=True
+    ):
+        if snapshot is None:
+            continue
+        root = target / safe_relative_path(relative)
+        restore_object_metadata(root, snapshot)
+
+
 def software_rollback_complete(
     target: Path,
     hold: Path,
     expected_old: set[Path],
     expected_absent: set[Path],
     expected_state: dict[str, TreeEntry],
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None] | None = None,
 ) -> bool:
     for relative in SOFTWARE_REPLACE_PATHS:
         if path_exists_no_follow(hold / relative):
@@ -4455,7 +5139,16 @@ def software_rollback_complete(
     for relative in expected_absent:
         if path_exists_no_follow(target / relative):
             return False
-    return snapshot_software_surface_state(target) == expected_state
+    if expected_object_state is not None:
+        restore_software_object_metadata(target, expected_object_state)
+    if snapshot_software_surface_state(target) != expected_state:
+        return False
+    if (
+        expected_object_state is not None
+        and snapshot_software_object_state(target) != expected_object_state
+    ):
+        return False
+    return True
 
 
 def restore_software_paths(
@@ -4467,6 +5160,7 @@ def restore_software_paths(
     installed_new: list[Path],
     preexisting_parent_paths: set[Path],
     expected_state: dict[str, TreeEntry],
+    expected_object_state: dict[str, dict[str, ObjectEntry] | None] | None = None,
 ) -> None:
     expected_old = set(moved_old)
     expected_old.update(
@@ -4493,14 +5187,23 @@ def restore_software_paths(
                     if first_error is None:
                         first_error = exc
         cleanup_software_parents(target, preserve=preexisting_parent_paths)
-        if software_rollback_complete(target, hold, expected_old, expected_absent, expected_state):
+        if software_rollback_complete(
+            target,
+            hold,
+            expected_old,
+            expected_absent,
+            expected_state,
+            expected_object_state,
+        ):
             return
     if first_error is not None:
         raise ManagerError("software rollback failed") from first_error
     fail("software rollback did not restore the exact replace path set")
 
 
-def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) -> None:
+def replace_software_state(
+    target: Path, live_stage: Path, hold_parent: Path
+) -> SoftwareReplaceTransaction:
     for relative in SOFTWARE_REPLACE_PATHS:
         source = live_stage / relative
         if not path_exists_no_follow(source):
@@ -4512,6 +5215,7 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
         remove_path_durable_retry(hold, "preexisting software rollback hold")
     hold.mkdir(mode=OWNER_DIR_MODE)
     expected_state = snapshot_software_surface_state(target)
+    expected_object_state = snapshot_software_object_state(target)
     preexisting_parent_paths = {
         relative for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(target / relative)
     }
@@ -4530,6 +5234,16 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
         status = software_status(target)
         if not status["installed"] or not status["current"]:
             fail("installed Kilo CLI did not validate as the pinned npm package")
+        return SoftwareReplaceTransaction(
+            target=target,
+            hold=hold,
+            live_stage=live_stage,
+            moved_old=list(moved_old),
+            installed_new=list(installed_new),
+            preexisting_parent_paths=set(preexisting_parent_paths),
+            expected_state=expected_state,
+            expected_object_state=expected_object_state,
+        )
     except BaseException:
         moved_old = [
             relative
@@ -4544,8 +5258,27 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
             installed_new=installed_new,
             preexisting_parent_paths=preexisting_parent_paths,
             expected_state=expected_state,
+            expected_object_state=expected_object_state,
         )
         raise
+
+
+def rollback_software_replace_transaction(transaction: SoftwareReplaceTransaction) -> None:
+    restore_software_paths(
+        transaction.target,
+        transaction.hold,
+        transaction.live_stage,
+        moved_old=transaction.moved_old,
+        installed_new=transaction.installed_new,
+        preexisting_parent_paths=transaction.preexisting_parent_paths,
+        expected_state=transaction.expected_state,
+        expected_object_state=transaction.expected_object_state,
+    )
+    verify_software_object_state(
+        transaction.target,
+        transaction.expected_object_state,
+        "software rollback",
+    )
 
 
 def materialize_stage_entrypoint(live_stage: Path, native_provenance: dict[str, Any]) -> None:
@@ -4656,6 +5389,21 @@ def cleanup_transaction_directory(path: Path, label: str) -> None:
         fail(f"{label} cleanup left residue: {path}")
 
 
+def cleanup_transaction_directory_retry(path: Path, label: str, *, attempts: int = 3) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            cleanup_transaction_directory(path, label)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if not path_exists_no_follow(path):
+            return
+    if first_error is not None:
+        raise ManagerError(f"{label} cleanup failed") from first_error
+    fail(f"{label} cleanup left residue: {path}")
+
+
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
     require_supported_production_platform()
     with bootstrap_lifecycle_lock(target) as locked_target:
@@ -4687,7 +5435,7 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                 "wrapper_sha256": preflight.get("wrapper_sha256"),
             }
     staging: Path | None = None
-    pre_operation_software_roots: dict[str, dict[str, TreeEntry] | None] | None = None
+    software_transaction: SoftwareReplaceTransaction | None = None
     published = False
     with target_lock(target, create_parent=(command == "install-cli")) as transaction:
         try:
@@ -4718,7 +5466,6 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                         "native_executable": status.get("native_executable"),
                         "wrapper_sha256": status.get("wrapper_sha256"),
                     }
-            pre_operation_software_roots = snapshot_software_root_states(target)
             staging = Path(
                 tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-stage.")
             )
@@ -4728,25 +5475,40 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             run_npm_install(staging, live_stage)
             chmod_private_tree(live_stage)
             write_stage_software_manifest(live_stage)
-            replace_software_state(target, live_stage, staging)
+            software_transaction = replace_software_state(target, live_stage, staging)
             published = True
             installation = require_current_software(target)
-            cleanup_transaction_directory(staging, "software staging")
+            try:
+                cleanup_transaction_directory(staging, "software staging")
+            except BaseException:
+                raise
             staging = None
-        except BaseException:
-            if published and pre_operation_software_roots is not None:
-                restore_software_root_states(
-                    target,
-                    pre_operation_software_roots,
-                    "software operation rollback",
-                )
+        except BaseException as original:
+            rollback_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
+            if published and software_transaction is not None:
+                try:
+                    rollback_software_replace_transaction(software_transaction)
+                except BaseException as exc:
+                    rollback_error = exc
             if staging is not None:
-                cleanup_transaction_directory(
-                    staging,
-                    "software staging rollback" if published else "software staging",
-                )
+                try:
+                    cleanup_transaction_directory_retry(
+                        staging,
+                        "software staging rollback" if published else "software staging",
+                    )
+                except BaseException as exc:
+                    cleanup_error = exc
             remove_created_target_if_empty(target, target_existed_before)
-            raise
+            if rollback_error is not None:
+                raise ManagerError(
+                    "software rollback failed after operation error"
+                ) from rollback_error
+            if cleanup_error is not None:
+                raise ManagerError(
+                    "software transaction cleanup failed after rollback"
+                ) from cleanup_error
+            raise original
     return {
         "schema_version": 1,
         "command": command,
