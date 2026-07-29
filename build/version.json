@@ -7,6 +7,6 @@
   "kilo_cli_package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
   "kilo_cli_package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
   "kilo_cli_install_channel": "npm",
-  "python_requires": ">=3.11",
+  "python_requires": ">=3.9",
   "runtime_baseline": "references/kilo-cli-baseline.json"
 }

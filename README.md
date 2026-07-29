@@ -22,6 +22,11 @@ config location, and launch binary selection are source-owned by
 `cli-tools/nddev_kilo_cli.py`. Use `software-status --json` and
 `status --json` for target-specific state.
 
+Production install and launch support is limited to macOS and Ubuntu glibc
+desktop/server hosts. The exact host IDs, unsupported categories, official
+floor observation, and upstream optional-package mapping are owned by
+`config/nddev-contract.json` and `references/kilo-cli-baseline.json`.
+
 ## Setup And Profiles
 
 This public module currently ships the `nddev-builder` setup. The exact active
@@ -37,7 +42,9 @@ builder guidance, a progressive Agent Skill toolkit, native agents, commands,
 and a local-file plugin. The exact installed file inventory and plugin path are
 owned by `setups/nddev-builder/setup.json` and `cli-tools/nddev_kilo_cli.py`;
 use `plan --json` or `status --json` to inspect what a target would receive or
-currently contains.
+currently contains. `plan --json` reports the stable `changed_paths` contract
+that setup mutations use; paths are reported only when their target bytes or
+presence would change.
 
 The plugin's supported purpose and boundaries are owned by the setup source and
 the public contract. It is intended only for deterministic builder context
@@ -46,20 +53,21 @@ provider, network, MCP, or tool-behavior control plane.
 
 ## Usage
 
+The full command surface is owned by `cli-tools/nddev_kilo_cli.py`. Common
+read-only and lifecycle examples:
+
 ```bash
 python3 cli-tools/nddev_kilo_cli.py list --json
 python3 cli-tools/nddev_kilo_cli.py plan --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py install --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py switch --profile safe --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py migrate --profile full-auto --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py install-cli --target /absolute/kilo-target --json
+python3 cli-tools/nddev_kilo_cli.py update --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py software-status --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py update-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py restore --backup 0 --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove-cli --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --workspace /absolute/project --timeout-seconds 3600 -- "implement the task"
+python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target -- "implement the task"
 ```
+
+`update` refreshes an already installed setup using the installed setup/profile
+identity. Like other setup mutations, it uses the manager's byte-diff
+postcondition contract; an identical target is a true no-op.
 
 `install-cli` and `update-cli` maintain target-owned CLI software through the
 manager's pinned official-channel install boundary. The volatile package pin,
@@ -69,15 +77,13 @@ contract, and drift checks are owned by `references/kilo-cli-baseline.json`,
 current installed provenance with `software-status --json`.
 
 `launch` requires a clean managed setup and current target-owned CLI software.
-It runs native `kilo run` with an explicit project workspace: pass
-`--workspace`, or omit it to capture the caller's current directory at launch
-entry. It holds lifecycle locks through child completion or timeout cleanup,
-preserves the runtime writability Kilo needs, and denies concurrent lifecycle
-mutations while the child is running. Exact lock structure, lock ordering,
-workspace binding, runtime environment, executable handoff, child argument
-filtering, and timeout behavior are owned by `cli-tools/nddev_kilo_cli.py` and
-summarized in `config/nddev-contract.json`; inspect target state with
-`status --json` and `software-status --json`.
+It holds lifecycle locks through child completion or timeout cleanup, preserves
+the runtime writability Kilo needs, and denies concurrent lifecycle mutations
+while the child is running. Exact lock structure, lock ordering, runtime
+environment, executable handoff, child argument filtering, and timeout behavior
+are owned by `cli-tools/nddev_kilo_cli.py` and summarized in
+`config/nddev-contract.json`; inspect target state with `status --json` and
+`software-status --json`.
 
 The launch boundary is a manager-verified path handoff under a no-sandbox
 same-UID threat model. It does not claim portable file-descriptor execution or

@@ -7,6 +7,7 @@
     "current_version": "7.4.16",
     "minimum_version": "7.4.16",
     "package": "@kilocode/cli",
+    "python_requires": ">=3.9",
     "official_source": {
       "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
       "repository": "https://github.com/Kilo-Org/kilocode",
@@ -22,18 +23,6 @@
     "auto_for_profiles": [
       "full-auto"
     ],
-    "workspace_scope": {
-      "target_role": "managed-runtime-home",
-      "default": "captured-caller-cwd",
-      "manager_flag": "--workspace",
-      "native_form": [
-        "run",
-        "--dir",
-        "<workspace>"
-      ],
-      "child_cwd": "same-resolved-workspace",
-      "explicit_workspace": "absolute-existing-directory-final-component-not-symlink"
-    },
     "config_env": "KILO_CONFIG",
     "config_path": "xdg-config/kilo/kilo.jsonc",
     "isolated_child_home": true,
@@ -47,29 +36,41 @@
     "credential_inheritance": false,
     "forwards_child_exit_code": true,
     "lifecycle_lock": "persistent-flock-held-through-child",
+    "cleanup_pending_policy": "drain-under-target-lock-before-launch-image-protection-child",
     "bootstrap_lock": {
       "kind": "external-product-anchor-and-persistent-target-flock",
       "system_root": "fixed-real-sticky-system-temp",
       "macos_system_root": "/private/tmp",
       "ubuntu_system_root": "/tmp",
       "product_root_mode": "0700",
-      "product_anchor": "global.lock",
-      "target_anchor_root": "targets",
       "file_mode": "0600",
+      "product_anchor": "global.lock",
+      "product_anchor_lifetime": "monotonic-persistent",
       "filename": "sha256-product-namespace-and-canonical-target",
+      "target_anchor_lifetime": "mutation-published-monotonic-persistent",
       "target_binding": "json-product-canonical-target-and-sha256",
-      "anchor_publication": "native-rename-no-replace-complete-binding",
-      "empty_or_partial_final_binding": "fail-closed",
-      "stage_alias_recovery": "exclusive-mutator-only-exact-payload",
+      "target_parent_symlink_policy": "safe-user-symlink-parents-canonicalized-after-product-lock",
       "binding_exact": true,
+      "binding_publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
+      "hardlink_publication_alias_recovery": "mutation-only-lock-final-then-unlink-single-machine-temp-alias",
+      "read_only_publication_alias_policy": "fail-closed-no-repair",
       "binding_revalidated_before_yield": true,
       "fd_path_inode_revalidated_before_yield": true,
+      "read_only_anchor_policy": "no-create-product-anchor-and-no-create-target-anchor",
+      "cold_read_policy": "inspect-with-anchor-absence-double-check",
       "persistent_inode": true,
       "unlink_on_release": false,
       "acquire_order": "external-before-internal",
       "release_order": "internal-before-external",
       "child_env_exposed": false,
-      "same_uid_tampering_resistant_without_sandbox": false
+      "same_uid_tampering_resistant_without_sandbox": false,
+      "coordination_order": [
+        "host",
+        "lexical-target",
+        "product-bootstrap-lock",
+        "canonical-target-bootstrap-lock",
+        "target-inspection"
+      ]
     },
     "lock_file": ".nddev-kilo-cli.lock/lock",
     "lock_file_mode": "0600",
@@ -108,6 +109,7 @@
       "plan",
       "install",
       "switch",
+      "update",
       "migrate",
       "restore",
       "remove",
@@ -118,7 +120,41 @@
       "launch"
     ],
     "explicit_absolute_target": true,
-    "target_bound_backup_slots": 10
+    "target_bound_backup_slots": 10,
+    "target_bound_reject_before": [
+      "target",
+      "setup",
+      "bootstrap-lock",
+      "internal-lock",
+      "staging",
+      "network",
+      "launch"
+    ],
+    "cleanup_journal": {
+      "kind": "bounded-target-owned-cleanup-journal",
+      "root": ".nddev-kilo-cli-cleanup",
+      "intent": "intent.json",
+      "journal": "journal.json",
+      "tombstone": "tombstone",
+      "schema_version": 1,
+      "root_mode": "0700",
+      "journal_mode": "0600",
+      "publication": "atomic-temp-fsync-link-no-replace-parent-fsync",
+      "pre_move_intent": "durable-complete-intent-before-first-source-move",
+      "intent_recovery": "mutation-only-restore-or-complete-under-exclusive-target-lock",
+      "intent_source_binding": "fixed-anchor-relative-operation-kind-parent-identity",
+      "hardlink_publication_alias_recovery": "mutation-only-under-exclusive-target-lock",
+      "read_only_policy": "fail-closed-no-repair-on-incomplete-or-invalid",
+      "deletion_paths": "journal-relative-tombstone-names-only",
+      "absolute_deletion_paths": false,
+      "top_level_cleanup_pending": true,
+      "pending_noop_policy": "drain-is-lifecycle-work",
+      "max_paths": 121328,
+      "max_bytes": 1356857344,
+      "serialized_max_bytes": 8388608
+    },
+    "plan_changed_paths": "actual-byte-diff",
+    "mutation_changed_paths": "actual-byte-diff"
   },
   "managed_state": {
     "config_file": "xdg-config/kilo/kilo.jsonc",
@@ -169,17 +205,16 @@
     "version": "7.4.16",
     "command": "kilo",
     "official_alias": "kilocode",
-    "install_tool": "npm",
-    "install_argv": [
-      "install",
-      "--global",
-      "--ignore-scripts",
-      "--save-exact",
-      "--audit=false",
-      "--fund=false",
-      "--registry=https://registry.npmjs.org/",
-      "@kilocode/cli@7.4.16"
-    ],
+    "install_tool": "verified-npm-archive-set",
+    "archive_authority": {
+      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
+      "native_tarball": "host-selected-production-native-package",
+      "verification": [
+        "sha512-integrity",
+        "sha1-shasum"
+      ],
+      "materialization": "extract-verified-local-bytes-without-scripts"
+    },
     "package_integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
     "package_shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
     "lifecycle_scripts": "disabled",
@@ -199,24 +234,73 @@
     "install_executes_target_binary": false,
     "entrypoint_kind": "target-owned-native-wrapper",
     "native_executable_policy": "selected-native-package-bin-kilo",
-    "target_owned": true
-  },
-  "cleanup_lifecycle": {
-    "kind": "durable-intent-and-immutable-pending-journal",
-    "root": ".nddev-kilo-cli-cleanup",
-    "intent": "intent.json",
-    "journal": "journal.json",
-    "tombstone": "tombstone",
-    "schema_version": 1,
-    "publication": "native-rename-no-replace-complete-binding",
-    "prepare_before_first_move": true,
-    "mutation_drains_first": true,
-    "read_only_repairs": false,
-    "top_level_cleanup_pending": true,
-    "malformed_state": "fail-closed-exit-2-no-mutation",
-    "max_paths": 120538,
-    "max_bytes": 1346371584,
-    "serialized_max_bytes": 8388608
+    "target_owned": true,
+    "platform_scope": {
+      "supported_hosts": [
+        {
+          "id": "macos-arm64",
+          "os": "darwin",
+          "cpu": "arm64",
+          "libc": null,
+          "distribution": null
+        },
+        {
+          "id": "macos-x64",
+          "os": "darwin",
+          "cpu": "x64",
+          "libc": null,
+          "distribution": null
+        },
+        {
+          "id": "ubuntu-glibc-arm64",
+          "os": "linux",
+          "cpu": "arm64",
+          "libc": "glibc",
+          "distribution": "ubuntu",
+          "ubuntu_version_floor": null,
+          "ubuntu_version_floor_source": "no-official-floor"
+        },
+        {
+          "id": "ubuntu-glibc-x64",
+          "os": "linux",
+          "cpu": "x64",
+          "libc": "glibc",
+          "distribution": "ubuntu",
+          "ubuntu_version_floor": null,
+          "ubuntu_version_floor_source": "no-official-floor"
+        }
+      ],
+      "unsupported_categories": [
+        "windows",
+        "non-ubuntu-linux",
+        "linux-musl",
+        "unsupported-architecture"
+      ],
+      "reject_before": [
+        "target",
+        "lock",
+        "staging",
+        "network",
+        "launch"
+      ],
+      "vendor_package_preferences": {
+        "macos-arm64": [
+          "@kilocode/cli-darwin-arm64"
+        ],
+        "macos-x64": [
+          "@kilocode/cli-darwin-x64-baseline",
+          "@kilocode/cli-darwin-x64"
+        ],
+        "ubuntu-glibc-arm64": [
+          "@kilocode/cli-linux-arm64"
+        ],
+        "ubuntu-glibc-x64": [
+          "@kilocode/cli-linux-x64-baseline",
+          "@kilocode/cli-linux-x64"
+        ]
+      },
+      "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog"
+    }
   },
   "builder": {
     "enabled_by_default": true,
