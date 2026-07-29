@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import ctypes
 import errno
 import hashlib
 import json
@@ -49,6 +50,15 @@ BACKUP_SCHEMA = 1
 MAX_BACKUPS = 10
 OWNER_FILE_MODE = 0o600
 OWNER_DIR_MODE = 0o700
+AT_FDCWD_BY_SYSTEM = {"darwin": -2, "linux": -100}
+RENAME_EXCL_DARWIN = 0x00000004
+RENAME_NOREPLACE_LINUX = 1
+RENAMEAT2_SYSCALL_BY_MACHINE = {
+    "x86_64": 316,
+    "amd64": 316,
+    "aarch64": 276,
+    "arm64": 276,
+}
 MANAGED_PAYLOAD_MAX_BYTES = 1024 * 1024
 METADATA_MAX_BYTES = 256 * 1024
 SOURCE_CONFIG = "config.json"
@@ -163,14 +173,30 @@ SOFTWARE_TREE_MAX_PATHS = 120000
 SOFTWARE_PREFIX_RELATIVE = Path("install") / "npm-prefix"
 SOFTWARE_GLOBAL_DIR_RELATIVE = SOFTWARE_PREFIX_RELATIVE / "lib"
 SOFTWARE_LOCK_RELATIVE = Path("software") / "package-lock.json"
+SOFTWARE_STAGE_RELATIVE = Path(".nddev-kilo-cli-software-stages")
 BACKUP_POOL_RELATIVE = Path(".nddev-kilo-cli-backups")
+CLEANUP_RELATIVE = Path(".nddev-kilo-cli-cleanup")
+CLEANUP_INTENT_NAME = "intent.json"
+CLEANUP_JOURNAL_NAME = "journal.json"
+CLEANUP_TOMBSTONE_NAME = "tombstone"
+CLEANUP_SCHEMA = 1
+CLEANUP_MAX_PATHS = SOFTWARE_TREE_MAX_PATHS + MAX_BACKUPS * (len(BUILDER_FILES) + 16) + 128
+CLEANUP_MAX_BYTES = SOFTWARE_TREE_MAX_BYTES + MAX_BACKUPS * (
+    MANAGED_PAYLOAD_MAX_BYTES * (len(BUILDER_FILES) + 1)
+)
+CLEANUP_JOURNAL_MAX_BYTES = 8 * 1024 * 1024
 LOCK_RELATIVE = Path(".nddev-kilo-cli.lock")
 LOCK_FILE_NAME = "lock"
 LOCK_OWNER_NAME = "owner.json"
 LOCK_HELD_PARENT_MODE = 0o500
 BOOTSTRAP_LOCK_SCHEMA = 1
 BOOTSTRAP_LOCK_PREFIX = f"{PRODUCT_NAME}-bootstrap-locks"
+BOOTSTRAP_PRODUCT_LOCK_NAME = "global.lock"
+BOOTSTRAP_TARGET_LOCK_ROOT_NAME = "targets"
 BOOTSTRAP_LOCK_MAX_BYTES = 16 * 1024
+BOOTSTRAP_LOCK_MAX_STAGE_ALIASES = 8
+BOOTSTRAP_LOCK_MAX_ROOT_ENTRIES = 256
+BOOTSTRAP_LOCK_STAGE_NUMERIC_COMPONENT_MAX_DIGITS = 20
 FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES = (
     "NDDEV_KILO_BOOTSTRAP_LOCK_ROOT",
     "NDDEV_KILO_TEST_BOOTSTRAP_LOCK_ROOT",
@@ -178,14 +204,19 @@ FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES = (
     "BOOTSTRAP_LOCK_ROOT_OVERRIDE",
 )
 BOOTSTRAP_LOCK_CONTRACT = {
-    "kind": "external-product-uid-flock",
+    "kind": "external-product-anchor-and-persistent-target-flock",
     "system_root": "fixed-real-sticky-system-temp",
     "macos_system_root": "/private/tmp",
     "ubuntu_system_root": "/tmp",
     "product_root_mode": "0700",
+    "product_anchor": BOOTSTRAP_PRODUCT_LOCK_NAME,
+    "target_anchor_root": BOOTSTRAP_TARGET_LOCK_ROOT_NAME,
     "file_mode": "0600",
     "filename": "sha256-product-namespace-and-canonical-target",
     "target_binding": "json-product-canonical-target-and-sha256",
+    "anchor_publication": "native-rename-no-replace-complete-binding",
+    "empty_or_partial_final_binding": "fail-closed",
+    "stage_alias_recovery": "exclusive-mutator-only-exact-payload",
     "binding_exact": True,
     "binding_revalidated_before_yield": True,
     "fd_path_inode_revalidated_before_yield": True,
@@ -196,9 +227,31 @@ BOOTSTRAP_LOCK_CONTRACT = {
     "child_env_exposed": False,
     "same_uid_tampering_resistant_without_sandbox": False,
 }
+CLEANUP_JOURNAL_CONTRACT = {
+    "kind": "durable-intent-and-immutable-pending-journal",
+    "root": CLEANUP_RELATIVE.as_posix(),
+    "intent": CLEANUP_INTENT_NAME,
+    "journal": CLEANUP_JOURNAL_NAME,
+    "tombstone": CLEANUP_TOMBSTONE_NAME,
+    "schema_version": CLEANUP_SCHEMA,
+    "publication": "native-rename-no-replace-complete-binding",
+    "prepare_before_first_move": True,
+    "mutation_drains_first": True,
+    "read_only_repairs": False,
+    "top_level_cleanup_pending": True,
+    "malformed_state": "fail-closed-exit-2-no-mutation",
+    "max_paths": CLEANUP_MAX_PATHS,
+    "max_bytes": CLEANUP_MAX_BYTES,
+    "serialized_max_bytes": CLEANUP_JOURNAL_MAX_BYTES,
+}
 BOOTSTRAP_LOCK_BINDING_KEYS = frozenset(
     {"schema_version", "product_name", "target", "target_sha256"}
 )
+PRODUCT_LOCK_BINDING_KEYS = frozenset(
+    {"schema_version", "product_name", "kind", "namespace"}
+)
+READ_LIFECYCLE_MAX_ATTEMPTS = 3
+HEX_DIGITS = frozenset("0123456789abcdef")
 KILO_PACKAGE_BIN_RELATIVE = (
     SOFTWARE_GLOBAL_DIR_RELATIVE / "node_modules" / "@kilocode" / "cli" / "bin" / "kilo"
 )
@@ -307,6 +360,10 @@ class ConcurrentTargetChange(ManagerError):
     """A fail-closed target race or identity change."""
 
 
+class ReadLifecycleRetry(Exception):
+    """A read-only lifecycle observation must be retried under fresh coordination."""
+
+
 @dataclass(frozen=True)
 class Setup:
     setup_id: str
@@ -333,6 +390,61 @@ class DirectoryTransaction:
         for path in reversed(self.created):
             with contextlib.suppress(OSError):
                 path.rmdir()
+
+
+@dataclass(frozen=True)
+class DirectoryMetadata:
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_nlink: int
+    st_uid: int | None
+    st_gid: int | None
+    mode: int
+    atime_ns: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class AnchorStageSignature:
+    path: Path
+    st_dev: int
+    st_ino: int
+    st_nlink: int
+    st_uid: int | None
+    st_gid: int | None
+    mode: int
+    size: int
+    mtime_ns: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class CreatedDirectorySignature:
+    path: Path
+    descriptor: int
+    st_dev: int
+    st_ino: int
+    st_nlink: int
+    st_uid: int | None
+    st_gid: int | None
+    mode: int
+
+
+@dataclass(frozen=True)
+class ProductBootstrapLockHandle:
+    descriptor: int
+    path: Path
+    root: Path
+    mode: int
+
+
+@dataclass(frozen=True)
+class ExternalBootstrapTargetLockHandle:
+    descriptor: int
+    path: Path
+    target: Path
+    mode: int
 
 
 def fail(message: str) -> NoReturn:
@@ -395,6 +507,84 @@ def chmod_directory_no_follow(path: Path, mode: int, label: str) -> os.stat_resu
         return final
     finally:
         os.close(descriptor)
+
+
+def capture_created_directory_signature(path: Path, label: str) -> CreatedDirectorySignature:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        fail(f"{label} rollback requires no-follow directory descriptors: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ManagerError(f"{label} must be opened exactly after creation: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            fail(f"{label} creation descriptor must be a directory: {path}")
+        os.fchmod(descriptor, OWNER_DIR_MODE)
+        opened = os.fstat(descriptor)
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} created path must be a real directory: {path}")
+        if identity_of(opened) != identity_of(info):
+            raise ConcurrentTargetChange(f"{label} changed while its creation was captured: {path}")
+        if not is_owner_private_directory(info):
+            fail(f"{label} must be owned by the current user with mode 0700: {path}")
+        return CreatedDirectorySignature(
+            path=path,
+            descriptor=descriptor,
+            st_dev=info.st_dev,
+            st_ino=info.st_ino,
+            st_nlink=info.st_nlink,
+            st_uid=getattr(info, "st_uid", None),
+            st_gid=getattr(info, "st_gid", None),
+            mode=stat.S_IMODE(info.st_mode),
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def close_created_directory_signature(signature: CreatedDirectorySignature | None) -> None:
+    if signature is None:
+        return
+    with contextlib.suppress(OSError):
+        os.close(signature.descriptor)
+
+
+def revalidate_created_directory_signature(signature: CreatedDirectorySignature, label: str) -> None:
+    opened = os.fstat(signature.descriptor)
+    info = signature.path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} rollback target is no longer a real directory")
+    if not stat.S_ISDIR(opened.st_mode):
+        fail(f"{label} rollback descriptor is no longer a directory")
+    if identity_of(opened) != (signature.st_dev, signature.st_ino):
+        raise ConcurrentTargetChange(f"{label} descriptor changed before rollback cleanup")
+    if identity_of(info) != (signature.st_dev, signature.st_ino):
+        raise ConcurrentTargetChange(f"{label} path changed before rollback cleanup")
+    if (
+        info.st_nlink != signature.st_nlink
+        or getattr(info, "st_uid", None) != signature.st_uid
+        or getattr(info, "st_gid", None) != signature.st_gid
+        or stat.S_IMODE(info.st_mode) != signature.mode
+    ):
+        raise ConcurrentTargetChange(f"{label} metadata changed before rollback cleanup")
+
+
+def cleanup_created_directory_signature(
+    signature: CreatedDirectorySignature,
+    parent: Path,
+    label: str,
+) -> None:
+    revalidate_created_directory_signature(signature, label)
+    try:
+        signature.path.rmdir()
+    except OSError as cleanup_exc:
+        fail(f"{label} rollback found unexpected nonempty state: {cleanup_exc}")
+    fsync_directory(parent)
 
 
 def require_safe_target_ancestor(path: Path, label: str) -> None:
@@ -503,6 +693,80 @@ def require_directory(path: Path, label: str) -> os.stat_result:
     return info
 
 
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def directory_metadata(path: Path, label: str) -> DirectoryMetadata:
+    info = require_directory(path, label)
+    return DirectoryMetadata(
+        st_dev=info.st_dev,
+        st_ino=info.st_ino,
+        st_size=info.st_size,
+        st_nlink=info.st_nlink,
+        st_uid=getattr(info, "st_uid", None),
+        st_gid=getattr(info, "st_gid", None),
+        mode=stat.S_IMODE(info.st_mode),
+        atime_ns=info.st_atime_ns,
+        mtime_ns=info.st_mtime_ns,
+    )
+
+
+def restore_directory_metadata(path: Path, expected: DirectoryMetadata, label: str) -> None:
+    info = require_directory(path, label)
+    if info.st_dev != expected.st_dev or info.st_ino != expected.st_ino:
+        raise ConcurrentTargetChange(f"{label} changed during staged recovery")
+    if stat.S_IMODE(info.st_mode) != expected.mode:
+        path.chmod(expected.mode)
+    os.utime(path, ns=(expected.atime_ns, expected.mtime_ns))
+    fsync_directory(path)
+    final = require_directory(path, label)
+    if (
+        final.st_dev != expected.st_dev
+        or final.st_ino != expected.st_ino
+        or final.st_size != expected.st_size
+        or final.st_nlink != expected.st_nlink
+        or getattr(final, "st_uid", None) != expected.st_uid
+        or getattr(final, "st_gid", None) != expected.st_gid
+        or stat.S_IMODE(final.st_mode) != expected.mode
+        or final.st_atime_ns != expected.atime_ns
+        or final.st_mtime_ns != expected.mtime_ns
+    ):
+        raise ConcurrentTargetChange(f"{label} metadata was not restored exactly")
+
+
+def restore_directory_stage_cleanup_metadata(path: Path, expected: DirectoryMetadata, label: str) -> None:
+    info = require_directory(path, label)
+    if info.st_dev != expected.st_dev or info.st_ino != expected.st_ino:
+        raise ConcurrentTargetChange(f"{label} changed during staged cleanup")
+    if getattr(info, "st_uid", None) != expected.st_uid or getattr(info, "st_gid", None) != expected.st_gid:
+        raise ConcurrentTargetChange(f"{label} ownership changed during staged cleanup")
+    if stat.S_IMODE(info.st_mode) != expected.mode:
+        path.chmod(expected.mode)
+    os.utime(path, ns=(expected.atime_ns, expected.mtime_ns))
+    fsync_directory(path)
+    final = require_directory(path, label)
+    if (
+        final.st_dev != expected.st_dev
+        or final.st_ino != expected.st_ino
+        or getattr(final, "st_uid", None) != expected.st_uid
+        or getattr(final, "st_gid", None) != expected.st_gid
+        or stat.S_IMODE(final.st_mode) != expected.mode
+        or final.st_atime_ns != expected.atime_ns
+        or final.st_mtime_ns != expected.mtime_ns
+    ):
+        raise ConcurrentTargetChange(f"{label} metadata was not restored after staged cleanup")
+
+
 def require_regular_file(
     path: Path,
     label: str,
@@ -587,6 +851,75 @@ def read_json_file(
         read_regular_file(path, label, owner_only=owner_only, max_bytes=max_bytes),
         label,
     )
+
+
+def is_sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
+    observed = set(value)
+    if observed == expected:
+        return
+    missing = sorted(expected - observed)
+    extra = sorted(observed - expected)
+    details = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if extra:
+        details.append("extra " + ", ".join(extra))
+    fail(f"{label} keys are not exact: {'; '.join(details)}")
+
+
+def fsync_parent_directory(path: Path, label: str) -> None:
+    parent = path.parent
+    try:
+        parent.lstat()
+    except FileNotFoundError:
+        return
+    fsync_directory(parent)
+
+
+def remove_path_durable(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+        path.unlink()
+        fsync_parent_directory(path, f"parent of removed path {path}")
+        return
+    if stat.S_ISDIR(info.st_mode):
+        entries = sorted(path.iterdir(), key=lambda item: item.name, reverse=True)
+        for child in entries:
+            remove_path_durable(child)
+        path.rmdir()
+        fsync_parent_directory(path, f"parent of removed directory {path}")
+        return
+    fail(f"cannot remove unsupported path type: {path}")
+
+
+def remove_path_durable_retry(path: Path, label: str, *, attempts: int = 3) -> None:
+    first_error: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            remove_path_durable(path)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if not path_exists_no_follow(path):
+            return
+    if first_error is not None:
+        raise ManagerError(f"{label} cleanup failed") from first_error
+    fail(f"{label} cleanup left residue: {path}")
+
+
+def cleanup_transaction_directory_retry(path: Path, label: str, *, attempts: int = 3) -> None:
+    remove_path_durable_retry(path, label, attempts=attempts)
 
 
 def baseline() -> dict[str, Any]:
@@ -909,13 +1242,1146 @@ def backup_slot_directory(target: Path, slot: int) -> Path:
     fail(f"backup slot is missing: {slot}")
 
 
-def canonical_target_for_bootstrap_lock(raw: str | Path) -> Path:
+def software_stage_root(target: Path) -> Path:
+    return target / SOFTWARE_STAGE_RELATIVE
+
+
+def cleanup_root_path(target: Path) -> Path:
+    return target / CLEANUP_RELATIVE
+
+
+def cleanup_intent_path(target: Path) -> Path:
+    return cleanup_root_path(target) / CLEANUP_INTENT_NAME
+
+
+def cleanup_journal_path(target: Path) -> Path:
+    return cleanup_root_path(target) / CLEANUP_JOURNAL_NAME
+
+
+def cleanup_tombstone_path(target: Path) -> Path:
+    return cleanup_root_path(target) / CLEANUP_TOMBSTONE_NAME
+
+
+def cleanup_record_path(target: Path, relative: str) -> Path:
+    root = cleanup_tombstone_path(target)
+    return root if relative == "." else root / safe_relative_path(relative)
+
+
+def cleanup_record_path_under(root: Path, relative: str) -> Path:
+    return root if relative == "." else root / safe_relative_path(relative)
+
+
+def cleanup_temp_name_is_valid(name: str, final_name: str) -> bool:
+    prefix = f".{final_name}.tmp-"
+    if not name.startswith(prefix):
+        return False
+    suffix = name[len(prefix):]
+    return bool(suffix) and len(suffix) <= 64 and all(
+        character in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-"
+        for character in suffix
+    )
+
+
+def is_unpublished_cleanup_temp(path: Path, final_names: set[str]) -> bool:
+    if not any(cleanup_temp_name_is_valid(path.name, final_name) for final_name in final_names):
+        return False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and is_owner_only_file(info) and info.st_nlink == 1
+
+
+def remove_unpublished_cleanup_temps(
+    root: Path,
+    *,
+    final_names: set[str],
+    allowed_names: set[str],
+) -> bool:
+    removed = False
+    for entry in sorted(root.iterdir(), key=lambda path: path.name):
+        if entry.name in allowed_names:
+            continue
+        if not is_unpublished_cleanup_temp(entry, final_names):
+            fail("cleanup pending root object set is not exact")
+        entry.unlink()
+        removed = True
+    if removed:
+        fsync_directory(root)
+    return removed
+
+
+def cleanup_graph_record(
+    path: Path,
+    relative: str,
+    path_counter: dict[str, int],
+    byte_counter: dict[str, int],
+) -> dict[str, Any]:
+    path_counter["value"] += 1
+    if path_counter["value"] > CLEANUP_MAX_PATHS:
+        fail("cleanup tombstone exceeds the bounded path limit")
+    info = path.lstat()
+    record: dict[str, Any] = {
+        "path": relative,
+        "uid": owner_of(info),
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+    }
+    if stat.S_ISLNK(info.st_mode):
+        fail(f"cleanup tombstone must not contain symlinks: {path}")
+    if stat.S_ISDIR(info.st_mode):
+        if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+            fail(f"cleanup tombstone directory is not owned by the current user: {path}")
+        record["kind"] = "directory"
+        return record
+    if stat.S_ISREG(info.st_mode):
+        record["kind"] = "file"
+        record["sha256"] = digest_regular_file(path, f"cleanup tombstone {relative}", byte_counter)
+        if byte_counter["value"] > CLEANUP_MAX_BYTES:
+            fail("cleanup tombstone exceeds the bounded byte limit")
+        return record
+    fail(f"cleanup tombstone contains unsupported path type: {path}")
+
+
+def cleanup_object_graph_records(root: Path) -> list[dict[str, Any]]:
+    require_directory(root, "cleanup tombstone")
+    records: list[dict[str, Any]] = []
+    path_counter = {"value": 0}
+    byte_counter = {"value": 0}
+
+    def add_record(path: Path, relative: str) -> None:
+        records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
+
+    add_record(root, ".")
+    root_info = root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode):
+        return records
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        current_path = Path(current)
+        for directory in directories:
+            path = current_path / directory
+            add_record(path, path.relative_to(root).as_posix())
+        for filename in files:
+            path = current_path / filename
+            add_record(path, path.relative_to(root).as_posix())
+    return records
+
+
+def projected_cleanup_root_record(root: Path) -> dict[str, Any]:
+    info = require_directory(root, "cleanup tombstone")
+    max_identity = (1 << 64) - 1
+    return {
+        "path": ".",
+        "uid": owner_of(info),
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": max(info.st_dev, max_identity),
+        "ino": max(info.st_ino, max_identity),
+        "mtime_ns": max(info.st_mtime_ns, max_identity),
+        "nlink": max(info.st_nlink, CLEANUP_MAX_PATHS + 2),
+        "size": max(info.st_size, max_identity),
+        "kind": "directory",
+    }
+
+
+def projected_cleanup_graph_records(
+    tombstone_root: Path,
+    destinations: list[tuple[str, Path]],
+) -> list[dict[str, Any]]:
+    records = [projected_cleanup_root_record(tombstone_root)]
+    path_counter = {"value": 1}
+    byte_counter = {"value": 0}
+    for destination_name, source in destinations:
+        records.append(cleanup_graph_record(source, destination_name, path_counter, byte_counter))
+        if not source.is_dir():
+            continue
+        for current, directories, files in os.walk(source):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for directory in directories:
+                path = current_path / directory
+                relative = Path(destination_name, path.relative_to(source)).as_posix()
+                records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
+            for filename in files:
+                path = current_path / filename
+                relative = Path(destination_name, path.relative_to(source)).as_posix()
+                records.append(cleanup_graph_record(path, relative, path_counter, byte_counter))
+    return records
+
+
+def cleanup_record_matches(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    allow_directory_drain_metadata: bool = False,
+) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        fail("cleanup tombstone must not contain symlinks")
+    if (
+        owner_of(info) != record.get("uid")
+        or stat.S_IMODE(info.st_mode) != record.get("mode")
+        or info.st_dev != record.get("dev")
+        or info.st_ino != record.get("ino")
+    ):
+        return False
+    kind = record.get("kind")
+    if kind == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if allow_directory_drain_metadata:
+            return True
+        return (
+            info.st_nlink == record.get("nlink")
+            and info.st_size == record.get("size")
+            and info.st_mtime_ns == record.get("mtime_ns")
+        )
+    if (
+        info.st_nlink != record.get("nlink")
+        or info.st_size != record.get("size")
+        or info.st_mtime_ns != record.get("mtime_ns")
+    ):
+        return False
+    if kind == "file":
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        expected_digest = record.get("sha256")
+        if not isinstance(expected_digest, str):
+            fail("cleanup journal file digest is invalid")
+        observed = digest_regular_file(path, "cleanup pending file", {"value": 0})
+        return observed == expected_digest
+    fail("cleanup journal object kind is unsupported")
+
+
+def cleanup_record_parent(relative: str) -> str | None:
+    if relative == ".":
+        return None
+    parts = Path(relative).parts
+    if not parts:
+        fail("cleanup pending journal graph path is invalid")
+    if len(parts) == 1:
+        return "."
+    return Path(*parts[:-1]).as_posix()
+
+
+def cleanup_declared_children(records: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    children = {
+        relative: set() for relative, record in records.items() if record.get("kind") == "directory"
+    }
+    for relative, record in records.items():
+        if relative == ".":
+            continue
+        parent = cleanup_record_parent(relative)
+        if parent not in records or records[parent].get("kind") != "directory":
+            fail("cleanup pending journal graph omits a parent directory")
+        children.setdefault(parent, set()).add(Path(relative).name)
+        if record.get("kind") == "directory":
+            children.setdefault(relative, set())
+    return children
+
+
+def cleanup_directory_stable_matches(path: Path, record: dict[str, Any]) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and owner_of(info) == record.get("uid")
+        and stat.S_IMODE(info.st_mode) == record.get("mode")
+        and info.st_dev == record.get("dev")
+        and info.st_ino == record.get("ino")
+    )
+
+
+def validate_cleanup_remaining_child_set(
+    target: Path,
+    relative: str,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    path = cleanup_record_path(target, relative)
+    if not path_exists_no_follow(path):
+        return
+    record = records[relative]
+    if record.get("kind") != "directory":
+        return
+    if not cleanup_directory_stable_matches(path, record):
+        fail("cleanup pending tombstone directory identity mismatch")
+    current_names = {entry.name for entry in path.iterdir()}
+    expected_names = {
+        name
+        for name in children.get(relative, set())
+        if path_exists_no_follow(
+            cleanup_record_path(target, name if relative == "." else f"{relative}/{name}")
+        )
+    }
+    if current_names != expected_names:
+        fail("cleanup pending tombstone child set is not journal-declared")
+
+
+def validate_cleanup_remaining_shape(
+    target: Path,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    for relative, record in records.items():
+        path = cleanup_record_path(target, relative)
+        if not path_exists_no_follow(path):
+            continue
+        if record.get("kind") == "file":
+            if not cleanup_record_matches(path, record):
+                fail("cleanup pending tombstone object identity mismatch")
+            continue
+        if record.get("kind") == "directory":
+            validate_cleanup_remaining_child_set(target, relative, records, children)
+            continue
+        fail("cleanup pending journal object kind is unsupported")
+
+
+def cleanup_ancestor_relatives(relative: str) -> list[str]:
+    ancestors: list[str] = []
+    parent = cleanup_record_parent(relative)
+    while parent is not None:
+        ancestors.append(parent)
+        parent = cleanup_record_parent(parent)
+    return ancestors
+
+
+def validate_cleanup_ancestors_before_delete(
+    target: Path,
+    relative: str,
+    records: dict[str, dict[str, Any]],
+    children: dict[str, set[str]],
+) -> None:
+    for ancestor in cleanup_ancestor_relatives(relative):
+        if ancestor in records:
+            validate_cleanup_remaining_child_set(target, ancestor, records, children)
+
+
+def validate_cleanup_graph_record_schema(
+    graph: Any,
+    *,
+    label: str,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(graph, list) or not graph:
+        fail(f"{label} graph is invalid")
+    if len(graph) > CLEANUP_MAX_PATHS:
+        fail(f"{label} graph exceeds the bounded path limit")
+    records: dict[str, dict[str, Any]] = {}
+    total_file_size = 0
+    for index, record in enumerate(graph):
+        if not isinstance(record, dict):
+            fail(f"{label} graph record {index} is invalid")
+        kind = record.get("kind")
+        expected_keys = {
+            "path",
+            "kind",
+            "uid",
+            "mode",
+            "dev",
+            "ino",
+            "mtime_ns",
+            "nlink",
+            "size",
+        }
+        if kind == "file":
+            expected_keys.add("sha256")
+        require_exact_keys(record, expected_keys, f"{label} graph record {index}")
+        relative = record["path"]
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or any(part in {"", ".."} for part in Path(relative).parts)
+        ):
+            fail(f"{label} graph path {index} is invalid")
+        if relative in records:
+            fail(f"{label} graph path is duplicated: {relative}")
+        if kind not in {"directory", "file"}:
+            fail(f"{label} graph kind {index} is unsupported")
+        for key in ("uid", "mode", "dev", "ino", "mtime_ns", "nlink", "size"):
+            value = record[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                fail(f"{label} graph {relative} {key} is invalid")
+        if kind == "file" and not is_sha256_hex(record["sha256"]):
+            fail(f"{label} graph {relative} digest is invalid")
+        if kind == "file":
+            total_file_size += record["size"]
+            if total_file_size > CLEANUP_MAX_BYTES:
+                fail(f"{label} graph exceeds the bounded byte limit")
+        records[relative] = record
+    if "." not in records:
+        fail(f"{label} graph omits the root")
+    return records
+
+
+def validate_cleanup_graph_records(
+    journal: dict[str, Any], target: Path
+) -> dict[str, dict[str, Any]]:
+    records = validate_cleanup_graph_record_schema(
+        journal["graph"],
+        label="cleanup pending journal",
+    )
+    entry_tombstones = {entry["tombstone"] for entry in journal["entries"]}
+    for tombstone in entry_tombstones:
+        if tombstone not in records:
+            fail("cleanup pending journal omits a declared tombstone root")
+    children = cleanup_declared_children(records)
+    tombstone_root = cleanup_tombstone_path(target)
+    if path_exists_no_follow(tombstone_root):
+        for current, directories, files in os.walk(tombstone_root):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for name in [*directories, *files]:
+                relative = (current_path / name).relative_to(tombstone_root).as_posix()
+                if relative not in records:
+                    fail("cleanup pending tombstone contains an unjournaled object")
+    all_present = all(
+        path_exists_no_follow(cleanup_record_path(target, relative)) for relative in records
+    )
+    if all_present:
+        for relative, record in records.items():
+            if not cleanup_record_matches(cleanup_record_path(target, relative), record):
+                fail("cleanup pending tombstone object identity mismatch")
+    else:
+        validate_cleanup_remaining_shape(target, records, children)
+    return records
+
+
+def ensure_cleanup_journal_serialized_bound(content: bytes) -> None:
+    if len(content) > CLEANUP_JOURNAL_MAX_BYTES:
+        fail("cleanup pending journal exceeds the serialized byte limit")
+
+
+def cleanup_journal_document(
+    target: Path,
+    command: str,
+    entries: list[dict[str, str]],
+    graph: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": CLEANUP_SCHEMA,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "target": str(target),
+        "command": command,
+        "root": CLEANUP_RELATIVE.as_posix(),
+        "tombstone": CLEANUP_TOMBSTONE_NAME,
+        "entries": entries,
+        "graph": graph,
+    }
+
+
+def cleanup_journal_content(
+    target: Path,
+    command: str,
+    entries: list[dict[str, str]],
+    graph: list[dict[str, Any]],
+) -> bytes:
+    content = canonical_json(cleanup_journal_document(target, command, entries, graph))
+    ensure_cleanup_journal_serialized_bound(content)
+    return content
+
+
+def cleanup_source_parent_identity(path: Path) -> dict[str, Any]:
+    info = require_directory(path, "cleanup intent source parent")
+    if hasattr(os, "geteuid") and owner_of(info) != os.geteuid():
+        fail("cleanup intent source parent is not owned by the current user")
+    return {
+        "kind": "directory",
+        "uid": owner_of(info),
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+    }
+
+
+def cleanup_source_parent_identity_matches(path: Path, expected: dict[str, Any]) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and expected.get("kind") == "directory"
+        and owner_of(info) == expected.get("uid")
+        and stat.S_IMODE(info.st_mode) == expected.get("mode")
+        and info.st_dev == expected.get("dev")
+        and info.st_ino == expected.get("ino")
+    )
+
+
+def cleanup_intent_source_binding(target: Path, source: Path, kind: str) -> dict[str, Any]:
+    if not source.is_absolute():
+        fail("cleanup intent source must be anchored by manager-owned roots")
+    if kind.startswith("retired-backup-slot-"):
+        try:
+            relative_path = source.relative_to(backup_pool(target))
+        except ValueError:
+            fail("cleanup retired backup source is outside the backup-pool anchor")
+        slot = kind.removeprefix("retired-backup-slot-")
+        if relative_path.as_posix() != slot or not slot.isdigit():
+            fail("cleanup retired backup source is not the declared backup slot")
+        anchor = "backup-pool"
+        relative = relative_path.as_posix()
+    elif kind in {"software-staging", "software-removal"}:
+        try:
+            relative_path = source.relative_to(target)
+        except ValueError:
+            fail("cleanup software source is outside the target anchor")
+        if relative_path != SOFTWARE_STAGE_RELATIVE:
+            fail("cleanup software source is not the fixed manager software-stage root")
+        anchor = "target"
+        relative = relative_path.as_posix()
+    else:
+        fail("cleanup intent source kind is not operation-specific")
+    safe_relative_path(relative)
+    return {
+        "anchor": anchor,
+        "relative": relative,
+        "parent": cleanup_source_parent_identity(source.parent),
+    }
+
+
+def cleanup_intent_source_from_binding(
+    target: Path,
+    kind: str,
+    binding: dict[str, Any],
+    index: int,
+) -> Path:
+    require_exact_keys(binding, {"anchor", "relative", "parent"}, f"cleanup pending intent source {index}")
+    anchor = binding["anchor"]
+    relative = binding["relative"]
+    parent = binding["parent"]
+    if not isinstance(anchor, str) or not isinstance(relative, str):
+        fail(f"cleanup pending intent source {index} binding is invalid")
+    if not isinstance(parent, dict):
+        fail(f"cleanup pending intent source {index} parent binding is invalid")
+    require_exact_keys(parent, {"kind", "uid", "mode", "dev", "ino"}, f"cleanup pending intent source {index} parent")
+    for key in ("uid", "mode", "dev", "ino"):
+        value = parent[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            fail(f"cleanup pending intent source {index} parent {key} is invalid")
+    relative_path = safe_relative_path(relative)
+    if anchor == "backup-pool":
+        source = backup_pool(target) / relative_path
+    elif anchor == "target":
+        source = target / relative_path
+    else:
+        fail(f"cleanup pending intent source {index} anchor is unsupported")
+    expected_binding = cleanup_intent_source_binding(target, source, kind)
+    if (
+        expected_binding["anchor"] != anchor
+        or expected_binding["relative"] != relative
+        or expected_binding["parent"] != parent
+    ):
+        fail(f"cleanup pending intent source {index} binding is not exact")
+    if not cleanup_source_parent_identity_matches(source.parent, parent):
+        fail(f"cleanup pending intent source {index} parent identity changed")
+    return source
+
+
+def cleanup_intent_entries(
+    target: Path,
+    entries: list[dict[str, str]],
+    present: list[tuple[str, Path]],
+) -> list[dict[str, Any]]:
+    intent_entries: list[dict[str, Any]] = []
+    for entry, (kind, source) in zip(entries, present):
+        intent_entries.append(
+            {
+                "kind": kind,
+                "tombstone": entry["tombstone"],
+                "source": cleanup_intent_source_binding(target, source, kind),
+                "graph": cleanup_object_graph_records(source),
+            }
+        )
+    return intent_entries
+
+
+def cleanup_intent_document(target: Path, command: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": CLEANUP_SCHEMA,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "target": str(target),
+        "command": command,
+        "root": CLEANUP_RELATIVE.as_posix(),
+        "intent": CLEANUP_INTENT_NAME,
+        "journal": CLEANUP_JOURNAL_NAME,
+        "tombstone": CLEANUP_TOMBSTONE_NAME,
+        "entries": entries,
+    }
+
+
+def cleanup_intent_content(target: Path, command: str, entries: list[dict[str, Any]]) -> bytes:
+    content = canonical_json(cleanup_intent_document(target, command, entries))
+    ensure_cleanup_journal_serialized_bound(content)
+    return content
+
+
+def read_cleanup_bound_json_file(path: Path, label: str) -> dict[str, Any]:
+    content = read_regular_file(path, label, owner_only=True, max_bytes=CLEANUP_JOURNAL_MAX_BYTES)
+    return parse_json_object(content, label)
+
+
+def read_cleanup_journal_file(path: Path) -> dict[str, Any]:
+    return read_cleanup_bound_json_file(path, "cleanup pending journal")
+
+
+def read_cleanup_intent_file(path: Path) -> dict[str, Any]:
+    return read_cleanup_bound_json_file(path, "cleanup pending intent")
+
+
+def cleanup_intent_entry_source(target: Path, entry: dict[str, Any], index: int) -> Path:
+    kind = entry["kind"]
+    if not isinstance(kind, str) or not kind:
+        fail(f"cleanup pending intent entry {index} kind is invalid")
+    source = entry["source"]
+    if not isinstance(source, dict):
+        fail(f"cleanup pending intent entry {index} source is invalid")
+    return cleanup_intent_source_from_binding(target, kind, source, index)
+
+
+def validate_cleanup_root_names(
+    target: Path,
+    *,
+    allow_intent: bool,
+    allow_journal: bool,
+    allow_tombstone: bool,
+) -> None:
+    allowed: set[str] = set()
+    if allow_intent:
+        allowed.add(CLEANUP_INTENT_NAME)
+    if allow_journal:
+        allowed.add(CLEANUP_JOURNAL_NAME)
+    if allow_tombstone:
+        allowed.add(CLEANUP_TOMBSTONE_NAME)
+    for entry in sorted(cleanup_root_path(target).iterdir(), key=lambda item: item.name):
+        if entry.name not in allowed:
+            fail("cleanup pending root object set is not exact")
+
+
+def validate_cleanup_intent(target: Path, *, allow_journal_residue: bool = False) -> dict[str, Any]:
+    root_info = require_directory(cleanup_root_path(target), "cleanup pending root")
+    if not is_owner_private_directory(root_info):
+        fail("cleanup pending root must be private to the current user with mode 0700")
+    validate_cleanup_root_names(
+        target,
+        allow_intent=True,
+        allow_journal=allow_journal_residue,
+        allow_tombstone=True,
+    )
+    intent = read_cleanup_intent_file(cleanup_intent_path(target))
+    require_exact_keys(
+        intent,
+        {"schema_version", "product_name", "build_version", "target", "command", "root", "intent", "journal", "tombstone", "entries"},
+        "cleanup pending intent",
+    )
+    ensure_cleanup_journal_serialized_bound(canonical_json(intent))
+    if intent["schema_version"] != CLEANUP_SCHEMA:
+        fail("cleanup pending intent schema is unsupported")
+    if intent["product_name"] != PRODUCT_NAME or intent["build_version"] != VERSION:
+        fail("cleanup pending intent belongs to another product/build")
+    if intent["target"] != str(target):
+        fail("cleanup pending intent is bound to a different target")
+    if intent["root"] != CLEANUP_RELATIVE.as_posix():
+        fail("cleanup pending intent root is invalid")
+    if intent["intent"] != CLEANUP_INTENT_NAME or intent["journal"] != CLEANUP_JOURNAL_NAME:
+        fail("cleanup pending intent names are invalid")
+    if intent["tombstone"] != CLEANUP_TOMBSTONE_NAME:
+        fail("cleanup pending intent tombstone is invalid")
+    if not isinstance(intent["command"], str) or not intent["command"]:
+        fail("cleanup pending intent command is invalid")
+    entries = intent["entries"]
+    if not isinstance(entries, list) or not entries:
+        fail("cleanup pending intent entries are invalid")
+    seen_tombstones: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            fail(f"cleanup pending intent entry {index} is invalid")
+        require_exact_keys(entry, {"kind", "tombstone", "source", "graph"}, f"cleanup pending intent entry {index}")
+        kind = entry["kind"]
+        if not isinstance(kind, str) or not kind:
+            fail(f"cleanup pending intent entry {index} kind is invalid")
+        tombstone = entry["tombstone"]
+        if (
+            not isinstance(tombstone, str)
+            or tombstone in seen_tombstones
+            or Path(tombstone).is_absolute()
+            or any(part in {"", ".", ".."} for part in Path(tombstone).parts)
+        ):
+            fail(f"cleanup pending intent entry {index} tombstone is invalid")
+        seen_tombstones.add(tombstone)
+        cleanup_intent_entry_source(target, entry, index)
+        validate_cleanup_graph_record_schema(entry["graph"], label=f"cleanup pending intent entry {index}")
+    return intent
+
+
+def validate_cleanup_journal(target: Path, *, allow_intent_residue: bool = False) -> dict[str, Any]:
+    root_info = require_directory(cleanup_root_path(target), "cleanup pending root")
+    if not is_owner_private_directory(root_info):
+        fail("cleanup pending root must be private to the current user with mode 0700")
+    validate_cleanup_root_names(
+        target,
+        allow_intent=allow_intent_residue,
+        allow_journal=True,
+        allow_tombstone=True,
+    )
+    journal = read_cleanup_journal_file(cleanup_journal_path(target))
+    require_exact_keys(
+        journal,
+        {"schema_version", "product_name", "build_version", "target", "command", "root", "tombstone", "entries", "graph"},
+        "cleanup pending journal",
+    )
+    ensure_cleanup_journal_serialized_bound(canonical_json(journal))
+    if journal["schema_version"] != CLEANUP_SCHEMA:
+        fail("cleanup pending journal schema is unsupported")
+    if journal["product_name"] != PRODUCT_NAME or journal["build_version"] != VERSION:
+        fail("cleanup pending journal belongs to another product/build")
+    if journal["target"] != str(target):
+        fail("cleanup pending journal is bound to a different target")
+    if journal["root"] != CLEANUP_RELATIVE.as_posix():
+        fail("cleanup pending journal root is invalid")
+    if journal["tombstone"] != CLEANUP_TOMBSTONE_NAME:
+        fail("cleanup pending journal tombstone is invalid")
+    if not isinstance(journal["command"], str) or not journal["command"]:
+        fail("cleanup pending journal command is invalid")
+    entries = journal["entries"]
+    if not isinstance(entries, list) or not entries:
+        fail("cleanup pending journal entries are invalid")
+    seen_tombstones: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            fail(f"cleanup pending journal entry {index} is invalid")
+        require_exact_keys(entry, {"kind", "tombstone"}, f"cleanup pending journal entry {index}")
+        if not isinstance(entry["kind"], str) or not entry["kind"]:
+            fail(f"cleanup pending journal entry {index} kind is invalid")
+        tombstone = entry["tombstone"]
+        if (
+            not isinstance(tombstone, str)
+            or tombstone in seen_tombstones
+            or Path(tombstone).is_absolute()
+            or any(part in {"", ".", ".."} for part in Path(tombstone).parts)
+        ):
+            fail(f"cleanup pending journal entry {index} tombstone is invalid")
+        seen_tombstones.add(tombstone)
+    if allow_intent_residue and path_exists_no_follow(cleanup_intent_path(target)):
+        validate_cleanup_intent(target, allow_journal_residue=True)
+    validate_cleanup_graph_records(journal, target)
+    return journal
+
+
+def cleanup_pending_payload(target: Path) -> dict[str, Any]:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return {"entry_count": 0, "kinds": [], "command": None}
+    journal = validate_cleanup_journal(target)
+    kinds = sorted({entry["kind"] for entry in journal["entries"]})
+    return {
+        "entry_count": len(journal["entries"]),
+        "kinds": kinds,
+        "command": journal["command"],
+        "max_paths": CLEANUP_MAX_PATHS,
+        "max_bytes": CLEANUP_MAX_BYTES,
+        "serialized_max_bytes": CLEANUP_JOURNAL_MAX_BYTES,
+    }
+
+
+def cleanup_pending_summary(target: Path) -> tuple[bool, dict[str, Any]]:
+    pending = path_exists_no_follow(cleanup_root_path(target))
+    return pending, cleanup_pending_payload(target)
+
+
+def recover_cleanup_prepare_root_only(target: Path) -> None:
+    root = cleanup_root_path(target)
+    if not path_exists_no_follow(root):
+        return
+    if path_exists_no_follow(cleanup_intent_path(target)) or path_exists_no_follow(cleanup_journal_path(target)):
+        return
+    root_info = require_directory(root, "cleanup pending root")
+    if not is_owner_private_directory(root_info):
+        fail("cleanup pending root must be private to the current user with mode 0700")
+    entries = sorted(root.iterdir(), key=lambda path: path.name)
+    tombstone = cleanup_tombstone_path(target)
+    if not entries:
+        root.rmdir()
+        fsync_parent_directory(root, "cleanup pending parent")
+        return
+    if tombstone not in entries:
+        remove_unpublished_cleanup_temps(
+            root,
+            final_names={CLEANUP_INTENT_NAME, CLEANUP_JOURNAL_NAME},
+            allowed_names=set(),
+        )
+        root.rmdir()
+        fsync_parent_directory(root, "cleanup pending parent")
+        return
+    tombstone_info = require_directory(tombstone, "cleanup tombstone")
+    if not is_owner_private_directory(tombstone_info):
+        fail("cleanup tombstone must be private to the current user with mode 0700")
+    if any(tombstone.iterdir()):
+        fail("cleanup tombstone has no recovery authority")
+    remove_unpublished_cleanup_temps(
+        root,
+        final_names={CLEANUP_INTENT_NAME, CLEANUP_JOURNAL_NAME},
+        allowed_names={CLEANUP_TOMBSTONE_NAME},
+    )
+    tombstone.rmdir()
+    fsync_directory(root)
+    root.rmdir()
+    fsync_parent_directory(root, "cleanup pending parent")
+
+
+def cleanup_intent_entry_records(entry: dict[str, Any], index: int) -> dict[str, dict[str, Any]]:
+    return validate_cleanup_graph_record_schema(entry["graph"], label=f"cleanup pending intent entry {index}")
+
+
+def validate_cleanup_object_graph_at(root: Path, records: dict[str, dict[str, Any]]) -> bool:
+    if not path_exists_no_follow(root):
+        return False
+    for relative, record in records.items():
+        if not cleanup_record_matches(cleanup_record_path_under(root, relative), record):
+            fail("cleanup intent object graph identity mismatch")
+    observed: set[str] = {"."}
+    if records["."].get("kind") == "directory":
+        for current, directories, files in os.walk(root):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for name in [*directories, *files]:
+                observed.add((current_path / name).relative_to(root).as_posix())
+        if observed != set(records):
+            fail("cleanup intent object graph contains an undeclared object")
+    return True
+
+
+def cleanup_intent_entry_state(target: Path, entry: dict[str, Any], index: int) -> str:
+    records = cleanup_intent_entry_records(entry, index)
+    source = cleanup_intent_entry_source(target, entry, index)
+    tombstone = cleanup_tombstone_path(target) / safe_relative_path(entry["tombstone"])
+    source_present = validate_cleanup_object_graph_at(source, records)
+    tombstone_present = validate_cleanup_object_graph_at(tombstone, records)
+    if source_present and tombstone_present:
+        fail("cleanup intent source and tombstone are both present")
+    if source_present:
+        return "source"
+    if tombstone_present:
+        return "tombstone"
+    fail("cleanup intent source is neither restorable nor completable")
+
+
+def move_cleanup_intent_entry_to_tombstone(target: Path, entry: dict[str, Any], index: int) -> None:
+    records = cleanup_intent_entry_records(entry, index)
+    source = cleanup_intent_entry_source(target, entry, index)
+    destination = cleanup_tombstone_path(target) / safe_relative_path(entry["tombstone"])
+    if path_exists_no_follow(destination):
+        fail("cleanup intent tombstone destination already exists")
+    if not validate_cleanup_object_graph_at(source, records):
+        fail("cleanup intent source disappeared before completion")
+    if not rename_no_replace(source, destination, "cleanup tombstone source"):
+        fail("cleanup tombstone destination already exists")
+    fsync_directory(cleanup_tombstone_path(target))
+    if path_exists_no_follow(source.parent):
+        fsync_directory(source.parent)
+    if not validate_cleanup_object_graph_at(destination, records):
+        fail("cleanup intent tombstone identity changed after completion")
+
+
+def remove_cleanup_intent_after_valid_journal(target: Path) -> None:
+    if not path_exists_no_follow(cleanup_intent_path(target)):
+        return
+    validate_cleanup_journal(target, allow_intent_residue=True)
+    cleanup_intent_path(target).unlink()
+    fsync_directory(cleanup_root_path(target))
+
+
+def recover_cleanup_intent_before_mutation(target: Path) -> None:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return
+    if path_exists_no_follow(cleanup_journal_path(target)):
+        validate_cleanup_journal(target, allow_intent_residue=True)
+        remove_cleanup_intent_after_valid_journal(target)
+        validate_cleanup_journal(target)
+        return
+    if not path_exists_no_follow(cleanup_intent_path(target)):
+        recover_cleanup_prepare_root_only(target)
+        return
+    remove_unpublished_cleanup_temps(
+        cleanup_root_path(target),
+        final_names={CLEANUP_JOURNAL_NAME},
+        allowed_names={CLEANUP_INTENT_NAME, CLEANUP_TOMBSTONE_NAME},
+    )
+    intent = validate_cleanup_intent(target)
+    states = [
+        cleanup_intent_entry_state(target, entry, index)
+        for index, entry in enumerate(intent["entries"])
+    ]
+    if all(state == "source" for state in states):
+        cleanup_transaction_directory_retry(cleanup_root_path(target), "unmoved cleanup intent root")
+        return
+    for index, (entry, state) in enumerate(zip(intent["entries"], states)):
+        if state == "source":
+            move_cleanup_intent_entry_to_tombstone(target, entry, index)
+    journal_entries = [
+        {"kind": entry["kind"], "tombstone": entry["tombstone"]} for entry in intent["entries"]
+    ]
+    content = cleanup_journal_content(
+        target,
+        intent["command"],
+        journal_entries,
+        cleanup_object_graph_records(cleanup_tombstone_path(target)),
+    )
+    publish_cleanup_file_no_replace(
+        cleanup_root_path(target),
+        CLEANUP_JOURNAL_NAME,
+        content,
+        "cleanup pending journal",
+    )
+    validate_cleanup_journal(target, allow_intent_residue=True)
+    remove_cleanup_intent_after_valid_journal(target)
+
+
+def remove_exact_cleanup_entry(path: Path, record: dict[str, Any]) -> None:
+    if not path_exists_no_follow(path):
+        return
+    if record["kind"] == "file":
+        if not cleanup_record_matches(path, record):
+            fail("cleanup pending tombstone object changed before deletion")
+        path.unlink()
+        fsync_parent_directory(path, f"cleanup tombstone parent {path.parent}")
+        return
+    if record["kind"] == "directory":
+        if not cleanup_directory_stable_matches(path, record):
+            fail("cleanup pending tombstone directory changed before deletion")
+        if any(path.iterdir()):
+            fail("cleanup pending directory is not empty")
+        path.rmdir()
+        fsync_parent_directory(path, f"cleanup tombstone parent {path.parent}")
+        return
+    fail("cleanup pending tombstone object kind is unsupported")
+
+
+def drain_cleanup_pending(target: Path) -> tuple[bool, bool]:
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return False, False
+    recover_cleanup_intent_before_mutation(target)
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        return True, False
+    journal = validate_cleanup_journal(target)
+    records = validate_cleanup_graph_records(journal, target)
+    children = cleanup_declared_children(records)
+    try:
+        for relative, record in sorted(
+            records.items(),
+            key=lambda item: len(Path(item[0]).parts),
+            reverse=True,
+        ):
+            validate_cleanup_ancestors_before_delete(target, relative, records, children)
+            remove_exact_cleanup_entry(cleanup_record_path(target, relative), record)
+        cleanup_journal_path(target).unlink()
+        fsync_directory(cleanup_root_path(target))
+        cleanup_root_path(target).rmdir()
+        fsync_parent_directory(cleanup_root_path(target), "cleanup pending parent")
+    except BaseException:
+        validate_cleanup_journal(target)
+        return False, True
+    if path_exists_no_follow(cleanup_root_path(target)):
+        fail("cleanup pending tombstone drain left residue")
+    return True, False
+
+
+def validate_published_cleanup_file_content(path: Path, content: bytes, label: str) -> None:
+    before = require_regular_file(
+        path,
+        label,
+        owner_only=True,
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
+    if before.st_size != len(content):
+        fail(f"{label} size does not match the complete publication content")
+    observed = read_regular_file(
+        path,
+        label,
+        owner_only=True,
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
+    if observed != content:
+        fail(f"{label} content does not match the complete publication content")
+
+
+def publish_cleanup_file_no_replace(root: Path, final_name: str, content: bytes, label: str) -> bool:
+    ensure_cleanup_journal_serialized_bound(content)
+    final = root / final_name
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{final_name}.tmp-", dir=root)
+    temporary = Path(temporary_name)
+    promoted = False
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                fail(f"{label} write made no forward progress")
+            offset += written
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        promoted = rename_no_replace(temporary, final, label)
+        if not promoted:
+            fail(f"{label} already exists")
+        validate_published_cleanup_file_content(final, content, label)
+        try:
+            fsync_directory(root)
+        except BaseException:
+            validate_published_cleanup_file_content(final, content, label)
+            return True
+        validate_published_cleanup_file_content(final, content, label)
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not promoted:
+            with contextlib.suppress(BaseException):
+                remove_path_durable(temporary)
+
+
+def promote_cleanup_tombstone(target: Path, command: str, cleanup_paths: list[tuple[str, Path]]) -> bool | None:
+    present = [(kind, path) for kind, path in cleanup_paths if path_exists_no_follow(path)]
+    if not present:
+        return None
+    if path_exists_no_follow(cleanup_root_path(target)):
+        fail("cleanup pending journal already exists")
+    root = cleanup_root_path(target)
+    root.mkdir(mode=OWNER_DIR_MODE)
+    root.chmod(OWNER_DIR_MODE)
+    fsync_parent_directory(root, "cleanup pending parent")
+    tombstone_root = cleanup_tombstone_path(target)
+    tombstone_root.mkdir(mode=OWNER_DIR_MODE)
+    tombstone_root.chmod(OWNER_DIR_MODE)
+    fsync_directory(root)
+    entries = [
+        {"kind": kind, "tombstone": f"{index}-{kind}"}
+        for index, (kind, _source) in enumerate(present)
+    ]
+    destinations = [(entry["tombstone"], source) for entry, (_kind, source) in zip(entries, present)]
+    moved: list[dict[str, str]] = []
+    try:
+        intent_entries = cleanup_intent_entries(target, entries, present)
+        intent_content = cleanup_intent_content(target, command, intent_entries)
+        publish_cleanup_file_no_replace(root, CLEANUP_INTENT_NAME, intent_content, "cleanup pending intent")
+        validate_cleanup_intent(target)
+        cleanup_journal_content(
+            target,
+            command,
+            entries,
+            projected_cleanup_graph_records(tombstone_root, destinations),
+        )
+        for entry, (_kind, source) in zip(entries, present):
+            destination = tombstone_root / safe_relative_path(entry["tombstone"])
+            if path_exists_no_follow(destination):
+                fail("cleanup tombstone destination already exists")
+            if not rename_no_replace(source, destination, "cleanup tombstone source"):
+                fail("cleanup tombstone destination already exists")
+            moved.append(entry)
+            fsync_directory(tombstone_root)
+            if path_exists_no_follow(source.parent):
+                fsync_directory(source.parent)
+        content = cleanup_journal_content(
+            target,
+            command,
+            moved,
+            cleanup_object_graph_records(tombstone_root),
+        )
+        post_publish_issue = publish_cleanup_file_no_replace(
+            root,
+            CLEANUP_JOURNAL_NAME,
+            content,
+            "cleanup pending journal",
+        )
+        validate_cleanup_journal(target, allow_intent_residue=True)
+        remove_cleanup_intent_after_valid_journal(target)
+        validate_cleanup_journal(target)
+        return post_publish_issue
+    except BaseException:
+        if path_exists_no_follow(cleanup_journal_path(target)):
+            validate_cleanup_journal(target, allow_intent_residue=True)
+            with contextlib.suppress(BaseException):
+                remove_cleanup_intent_after_valid_journal(target)
+            return True
+        recover_cleanup_intent_before_mutation(target)
+        if path_exists_no_follow(root):
+            cleanup_transaction_directory_retry(root, "failed cleanup pending root")
+        raise
+
+
+def finish_post_commit_cleanup(target: Path, command: str, cleanup_paths: list[tuple[str, Path]]) -> bool:
+    post_publish_issue = promote_cleanup_tombstone(target, command, cleanup_paths)
+    if post_publish_issue is None:
+        return False
+    if post_publish_issue:
+        return True
+    _drained, pending = drain_cleanup_pending(target)
+    return pending
+
+
+def drain_cleanup_before_mutation(target: Path) -> bool:
+    _drained, pending = drain_cleanup_pending(target)
+    return pending
+
+
+def cleanup_pending_mutation_result(
+    target: Path,
+    command: str,
+    *,
+    operation: str | None = None,
+    setup_id: str | None = None,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
+    result: dict[str, Any] = {
+        "target": str(target),
+        "changed": False,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
+    }
+    if operation is not None:
+        result["operation"] = operation
+        result["changed_paths"] = []
+        result["builder"] = {"enabled": True, "projection": BUILDER_PROJECTION}
+    else:
+        result["schema_version"] = 1
+        result["command"] = command
+    if setup_id is not None:
+        result["setup_id"] = setup_id
+    if profile_id is not None:
+        result["permission_profile"] = profile_id
+    return result
+
+
+def lexical_target_for_bootstrap_lock(raw: str | Path) -> Path:
     path = Path(raw)
     if not path.is_absolute():
         fail("target must be an absolute path")
     path = Path(os.path.normpath(os.fspath(path)))
     if path.parent == path or not path.name:
         fail("target must name a directory below a real parent")
+    return path
+
+
+def canonical_target_for_bootstrap_lock(raw: str | Path) -> Path:
+    path = lexical_target_for_bootstrap_lock(raw)
     reject_absolute_symlink_ancestors(path.parent)
     try:
         parent = path.parent.resolve(strict=True)
@@ -961,40 +2427,544 @@ def bootstrap_lock_root() -> Path:
     return bootstrap_lock_parent() / f"{BOOTSTRAP_LOCK_PREFIX}-{os.geteuid()}"
 
 
+def product_bootstrap_lock_file_path(root: Path | None = None) -> Path:
+    return (bootstrap_lock_root() if root is None else root) / BOOTSTRAP_PRODUCT_LOCK_NAME
+
+
+def target_bootstrap_lock_root(root: Path | None = None) -> Path:
+    return (bootstrap_lock_root() if root is None else root) / BOOTSTRAP_TARGET_LOCK_ROOT_NAME
+
+
 def target_binding_sha256(target: Path) -> str:
     return sha256_bytes(f"{PRODUCT_NAME}\0{os.fspath(target)}".encode("utf-8"))
 
 
 def bootstrap_lock_file_path(target: Path) -> Path:
-    return bootstrap_lock_root() / f"{target_binding_sha256(target)}.lock"
+    return target_bootstrap_lock_root() / f"{target_binding_sha256(target)}.lock"
 
 
-def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
+def bootstrap_lock_file_path_for_root(root: Path, target: Path) -> Path:
+    return target_bootstrap_lock_root(root) / f"{target_binding_sha256(target)}.lock"
+
+
+def product_lock_binding_payload() -> bytes:
+    return canonical_json(
+        {
+            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "kind": "product",
+            "namespace": BOOTSTRAP_LOCK_PREFIX,
+        }
+    )
+
+
+def bootstrap_lock_binding_payload(target: Path) -> bytes:
+    return canonical_json(
+        {
+            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "target": os.fspath(target),
+            "target_sha256": target_binding_sha256(target),
+        }
+    )
+
+
+def require_open_anchor_identity(descriptor: int, lock_file: Path, label: str) -> os.stat_result:
     opened = os.fstat(descriptor)
     current = lock_file.lstat()
     if identity_of(opened) != identity_of(current):
-        raise ConcurrentTargetChange("bootstrap lifecycle lock file changed after it was opened")
+        raise ConcurrentTargetChange(f"{label} changed after it was opened")
     if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-        fail("bootstrap lifecycle lock file must be a single-link regular file")
+        fail(f"{label} must be a single-link regular file")
     if not is_owner_only_file(opened):
-        fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
+        fail(f"{label} must be owned by the current user with mode 0600")
     return opened
+
+
+def require_open_bootstrap_lock_identity(descriptor: int, lock_file: Path) -> os.stat_result:
+    return require_open_anchor_identity(descriptor, lock_file, "bootstrap lifecycle lock file")
+
+
+def write_bootstrap_lock_stage_file(
+    path: Path,
+    payload: bytes,
+    label: str = "bootstrap lifecycle lock",
+) -> AnchorStageSignature:
+    if len(payload) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail(f"{label} staged binding exceeds the bounded write limit")
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail(f"{label} staged file requires O_NOFOLLOW support")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(path, flags, OWNER_FILE_MODE)
+    try:
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    fail(f"{label} staged binding write made no forward progress")
+                offset += written
+            os.fchmod(descriptor, OWNER_FILE_MODE)
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            info = path.lstat()
+            if identity_of(opened) != identity_of(info):
+                raise ConcurrentTargetChange(f"{label} staged binding changed after creation")
+            signature = validate_anchor_stage_alias(path, payload, label)
+            if identity_of(opened) != (signature.st_dev, signature.st_ino):
+                raise ConcurrentTargetChange(f"{label} staged binding changed after validation")
+            return signature
+        except BaseException:
+            with contextlib.suppress(OSError):
+                opened = os.fstat(descriptor)
+                current = path.lstat()
+                if identity_of(opened) == identity_of(current):
+                    path.unlink()
+                    fsync_directory(path.parent)
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_anchor_stage_signature(signature: AnchorStageSignature, label: str) -> None:
+    revalidate_anchor_stage_signature(signature, label)
+    signature.path.unlink()
+    fsync_directory(signature.path.parent)
+
+
+def bootstrap_lock_stage_prefix(lock_file: Path) -> str:
+    return f".{lock_file.name}.nddev.tmp."
+
+
+def is_bootstrap_lock_stage_name(lock_file: Path, name: str) -> bool:
+    prefix = bootstrap_lock_stage_prefix(lock_file)
+    if not name.startswith(prefix):
+        return False
+    suffix = name[len(prefix) :]
+    parts = suffix.split(".")
+    return len(parts) == 2 and all(
+        part.isdecimal()
+        and 0 < len(part) <= BOOTSTRAP_LOCK_STAGE_NUMERIC_COMPONENT_MAX_DIGITS
+        for part in parts
+    )
+
+
+def bounded_bootstrap_lock_root_entries(parent: Path) -> list[Path]:
+    entries: list[Path] = []
+    try:
+        iterator = parent.iterdir()
+        for child in iterator:
+            entries.append(child)
+            if len(entries) > BOOTSTRAP_LOCK_MAX_ROOT_ENTRIES:
+                fail("bootstrap lifecycle lock root contains too many entries")
+    except OSError as exc:
+        fail(f"bootstrap lifecycle lock root could not be listed safely: {exc}")
+    return sorted(entries, key=lambda item: item.name)
+
+
+def validate_anchor_stage_alias(path: Path, payload: bytes, label: str) -> AnchorStageSignature:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} staged binding must be a regular file")
+    if info.st_nlink != 1:
+        fail(f"{label} staged binding must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail(f"{label} staged binding must be owned by the current user with mode 0600")
+    if info.st_size > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail(f"{label} staged binding exceeds the bounded read limit")
+    actual = read_regular_file(
+        path,
+        f"{label} staged binding",
+        owner_only=True,
+        max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+    )
+    final = path.lstat()
+    if (
+        identity_of(final) != identity_of(info)
+        or final.st_nlink != info.st_nlink
+        or stat.S_IMODE(final.st_mode) != stat.S_IMODE(info.st_mode)
+        or getattr(final, "st_uid", None) != getattr(info, "st_uid", None)
+        or getattr(final, "st_gid", None) != getattr(info, "st_gid", None)
+        or final.st_size != info.st_size
+        or final.st_mtime_ns != info.st_mtime_ns
+    ):
+        raise ConcurrentTargetChange(f"{label} staged binding changed while it was validated")
+    if actual != payload:
+        fail(f"{label} staged binding payload mismatch")
+    return AnchorStageSignature(
+        path=path,
+        st_dev=info.st_dev,
+        st_ino=info.st_ino,
+        st_nlink=info.st_nlink,
+        st_uid=getattr(info, "st_uid", None),
+        st_gid=getattr(info, "st_gid", None),
+        mode=stat.S_IMODE(info.st_mode),
+        size=info.st_size,
+        mtime_ns=info.st_mtime_ns,
+        payload=actual,
+    )
+
+
+def revalidate_anchor_stage_signature(signature: AnchorStageSignature, label: str) -> None:
+    current = validate_anchor_stage_alias(signature.path, signature.payload, label)
+    if current != signature:
+        raise ConcurrentTargetChange(f"{label} staged binding changed before mutation")
+
+
+def validate_bootstrap_lock_stage_alias(path: Path, target: Path) -> None:
+    validate_anchor_stage_alias(path, bootstrap_lock_binding_payload(target), "bootstrap lifecycle lock")
+
+
+def anchor_stage_aliases(lock_file: Path, payload: bytes, label: str) -> list[AnchorStageSignature]:
+    parent = lock_file.parent
+    if not path_exists_no_follow(parent):
+        return []
+    aliases: list[Path] = []
+    prefix = bootstrap_lock_stage_prefix(lock_file)
+    for child in bounded_bootstrap_lock_root_entries(parent):
+        if not child.name.startswith(prefix):
+            continue
+        if not is_bootstrap_lock_stage_name(lock_file, child.name):
+            fail(f"{label} staged binding has an invalid machine name")
+        aliases.append(child)
+        if len(aliases) > BOOTSTRAP_LOCK_MAX_STAGE_ALIASES:
+            fail(f"{label} staged binding aliases exceed the bounded limit")
+    return [validate_anchor_stage_alias(alias, payload, label) for alias in aliases]
+
+
+def bootstrap_lock_stage_aliases(lock_file: Path, target: Path) -> list[AnchorStageSignature]:
+    return anchor_stage_aliases(
+        lock_file,
+        bootstrap_lock_binding_payload(target),
+        "bootstrap lifecycle lock",
+    )
+
+
+def product_lock_stage_aliases(root: Path) -> list[AnchorStageSignature]:
+    return anchor_stage_aliases(
+        product_bootstrap_lock_file_path(root),
+        product_lock_binding_payload(),
+        "bootstrap product lock",
+    )
+
+
+def reject_bootstrap_lock_stage_aliases_for_read(lock_file: Path, target: Path) -> None:
+    if bootstrap_lock_stage_aliases(lock_file, target):
+        fail("bootstrap lifecycle lock staged binding requires exclusive recovery")
+
+
+def reject_anchor_stage_aliases_for_read(lock_file: Path, payload: bytes, label: str) -> None:
+    if anchor_stage_aliases(lock_file, payload, label):
+        fail(f"{label} staged binding requires exclusive recovery")
+
+
+def target_lock_final_name_is_valid(name: str) -> bool:
+    if not name.endswith(".lock"):
+        return False
+    digest = name[:-5]
+    return len(digest) == 64 and all(char in HEX_DIGITS for char in digest)
+
+
+def target_lock_stage_name_is_valid(name: str) -> bool:
+    if not name.startswith(".") or ".nddev.tmp." not in name:
+        return False
+    final_name, suffix = name[1:].split(".nddev.tmp.", 1)
+    if not target_lock_final_name_is_valid(final_name):
+        return False
+    parts = suffix.split(".")
+    return len(parts) == 2 and all(
+        part.isdecimal()
+        and 0 < len(part) <= BOOTSTRAP_LOCK_STAGE_NUMERIC_COMPONENT_MAX_DIGITS
+        for part in parts
+    )
+
+
+def namespace_record(path: Path, relative: str) -> tuple[Any, ...]:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+        digest: str | None = os.readlink(path)
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+        digest = None
+    elif stat.S_ISREG(info.st_mode):
+        kind = "file"
+        digest = None
+        if info.st_size <= BOOTSTRAP_LOCK_MAX_BYTES:
+            digest = sha256_bytes(read_regular_file(path, "bootstrap lifecycle namespace file"))
+    else:
+        kind = "other"
+        digest = None
+    return (
+        relative,
+        kind,
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_nlink,
+        stat.S_IMODE(info.st_mode),
+        getattr(info, "st_uid", None),
+        getattr(info, "st_gid", None),
+        info.st_mtime_ns,
+        digest,
+    )
+
+
+def cold_bootstrap_product_namespace_signature() -> tuple[tuple[Any, ...], ...]:
+    root = bootstrap_lock_root()
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return (("root", "absent"),)
+    if stat.S_ISLNK(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must not be a symlink")
+    if not stat.S_ISDIR(root_info.st_mode):
+        fail("bootstrap lifecycle lock root must be a real directory")
+    if not is_owner_private_directory(root_info):
+        fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+    records: list[tuple[Any, ...]] = [
+        (
+            ".",
+            "directory",
+            root_info.st_dev,
+            root_info.st_ino,
+            root_info.st_size,
+            root_info.st_nlink,
+            stat.S_IMODE(root_info.st_mode),
+            getattr(root_info, "st_uid", None),
+            getattr(root_info, "st_gid", None),
+            root_info.st_mtime_ns,
+        )
+    ]
+    entries = bounded_bootstrap_lock_root_entries(root)
+    if entries:
+        if any(entry.name == BOOTSTRAP_PRODUCT_LOCK_NAME for entry in entries):
+            raise ReadLifecycleRetry()
+        names = ", ".join(entry.name for entry in entries[:4])
+        fail(f"bootstrap lifecycle product namespace must be empty without product anchor: {names}")
+    return tuple(records)
+
+
+def validate_product_namespace_entries(root: Path, *, allow_target_stage_aliases: bool) -> None:
+    allowed = {BOOTSTRAP_PRODUCT_LOCK_NAME, BOOTSTRAP_TARGET_LOCK_ROOT_NAME}
+    for child in bounded_bootstrap_lock_root_entries(root):
+        if child.name not in allowed:
+            if is_bootstrap_lock_stage_name(product_bootstrap_lock_file_path(root), child.name):
+                fail("bootstrap product lock staged binding requires exclusive recovery")
+            fail(f"bootstrap lifecycle product namespace contains unknown entry: {child.name}")
+        if child.name == BOOTSTRAP_TARGET_LOCK_ROOT_NAME:
+            info = require_directory(child, "bootstrap lifecycle target lock root")
+            if not is_owner_private_directory(info):
+                fail("bootstrap lifecycle target lock root must be owned by the current user with mode 0700")
+            validate_target_lock_root_entries(child, allow_stage_aliases=allow_target_stage_aliases)
+
+
+def validate_target_lock_root_entries(root: Path, *, allow_stage_aliases: bool) -> None:
+    for child in bounded_bootstrap_lock_root_entries(root):
+        if target_lock_final_name_is_valid(child.name):
+            validate_any_target_lock_entry(child)
+            continue
+        if target_lock_stage_name_is_valid(child.name):
+            if allow_stage_aliases:
+                validate_any_target_lock_stage_entry(child)
+                continue
+            fail("bootstrap lifecycle target lock root contains pending publication stages")
+        fail(f"bootstrap lifecycle target lock root contains unknown entry: {child.name}")
+
+
+def rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+    system = platform.system().lower()
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if system == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = libc.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            source_bytes,
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            destination_bytes,
+            RENAME_EXCL_DARWIN,
+        )
+    elif system == "linux":
+        machine = platform.machine().lower()
+        syscall_number = RENAMEAT2_SYSCALL_BY_MACHINE.get(machine)
+        if syscall_number is None:
+            fail(f"{label} no-replace publication is unsupported on this architecture")
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(RENAME_NOREPLACE_LINUX),
+        )
+    else:
+        fail(f"{label} no-replace publication is unsupported on this platform")
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        fail(f"{label} no-replace publication primitive is unavailable")
+    fail(f"{label} no-replace publication failed: {os.strerror(error)}")
+
+
+def publish_missing_anchor_file(path: Path, payload: bytes, label: str) -> None:
+    parent = path.parent
+    parent_metadata = directory_metadata(parent, f"{label} parent")
+    for _attempt in range(4):
+        stage = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
+        if path_exists_no_follow(stage):
+            continue
+        stage_signature: AnchorStageSignature | None = None
+        published = False
+        try:
+            stage_signature = write_bootstrap_lock_stage_file(stage, payload, label)
+            try:
+                promoted = rename_no_replace(stage, path, label)
+            except ManagerError:
+                if not path_exists_no_follow(stage) and anchor_final_binding_is_valid(path, payload, label):
+                    return
+                raise
+            if not promoted:
+                if anchor_final_binding_is_valid(path, payload, label):
+                    return
+                cleanup_anchor_stage_signature(stage_signature, label)
+                restore_directory_metadata(parent, parent_metadata, f"{label} parent")
+                fail(f"{label} no-replace winner binding is invalid")
+                return
+            published = True
+            fsync_directory(parent)
+            return
+        except BaseException:
+            if not published and stage_signature is not None and path_exists_no_follow(stage):
+                cleanup_anchor_stage_signature(stage_signature, label)
+            if not published:
+                restore_directory_metadata(parent, parent_metadata, f"{label} parent")
+            raise
+    fail(f"{label} staged binding name could not be allocated")
+
+
+def publish_missing_bootstrap_lock_file(path: Path, target: Path) -> None:
+    publish_missing_anchor_file(path, bootstrap_lock_binding_payload(target), "bootstrap lifecycle lock file")
+
+
+def promote_anchor_stage_alias(
+    signature: AnchorStageSignature,
+    lock_file: Path,
+    payload: bytes,
+    label: str,
+) -> None:
+    path = signature.path
+    try:
+        revalidate_anchor_stage_signature(signature, label)
+    except FileNotFoundError:
+        if anchor_final_binding_is_valid(lock_file, payload, label):
+            return
+        raise
+    try:
+        promoted = rename_no_replace(path, lock_file, f"{label} staged binding")
+    except ManagerError:
+        if not path_exists_no_follow(path) and anchor_final_binding_is_valid(lock_file, payload, label):
+            return
+        raise
+    if promoted:
+        fsync_directory(lock_file.parent)
+
+
+def promote_bootstrap_lock_stage_alias(
+    signature: AnchorStageSignature,
+    lock_file: Path,
+    target: Path,
+) -> None:
+    promote_anchor_stage_alias(
+        signature,
+        lock_file,
+        bootstrap_lock_binding_payload(target),
+        "bootstrap lifecycle lock",
+    )
+
+
+def drain_anchor_stage_aliases(lock_file: Path, payload: bytes, label: str, descriptor: int) -> None:
+    aliases = anchor_stage_aliases(lock_file, payload, label)
+    if not aliases:
+        return
+    parent_metadata = directory_metadata(lock_file.parent, f"{label} parent")
+    before = require_open_anchor_identity(descriptor, lock_file, label)
+    for signature in aliases:
+        revalidate_anchor_stage_signature(signature, label)
+        signature.path.unlink()
+        fsync_directory(lock_file.parent)
+    restore_directory_stage_cleanup_metadata(lock_file.parent, parent_metadata, f"{label} parent")
+    after = require_open_anchor_identity(descriptor, lock_file, label)
+    if identity_of(before) != identity_of(after) or after.st_nlink != 1:
+        raise ConcurrentTargetChange(f"{label} changed during staged recovery")
+    record = read_bootstrap_lock_record(descriptor)
+    if payload == product_lock_binding_payload():
+        validate_product_lock_binding(record)
+    else:
+        target_raw = record.get("target") if isinstance(record, dict) else None
+        if not isinstance(target_raw, str):
+            fail(f"{label} target binding mismatch")
+        validate_bootstrap_lock_binding(record, Path(target_raw))
+
+
+def drain_bootstrap_lock_stage_aliases(lock_file: Path, target: Path, descriptor: int) -> None:
+    drain_anchor_stage_aliases(
+        lock_file,
+        bootstrap_lock_binding_payload(target),
+        "bootstrap lifecycle lock",
+        descriptor,
+    )
 
 
 def ensure_bootstrap_lock_root() -> Path:
     root = bootstrap_lock_root()
+    parent = root.parent
     try:
         info = root.lstat()
     except FileNotFoundError:
+        parent_metadata = directory_metadata(parent, "bootstrap lifecycle lock parent")
+        created = False
         try:
             root.mkdir(mode=OWNER_DIR_MODE)
+            created = True
         except FileExistsError:
             info = root.lstat()
         else:
-            final = chmod_directory_no_follow(root, OWNER_DIR_MODE, "bootstrap lifecycle lock root")
-            if not is_owner_private_directory(final):
-                fail("bootstrap lifecycle lock root must be private to the current user")
-            return root
+            try:
+                final = chmod_directory_no_follow(root, OWNER_DIR_MODE, "bootstrap lifecycle lock root")
+                if not is_owner_private_directory(final):
+                    fail("bootstrap lifecycle lock root must be private to the current user")
+                fsync_directory(parent)
+                return root
+            except BaseException:
+                if created and path_exists_no_follow(root):
+                    try:
+                        root.rmdir()
+                    except OSError as cleanup_exc:
+                        fail(
+                            "bootstrap lifecycle lock root rollback found unexpected nonempty state: "
+                            f"{cleanup_exc}"
+                        )
+                    fsync_directory(parent)
+                restore_directory_metadata(parent, parent_metadata, "bootstrap lifecycle lock parent")
+                raise
     if stat.S_ISLNK(info.st_mode):
         fail("bootstrap lifecycle lock root must not be a symlink")
     if not stat.S_ISDIR(info.st_mode):
@@ -1004,44 +2974,184 @@ def ensure_bootstrap_lock_root() -> Path:
     return root
 
 
-def open_bootstrap_lock_file(target: Path) -> int:
-    if not hasattr(os, "O_NOFOLLOW"):
-        fail("bootstrap lifecycle lock file requires O_NOFOLLOW support")
-    root = ensure_bootstrap_lock_root()
-    lock_file = root / f"{target_binding_sha256(target)}.lock"
-    for _attempt in range(2):
+def ensure_target_bootstrap_lock_root_with_signature(
+    product_root: Path,
+) -> tuple[Path, CreatedDirectorySignature | None]:
+    root = target_bootstrap_lock_root(product_root)
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        parent_metadata = directory_metadata(product_root, "bootstrap lifecycle product lock root")
+        created = False
+        signature: CreatedDirectorySignature | None = None
         try:
-            info = lock_file.lstat()
-        except FileNotFoundError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            flags |= os.O_NOFOLLOW
+            root.mkdir(mode=OWNER_DIR_MODE)
+            created = True
+            signature = capture_created_directory_signature(root, "bootstrap lifecycle target lock root")
+            fsync_directory(product_root)
+            return root, signature
+        except BaseException:
             try:
-                descriptor = os.open(lock_file, flags, OWNER_FILE_MODE)
-            except FileExistsError:
-                continue
-            os.fchmod(descriptor, OWNER_FILE_MODE)
-            require_open_bootstrap_lock_identity(descriptor, lock_file)
-            return descriptor
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            fail("bootstrap lifecycle lock file must be a regular file")
-        if info.st_nlink != 1:
-            fail("bootstrap lifecycle lock file must not have hard-link aliases")
-        if not is_owner_only_file(info):
-            fail("bootstrap lifecycle lock file must be owned by the current user with mode 0600")
-        flags = os.O_RDWR
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        flags |= os.O_NOFOLLOW
-        descriptor = os.open(lock_file, flags)
+                if created:
+                    if signature is None:
+                        fail(
+                            "bootstrap lifecycle target lock root rollback lacks exact creation signature"
+                        )
+                    cleanup_created_directory_signature(
+                        signature,
+                        product_root,
+                        "bootstrap lifecycle target lock root",
+                    )
+                restore_directory_metadata(
+                    product_root,
+                    parent_metadata,
+                    "bootstrap lifecycle product lock root",
+                )
+            finally:
+                close_created_directory_signature(signature)
+            raise
+    if stat.S_ISLNK(info.st_mode):
+        fail("bootstrap lifecycle target lock root must not be a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("bootstrap lifecycle target lock root must be a real directory")
+    if not is_owner_private_directory(info):
+        fail("bootstrap lifecycle target lock root must be owned by the current user with mode 0700")
+    return root, None
+
+
+def ensure_target_bootstrap_lock_root(product_root: Path) -> Path:
+    root, signature = ensure_target_bootstrap_lock_root_with_signature(product_root)
+    close_created_directory_signature(signature)
+    return root
+
+
+def product_anchor_stages_for_publication(root: Path) -> list[AnchorStageSignature]:
+    aliases = product_lock_stage_aliases(root)
+    alias_names = {alias.path.name for alias in aliases}
+    unknown = [
+        entry.name for entry in bounded_bootstrap_lock_root_entries(root) if entry.name not in alias_names
+    ]
+    if unknown:
+        fail(f"bootstrap lifecycle product namespace contains unknown entries: {', '.join(unknown[:4])}")
+    return aliases
+
+
+def publish_product_anchor_if_missing(root: Path) -> None:
+    lock_file = product_bootstrap_lock_file_path(root)
+    if path_exists_no_follow(lock_file):
+        return
+    aliases = product_anchor_stages_for_publication(root)
+    if aliases:
+        promote_anchor_stage_alias(
+            aliases[0],
+            lock_file,
+            product_lock_binding_payload(),
+            "bootstrap product lock",
+        )
+    else:
+        if bounded_bootstrap_lock_root_entries(root):
+            fail("bootstrap lifecycle product namespace must be empty before product anchor publication")
+        publish_missing_anchor_file(lock_file, product_lock_binding_payload(), "bootstrap product lock")
+
+
+def publish_target_anchor_if_missing(product_root: Path, target: Path) -> Path:
+    target_root = target_bootstrap_lock_root(product_root)
+    product_root_metadata = directory_metadata(product_root, "bootstrap lifecycle product lock root")
+    target_root, target_root_signature = ensure_target_bootstrap_lock_root_with_signature(product_root)
+    try:
+        lock_file = bootstrap_lock_file_path_for_root(product_root, target)
+        if path_exists_no_follow(lock_file):
+            return lock_file
+        aliases = bootstrap_lock_stage_aliases(lock_file, target)
+        if aliases:
+            promote_bootstrap_lock_stage_alias(aliases[0], lock_file, target)
+        else:
+            publish_missing_bootstrap_lock_file(lock_file, target)
+        if not bootstrap_lock_final_binding_is_valid(lock_file, target):
+            fail("bootstrap lifecycle target lock final binding was not published")
+    except BaseException:
+        final_binding_valid = bootstrap_lock_final_binding_is_valid(lock_file, target)
+        if not final_binding_valid and target_root_signature is not None:
+            cleanup_created_directory_signature(
+                target_root_signature,
+                product_root,
+                "bootstrap lifecycle target lock root",
+            )
+            restore_directory_metadata(
+                product_root,
+                product_root_metadata,
+                "bootstrap lifecycle product lock root",
+            )
+        raise
+    finally:
+        close_created_directory_signature(target_root_signature)
+    return lock_file
+
+
+def read_anchor_payload_from_descriptor(descriptor: int, expected: bytes, label: str) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    content = os.read(descriptor, BOOTSTRAP_LOCK_MAX_BYTES + 1)
+    if len(content) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail(f"{label} exceeds the bounded read limit")
+    if not content:
+        fail(f"{label} binding is empty")
+    if content != expected:
+        fail(f"{label} binding payload mismatch")
+    parse_json_object(content, label)
+    return content
+
+
+def open_validated_anchor_file(path: Path, payload: bytes, label: str, *, write: bool) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail(f"{label} requires O_NOFOLLOW support")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} must be a regular file")
+    if info.st_nlink != 1:
+        fail(f"{label} must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail(f"{label} must be owned by the current user with mode 0600")
+    if info.st_size == 0:
+        fail(f"{label} binding is empty")
+    if info.st_size > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail(f"{label} exceeds the bounded read limit")
+    flags = os.O_RDWR if write else os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
         opened = os.fstat(descriptor)
         if identity_of(opened) != identity_of(info):
-            os.close(descriptor)
-            raise ConcurrentTargetChange("bootstrap lifecycle lock file changed while it was opened")
-        require_open_bootstrap_lock_identity(descriptor, lock_file)
+            raise ConcurrentTargetChange(f"{label} changed while it was opened")
+        require_open_anchor_identity(descriptor, path, label)
+        read_anchor_payload_from_descriptor(descriptor, payload, label)
         return descriptor
-    raise ConcurrentTargetChange("bootstrap lifecycle lock file changed during creation")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def anchor_final_binding_is_valid(path: Path, payload: bytes, label: str) -> bool:
+    try:
+        descriptor = open_validated_anchor_file(path, payload, label, write=False)
+    except (OSError, ManagerError):
+        return False
+    try:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def bootstrap_lock_final_binding_is_valid(path: Path, target: Path) -> bool:
+    return anchor_final_binding_is_valid(
+        path,
+        bootstrap_lock_binding_payload(target),
+        "bootstrap lifecycle lock file",
+    )
 
 
 def read_bootstrap_lock_record(descriptor: int) -> dict[str, Any] | None:
@@ -1050,33 +3160,26 @@ def read_bootstrap_lock_record(descriptor: int) -> dict[str, Any] | None:
     if len(content) > BOOTSTRAP_LOCK_MAX_BYTES:
         fail("bootstrap lifecycle lock file exceeds the bounded read limit")
     if not content:
-        return None
+        fail("bootstrap lifecycle lock file binding is empty")
     return parse_json_object(content, "bootstrap lifecycle lock file")
 
 
-def write_bootstrap_lock_record(descriptor: int, target: Path) -> None:
-    content = canonical_json(
-        {
-            "schema_version": BOOTSTRAP_LOCK_SCHEMA,
-            "product_name": PRODUCT_NAME,
-            "target": os.fspath(target),
-            "target_sha256": target_binding_sha256(target),
-        }
-    )
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    offset = 0
-    while offset < len(content):
-        written = os.write(descriptor, content[offset:])
-        if written <= 0:
-            fail("bootstrap lifecycle lock file write made no forward progress")
-        offset += written
-    os.ftruncate(descriptor, len(content))
-    os.fsync(descriptor)
+def validate_product_lock_binding(record: dict[str, Any] | None) -> None:
+    if record is None:
+        fail("bootstrap product lock binding is missing")
+    if set(record) != PRODUCT_LOCK_BINDING_KEYS:
+        fail("bootstrap product lock binding keys mismatch")
+    if record.get("schema_version") != BOOTSTRAP_LOCK_SCHEMA:
+        fail("bootstrap product lock schema mismatch")
+    if record.get("product_name") != PRODUCT_NAME:
+        fail("bootstrap product lock belongs to another product")
+    if record.get("kind") != "product" or record.get("namespace") != BOOTSTRAP_LOCK_PREFIX:
+        fail("bootstrap product lock binding mismatch")
 
 
 def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path) -> None:
     if record is None:
-        return
+        fail("bootstrap lifecycle lock file binding is missing")
     if set(record) != BOOTSTRAP_LOCK_BINDING_KEYS:
         fail("bootstrap lifecycle lock file binding keys mismatch")
     if record.get("schema_version") != BOOTSTRAP_LOCK_SCHEMA:
@@ -1090,40 +3193,300 @@ def validate_bootstrap_lock_binding(record: dict[str, Any] | None, target: Path)
         fail("bootstrap lifecycle lock file target binding mismatch")
 
 
+def validate_any_target_lock_entry(path: Path) -> None:
+    if not target_lock_final_name_is_valid(path.name):
+        fail("bootstrap lifecycle target lock filename is invalid")
+    descriptor = open_validated_anchor_file(
+        path,
+        read_regular_file(
+            path,
+            "bootstrap lifecycle target lock file",
+            owner_only=True,
+            max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        ),
+        "bootstrap lifecycle target lock file",
+        write=False,
+    )
+    try:
+        record = read_bootstrap_lock_record(descriptor)
+        target_raw = record.get("target") if isinstance(record, dict) else None
+        if not isinstance(target_raw, str) or not Path(target_raw).is_absolute():
+            fail("bootstrap lifecycle target lock file target binding mismatch")
+        target = Path(target_raw)
+        validate_bootstrap_lock_binding(record, target)
+        if target_binding_sha256(target) != path.name[:-5]:
+            fail("bootstrap lifecycle target lock file name does not match its binding")
+    finally:
+        os.close(descriptor)
+
+
+def validate_any_target_lock_stage_entry(path: Path) -> None:
+    if not target_lock_stage_name_is_valid(path.name):
+        fail("bootstrap lifecycle target lock staged filename is invalid")
+    final_name = path.name[1:].split(".nddev.tmp.", 1)[0]
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lifecycle target lock staged binding must be a regular file")
+    if info.st_nlink != 1:
+        fail("bootstrap lifecycle target lock staged binding must not have hard-link aliases")
+    if not is_owner_only_file(info):
+        fail("bootstrap lifecycle target lock staged binding must be owned by the current user with mode 0600")
+    payload = read_regular_file(
+        path,
+        "bootstrap lifecycle target lock staged binding",
+        owner_only=True,
+        max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+    )
+    record = parse_json_object(payload, "bootstrap lifecycle target lock staged binding")
+    target_raw = record.get("target")
+    if not isinstance(target_raw, str) or not Path(target_raw).is_absolute():
+        fail("bootstrap lifecycle target lock staged binding target mismatch")
+    target = Path(target_raw)
+    validate_bootstrap_lock_binding(record, target)
+    if target_binding_sha256(target) != final_name[:-5]:
+        fail("bootstrap lifecycle target lock staged binding filename mismatch")
+    if payload != bootstrap_lock_binding_payload(target):
+        fail("bootstrap lifecycle target lock staged binding is not canonical")
+
+
+def acquire_product_lock(*, create: bool, exclusive: bool) -> ProductBootstrapLockHandle | None:
+    if fcntl is None:
+        fail("bootstrap lifecycle locks require fcntl.flock on this platform")
+    root = bootstrap_lock_root()
+    if create:
+        root_parent = root.parent
+        root_preexisting = path_exists_no_follow(root)
+        parent_metadata = directory_metadata(root_parent, "bootstrap lifecycle lock parent")
+        try:
+            root = ensure_bootstrap_lock_root()
+            if not path_exists_no_follow(product_bootstrap_lock_file_path(root)):
+                publish_product_anchor_if_missing(root)
+            if not anchor_final_binding_is_valid(
+                product_bootstrap_lock_file_path(root),
+                product_lock_binding_payload(),
+                "bootstrap product lock",
+            ):
+                fail("bootstrap product lock final binding was not published")
+        except BaseException:
+            if not root_preexisting and path_exists_no_follow(root):
+                try:
+                    root.rmdir()
+                except OSError as cleanup_exc:
+                    fail(
+                        "bootstrap lifecycle lock root rollback found unexpected nonempty state: "
+                        f"{cleanup_exc}"
+                    )
+                fsync_directory(root_parent)
+                restore_directory_metadata(root_parent, parent_metadata, "bootstrap lifecycle lock parent")
+            raise
+    else:
+        try:
+            root_info = root.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(root_info.st_mode):
+            fail("bootstrap lifecycle lock root must not be a symlink")
+        if not stat.S_ISDIR(root_info.st_mode):
+            fail("bootstrap lifecycle lock root must be a real directory")
+        if not is_owner_private_directory(root_info):
+            fail("bootstrap lifecycle lock root must be owned by the current user with mode 0700")
+    path = product_bootstrap_lock_file_path(root)
+    if not path_exists_no_follow(path):
+        return None
+    descriptor = open_validated_anchor_file(
+        path,
+        product_lock_binding_payload(),
+        "bootstrap product lock",
+        write=exclusive,
+    )
+    acquired = False
+    try:
+        lock_mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(descriptor, lock_mode)
+        acquired = True
+        require_open_anchor_identity(descriptor, path, "bootstrap product lock")
+        read_anchor_payload_from_descriptor(
+            descriptor,
+            product_lock_binding_payload(),
+            "bootstrap product lock",
+        )
+        if exclusive:
+            drain_anchor_stage_aliases(
+                path,
+                product_lock_binding_payload(),
+                "bootstrap product lock",
+                descriptor,
+            )
+        else:
+            reject_anchor_stage_aliases_for_read(
+                path,
+                product_lock_binding_payload(),
+                "bootstrap product lock",
+            )
+        validate_product_namespace_entries(root, allow_target_stage_aliases=exclusive)
+        return ProductBootstrapLockHandle(
+            descriptor=descriptor,
+            path=path,
+            root=root,
+            mode=lock_mode,
+        )
+    except BaseException:
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        raise
+
+
+def release_product_lock(handle: ProductBootstrapLockHandle | None) -> None:
+    if handle is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.descriptor, fcntl.LOCK_UN)
+    os.close(handle.descriptor)
+
+
+def open_external_target_lock(
+    product_root: Path,
+    target: Path,
+    *,
+    exclusive: bool,
+    create: bool,
+) -> ExternalBootstrapTargetLockHandle | None:
+    if fcntl is None:
+        fail("bootstrap lifecycle locks require fcntl.flock on this platform")
+    if create:
+        lock_file = publish_target_anchor_if_missing(product_root, target)
+    else:
+        target_root = target_bootstrap_lock_root(product_root)
+        if not path_exists_no_follow(target_root):
+            return None
+        ensure_target_bootstrap_lock_root(product_root)
+        lock_file = bootstrap_lock_file_path_for_root(product_root, target)
+        reject_bootstrap_lock_stage_aliases_for_read(lock_file, target)
+        if not path_exists_no_follow(lock_file):
+            return None
+    descriptor = open_validated_anchor_file(
+        lock_file,
+        bootstrap_lock_binding_payload(target),
+        "bootstrap lifecycle target lock",
+        write=exclusive,
+    )
+    acquired = False
+    try:
+        lock_mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        lock_mode |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(descriptor, lock_mode)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise
+            fail(f"target is locked: {lock_file}")
+        acquired = True
+        require_open_anchor_identity(descriptor, lock_file, "bootstrap lifecycle target lock")
+        read_anchor_payload_from_descriptor(
+            descriptor,
+            bootstrap_lock_binding_payload(target),
+            "bootstrap lifecycle target lock",
+        )
+        if exclusive:
+            drain_bootstrap_lock_stage_aliases(lock_file, target, descriptor)
+        else:
+            reject_bootstrap_lock_stage_aliases_for_read(lock_file, target)
+        validate_target_lock_root_entries(target_bootstrap_lock_root(product_root), allow_stage_aliases=False)
+        return ExternalBootstrapTargetLockHandle(
+            descriptor=descriptor,
+            path=lock_file,
+            target=target,
+            mode=lock_mode,
+        )
+    except BaseException:
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        raise
+
+
+def release_external_target_lock(handle: ExternalBootstrapTargetLockHandle | None) -> None:
+    if handle is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.descriptor, fcntl.LOCK_UN)
+    os.close(handle.descriptor)
+
+
 @contextlib.contextmanager
 def bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
     if fcntl is None:
         fail("bootstrap lifecycle locks require fcntl.flock on this platform")
-    target = canonical_target_for_bootstrap_lock(raw_target)
-    descriptor = -1
-    acquired = False
+    lexical_target = lexical_target_for_bootstrap_lock(raw_target)
+    product = acquire_product_lock(create=True, exclusive=True)
+    if product is None:
+        fail("bootstrap product lock was not created")
+    target_handle: ExternalBootstrapTargetLockHandle | None = None
     try:
-        descriptor = open_bootstrap_lock_file(target)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
-                raise
-            os.close(descriptor)
-            descriptor = -1
-            fail(f"target is locked: {bootstrap_lock_file_path(target)}")
-        acquired = True
-        require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
-        record = read_bootstrap_lock_record(descriptor)
-        validate_bootstrap_lock_binding(record, target)
-        if record is None:
-            write_bootstrap_lock_record(descriptor, target)
-            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
-            record = read_bootstrap_lock_record(descriptor)
-            validate_bootstrap_lock_binding(record, target)
-            require_open_bootstrap_lock_identity(descriptor, bootstrap_lock_file_path(target))
+        target = canonical_target_for_bootstrap_lock(lexical_target)
+        target_handle = open_external_target_lock(product.root, target, exclusive=True, create=True)
+        if target_handle is None:
+            fail("bootstrap target lock was not created")
+        release_product_lock(product)
+        product = None
         yield target
     finally:
-        if descriptor >= 0:
-            if acquired:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        release_external_target_lock(target_handle)
+        release_product_lock(product)
+
+
+@contextlib.contextmanager
+def readonly_bootstrap_lifecycle_lock(raw_target: str | Path) -> Iterator[Path]:
+    if fcntl is None:
+        fail("bootstrap lifecycle locks require fcntl.flock on this platform")
+    lexical_target = lexical_target_for_bootstrap_lock(raw_target)
+    product = acquire_product_lock(create=False, exclusive=False)
+    target_handle: ExternalBootstrapTargetLockHandle | None = None
+    if product is None:
+        before = cold_bootstrap_product_namespace_signature()
+        target = canonical_target_for_bootstrap_lock(lexical_target)
+        if cold_bootstrap_product_namespace_signature() != before:
+            raise ReadLifecycleRetry()
+        try:
+            yield target
+        except BaseException:
+            if cold_bootstrap_product_namespace_signature() != before:
+                raise ReadLifecycleRetry()
+            raise
+        else:
+            if cold_bootstrap_product_namespace_signature() != before:
+                raise ReadLifecycleRetry()
+        return
+    try:
+        target = canonical_target_for_bootstrap_lock(lexical_target)
+        target_handle = open_external_target_lock(product.root, target, exclusive=False, create=False)
+        if target_handle is not None:
+            release_product_lock(product)
+            product = None
+        yield target
+        if target_handle is None:
+            lock_file = bootstrap_lock_file_path_for_root(product.root, target)
+            reject_bootstrap_lock_stage_aliases_for_read(lock_file, target)
+            if path_exists_no_follow(lock_file):
+                raise ConcurrentTargetChange("bootstrap lifecycle target lock appeared during read-only inspection")
+    finally:
+        release_external_target_lock(target_handle)
+        release_product_lock(product)
+
+
+def read_bootstrap_lifecycle_payload(raw_target: str | Path, reader: Any) -> Any:
+    for attempt in range(READ_LIFECYCLE_MAX_ATTEMPTS):
+        try:
+            with readonly_bootstrap_lifecycle_lock(raw_target) as locked_target:
+                return reader(locked_target)
+        except ReadLifecycleRetry:
+            if attempt + 1 >= READ_LIFECYCLE_MAX_ATTEMPTS:
+                fail("bootstrap lifecycle namespace changed during read-only inspection")
+            continue
+    fail("bootstrap lifecycle namespace changed during read-only inspection")
 
 
 def lock_path(target: Path) -> Path:
@@ -1723,37 +4086,48 @@ def backup_current_state(target: Path, stamp: dict[str, Any]) -> int:
         fail("backup pool must be private to the current user with mode 0700")
     slot = choose_backup_slot(pool)
     slot_dir = pool / str(slot)
-    if slot_dir.exists():
+    if path_exists_no_follow(slot_dir):
         info = slot_dir.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             fail(f"backup slot is not a real directory: {slot}")
-        shutil.rmtree(slot_dir)
-    temporary = pool / f".tmp-{slot}-{os.getpid()}"
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    temporary.mkdir(mode=OWNER_DIR_MODE)
-    stamp_content = read_regular_file(stamp_path(target), "target stamp")
-    records = stamp["managed_files"]
-    for record in records:
-        relative = str(record["path"])
-        content = read_regular_file(
-            target / safe_relative_path(relative),
-            f"backup source {relative}",
-            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
-        )
-        write_backup_file(temporary, relative, content)
-    envelope = {
-        "schema_version": BACKUP_SCHEMA,
-        "product_name": PRODUCT_NAME,
-        "build_version": VERSION,
-        "slot": slot,
-        "canonical_target": str(target),
-        "source_setup_id": stamp["setup_id"],
-        "managed_files": records,
-        "stamp_sha256": sha256_bytes(stamp_content),
-    }
-    write_backup_file(temporary, BACKUP_NAME, canonical_json(envelope))
-    os.replace(temporary, slot_dir)
+    temporary: Path | None = Path(tempfile.mkdtemp(dir=pool, prefix=f".tmp-{slot}-{os.getpid()}-"))
+    try:
+        temporary.chmod(OWNER_DIR_MODE)
+        stamp_content = read_regular_file(stamp_path(target), "target stamp")
+        records = stamp["managed_files"]
+        for record in records:
+            relative = str(record["path"])
+            content = read_regular_file(
+                target / safe_relative_path(relative),
+                f"backup source {relative}",
+                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            )
+            write_backup_file(temporary, relative, content)
+        envelope = {
+            "schema_version": BACKUP_SCHEMA,
+            "product_name": PRODUCT_NAME,
+            "build_version": VERSION,
+            "slot": slot,
+            "canonical_target": str(target),
+            "source_setup_id": stamp["setup_id"],
+            "managed_files": records,
+            "stamp_sha256": sha256_bytes(stamp_content),
+        }
+        write_backup_file(temporary, BACKUP_NAME, canonical_json(envelope))
+        fsync_directory(temporary)
+        if path_exists_no_follow(slot_dir):
+            finish_post_commit_cleanup(
+                target,
+                "backup-rotate",
+                [(f"retired-backup-slot-{slot}", slot_dir)],
+            )
+        if not rename_no_replace(temporary, slot_dir, "backup slot"):
+            fail(f"backup slot already exists after cleanup: {slot}")
+        temporary = None
+        fsync_directory(pool)
+    finally:
+        if temporary is not None:
+            cleanup_transaction_directory_retry(temporary, "backup temporary")
     return slot
 
 
@@ -1850,6 +4224,14 @@ def _mutate_setup_locked(
 ) -> dict[str, Any]:
     with target_lock(target, create_parent=(operation == "install")) as transaction:
         ensure_private_directory(target, create=(operation == "install"), transaction=transaction)
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                operation,
+                operation=operation,
+                setup_id=setup_id,
+                profile_id=profile_id,
+            )
         if operation == "install":
             stamp = read_stamp(target)
             if stamp is None:
@@ -1875,12 +4257,15 @@ def _mutate_setup_locked(
         except Exception:
             restore_snapshot(target, snapshot)
             raise
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     return {
         "operation": operation,
         "setup_id": setup_id,
         "permission_profile": profile_id,
         "target": str(target),
         "backup_slot": backup_slot,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -1906,6 +4291,14 @@ def _migrate_setup_locked(
     target: Path, profile_id: str | None, backup_slot: int | None
 ) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(
+                target,
+                "migrate",
+                operation="migrate",
+                setup_id=DEFAULT_SETUP_ID,
+                profile_id=profile_id or DEFAULT_PROFILE_ID,
+            )
         stamp = require_clean_installed(target)
         if stamp_is_active(stamp):
             profile = profile_id or stamp_profile_id(stamp) or DEFAULT_PROFILE_ID
@@ -1921,12 +4314,15 @@ def _migrate_setup_locked(
         except Exception:
             restore_snapshot(target, snapshot)
             raise
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     return {
         "operation": "migrate",
         "setup_id": DEFAULT_SETUP_ID,
         "permission_profile": profile,
         "target": str(target),
         "backup_slot": backup_slot,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -1939,6 +4335,8 @@ def restore_setup(target: Path, slot: int) -> dict[str, Any]:
 
 def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(target, "restore", operation="restore")
         require_private_target_directory_for_software(target, allow_missing=False)
         setup_id, desired = desired_for_backup(target, slot)
         snapshot = snapshot_paths(target, set(desired))
@@ -1947,11 +4345,14 @@ def _restore_setup_locked(target: Path, slot: int) -> dict[str, Any]:
         except Exception:
             restore_snapshot(target, snapshot)
             raise
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     return {
         "operation": "restore",
         "setup_id": setup_id,
         "target": str(target),
         "backup_slot": slot,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
         "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
     }
 
@@ -1964,6 +4365,8 @@ def remove_setup(target: Path) -> dict[str, Any]:
 
 def _remove_setup_locked(target: Path) -> dict[str, Any]:
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            return cleanup_pending_mutation_result(target, "remove", operation="remove")
         stamp = require_clean_installed(target)
         desired = desired_for_remove(target)
         snapshot = snapshot_paths(target, set(desired))
@@ -1972,23 +4375,29 @@ def _remove_setup_locked(target: Path) -> dict[str, Any]:
         except Exception:
             restore_snapshot(target, snapshot)
             raise
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     return {
         "operation": "remove",
         "removed_setup_id": stamp["setup_id"],
         "target": str(target),
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
         "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
     }
 
 
 def status_payload(target: Path) -> dict[str, Any]:
-    with bootstrap_lifecycle_lock(target) as locked_target:
+    def read_locked(locked_target: Path) -> dict[str, Any]:
         target = resolve_target(locked_target, create=False)
+        cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
         software = software_status(target)
         stamp = read_stamp(target)
         if stamp is None:
             return {
                 "installed": False,
                 "target": str(target),
+                "cleanup_pending": cleanup_pending,
+                "cleanup_pending_detail": cleanup_pending_detail,
                 "builder": {"enabled": False, "projection": BUILDER_PROJECTION},
                 "software": software,
             }
@@ -2004,17 +4413,21 @@ def status_payload(target: Path) -> dict[str, Any]:
             "drift": drift,
             "legacy": legacy,
             "launchable": active and not drift,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
             "builder": stamp.get("builder", {"enabled": False, "projection": BUILDER_PROJECTION}),
             "backup_pool": str(backup_pool(target)),
             "software": software,
         }
+    return read_bootstrap_lifecycle_payload(target, read_locked)
 
 
 def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     load_setup(setup_id)
     load_profile(profile_id)
-    with bootstrap_lifecycle_lock(target) as locked_target:
+    def read_locked(locked_target: Path) -> dict[str, Any]:
         target = resolve_target(locked_target, create=False)
+        cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
         stamp = read_stamp(target) if target.exists() else None
         operation = "install" if stamp is None else "switch"
         return {
@@ -2023,9 +4436,12 @@ def plan_payload(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
             "permission_profile": profile_id,
             "target": str(target),
             "mutates": False,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
             "managed_files": list(MANAGED_FILES),
             "builder": {"enabled": True, "projection": BUILDER_PROJECTION},
         }
+    return read_bootstrap_lifecycle_payload(target, read_locked)
 
 
 def list_payload() -> dict[str, Any]:
@@ -3219,6 +5635,7 @@ def software_presence(target: Path) -> dict[str, Any]:
 
 
 def software_status(target: Path) -> dict[str, Any]:
+    cleanup_pending, cleanup_pending_detail = cleanup_pending_summary(target)
     if not require_private_target_directory_for_software(target, allow_missing=True):
         return {
             "schema_version": 1,
@@ -3232,6 +5649,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "partial": False,
             "replace_paths_present": [],
             "owned_parent_paths_present": [],
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     presence = software_presence(target)
     executable = kilo_executable(target)
@@ -3245,6 +5664,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "version": None,
             "executable": str(executable),
             **presence,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     try:
         manifest = read_json_file(
@@ -3263,6 +5684,8 @@ def software_status(target: Path) -> dict[str, Any]:
             "executable": str(executable),
             **presence,
             "validation_error": str(exc),
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_detail,
         }
     try:
         expected = build_software_manifest(target)
@@ -3295,6 +5718,8 @@ def software_status(target: Path) -> dict[str, Any]:
         "selected_native_package_path": manifest.get("selected_native_package_path"),
         "runtime_resource_contract": manifest.get("runtime_resource_contract"),
         **presence,
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_detail,
     }
     if validation_error is not None:
         result["validation_error"] = validation_error
@@ -3438,7 +5863,7 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
         validate_replace_destination(target, relative)
     hold = hold_parent / "rollback"
     if path_exists_no_follow(hold):
-        cleanup_path(hold)
+        fail("software rollback hold already exists")
     hold.mkdir(mode=OWNER_DIR_MODE)
     preexisting_parent_paths = {
         relative for relative in SOFTWARE_PARENT_PATHS if path_exists_no_follow(target / relative)
@@ -3473,8 +5898,6 @@ def replace_software_state(target: Path, live_stage: Path, hold_parent: Path) ->
             preexisting_parent_paths=preexisting_parent_paths,
         )
         raise
-    finally:
-        shutil.rmtree(hold, ignore_errors=True)
 
 
 def materialize_stage_entrypoint(live_stage: Path, native_provenance: dict[str, Any]) -> None:
@@ -3576,6 +5999,16 @@ def remove_created_target_if_empty(target: Path, existed_before: bool) -> None:
         pass
 
 
+def create_software_stage_root(target: Path) -> Path:
+    staging = software_stage_root(target)
+    if path_exists_no_follow(staging):
+        fail("software staging root already exists; run a mutating command to drain pending cleanup")
+    staging.mkdir(mode=OWNER_DIR_MODE)
+    staging.chmod(OWNER_DIR_MODE)
+    fsync_parent_directory(staging, "software staging parent")
+    return staging
+
+
 def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
@@ -3584,28 +6017,32 @@ def install_or_update_cli(target: Path, command: str) -> dict[str, Any]:
 
 def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
     target_existed_before = path_exists_no_follow(target)
-    preflight = software_status(target)
-    if command == "install-cli":
-        if preflight.get("partial"):
-            fail("partial target-owned Kilo CLI software state exists; use update-cli")
-        if preflight.get("replace_paths_present") or preflight.get("owned_parent_paths_present"):
-            fail("Kilo CLI software already exists; use update-cli")
-    if command == "update-cli":
-        if preflight["software_state"] == "absent":
-            fail("Kilo CLI is not installed at the selected target; use install-cli")
-        if preflight["installed"] and preflight["current"]:
-            return {
-                "schema_version": 1,
-                "command": command,
-                "target": str(target),
-                "changed": False,
-                "version": preflight["version"],
-                "executable": preflight["executable"],
-                "selected_native_package": preflight.get("selected_native_package"),
-                "native_executable": preflight.get("native_executable"),
-                "wrapper_sha256": preflight.get("wrapper_sha256"),
-            }
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        preflight = software_status(target)
+        if command == "install-cli":
+            if preflight.get("partial"):
+                fail("partial target-owned Kilo CLI software state exists; use update-cli")
+            if preflight.get("replace_paths_present") or preflight.get("owned_parent_paths_present"):
+                fail("Kilo CLI software already exists; use update-cli")
+        if command == "update-cli":
+            if preflight["software_state"] == "absent":
+                fail("Kilo CLI is not installed at the selected target; use install-cli")
+            if preflight["installed"] and preflight["current"]:
+                return {
+                    "schema_version": 1,
+                    "command": command,
+                    "target": str(target),
+                    "changed": False,
+                    "version": preflight["version"],
+                    "executable": preflight["executable"],
+                    "selected_native_package": preflight.get("selected_native_package"),
+                    "native_executable": preflight.get("native_executable"),
+                    "wrapper_sha256": preflight.get("wrapper_sha256"),
+                    "cleanup_pending": False,
+                    "cleanup_pending_detail": cleanup_pending_summary(target)[1],
+                }
     staging: Path | None = None
+    cleanup_pending = False
     with target_lock(target, create_parent=(command == "install-cli")) as transaction:
         try:
             ensure_private_directory(
@@ -3613,6 +6050,8 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                 create=(command == "install-cli"),
                 transaction=transaction,
             )
+            if drain_cleanup_before_mutation(target):
+                return cleanup_pending_mutation_result(target, command)
             status = software_status(target)
             if command == "install-cli":
                 if status.get("partial"):
@@ -3634,11 +6073,10 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
                         "selected_native_package": status.get("selected_native_package"),
                         "native_executable": status.get("native_executable"),
                         "wrapper_sha256": status.get("wrapper_sha256"),
+                        "cleanup_pending": False,
+                        "cleanup_pending_detail": cleanup_pending_summary(target)[1],
                     }
-            staging = Path(
-                tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-stage.")
-            )
-            staging.chmod(OWNER_DIR_MODE)
+            staging = create_software_stage_root(target)
             live_stage = staging / "live"
             live_stage.mkdir(mode=OWNER_DIR_MODE)
             run_npm_install(staging, live_stage)
@@ -3646,12 +6084,18 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
             write_stage_software_manifest(live_stage)
             replace_software_state(target, live_stage, staging)
             installation = require_current_software(target)
+            cleanup_pending = finish_post_commit_cleanup(
+                target,
+                command,
+                [("software-staging", staging)],
+            )
+            staging = None
         except BaseException:
             remove_created_target_if_empty(target, target_existed_before)
             raise
         finally:
             if staging is not None:
-                shutil.rmtree(staging, ignore_errors=True)
+                cleanup_transaction_directory_retry(staging, "software staging")
     return {
         "schema_version": 1,
         "command": command,
@@ -3662,6 +6106,8 @@ def _install_or_update_cli_locked(target: Path, command: str) -> dict[str, Any]:
         "selected_native_package": installation.get("selected_native_package"),
         "native_executable": installation.get("native_executable"),
         "wrapper_sha256": installation.get("wrapper_sha256"),
+        "cleanup_pending": cleanup_pending,
+        "cleanup_pending_detail": cleanup_pending_summary(target)[1],
     }
 
 
@@ -3672,29 +6118,47 @@ def remove_cli(target: Path) -> dict[str, Any]:
 
 
 def _remove_cli_locked(target: Path) -> dict[str, Any]:
-    status = software_status(target)
-    if status["software_state"] == "absent":
+    if not path_exists_no_follow(cleanup_root_path(target)):
+        status = software_status(target)
+    else:
+        status = None
+    if status is not None and status["software_state"] == "absent":
         return {
             "schema_version": 1,
             "command": "remove-cli",
             "target": str(target),
             "changed": False,
+            "cleanup_pending": False,
+            "cleanup_pending_detail": cleanup_pending_summary(target)[1],
         }
-    staging = Path(
-        tempfile.mkdtemp(dir=target.parent, prefix=f".{target.name}.nddev-kilo-cli-remove.")
-    )
+    staging: Path | None = None
+    cleanup_pending = False
+    changed = False
     try:
-        empty_live = staging / "live"
-        empty_live.mkdir(mode=OWNER_DIR_MODE)
-        hold = staging / "hold"
-        hold.mkdir(mode=OWNER_DIR_MODE)
-        preexisting_parent_paths = {
-            relative
-            for relative in SOFTWARE_PARENT_PATHS
-            if path_exists_no_follow(target / relative)
-        }
-        moved_old: list[Path] = []
         with target_lock(target):
+            if drain_cleanup_before_mutation(target):
+                return cleanup_pending_mutation_result(target, "remove-cli")
+            status = software_status(target)
+            if status["software_state"] == "absent":
+                return {
+                    "schema_version": 1,
+                    "command": "remove-cli",
+                    "target": str(target),
+                    "changed": False,
+                    "cleanup_pending": False,
+                    "cleanup_pending_detail": cleanup_pending_summary(target)[1],
+                }
+            staging = create_software_stage_root(target)
+            empty_live = staging / "live"
+            empty_live.mkdir(mode=OWNER_DIR_MODE)
+            hold = staging / "hold"
+            hold.mkdir(mode=OWNER_DIR_MODE)
+            preexisting_parent_paths = {
+                relative
+                for relative in SOFTWARE_PARENT_PATHS
+                if path_exists_no_follow(target / relative)
+            }
+            moved_old: list[Path] = []
             require_private_target_directory_for_software(target, allow_missing=False)
             validate_existing_software_surface(target)
             try:
@@ -3727,14 +6191,27 @@ def _remove_cli_locked(target: Path) -> dict[str, Any]:
                     preexisting_parent_paths=preexisting_parent_paths,
                 )
                 raise
+            changed = bool(moved_old)
+            final_status = software_status(target)
+            if final_status["software_state"] != "absent":
+                fail("removed Kilo CLI left target-owned software residue")
+            cleanup_pending = finish_post_commit_cleanup(
+                target,
+                "remove-cli",
+                [("software-removal", staging)],
+            )
+            staging = None
         return {
             "schema_version": 1,
             "command": "remove-cli",
             "target": str(target),
-            "changed": bool(moved_old),
+            "changed": changed,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_pending_detail": cleanup_pending_summary(target)[1],
         }
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging is not None:
+            cleanup_transaction_directory_retry(staging, "software removal staging")
 
 
 def require_current_software(target: Path) -> dict[str, Any]:
@@ -3822,30 +6299,92 @@ def normalize_launch_child_args(child_args: list[str]) -> list[str]:
     return forwarded
 
 
-def launch_command_for_profile(executable: str, profile_id: str, forwarded: list[str]) -> list[str]:
+def resolve_launch_workspace(raw_workspace: str | Path | None) -> Path:
+    if raw_workspace is None:
+        try:
+            raw = Path.cwd()
+        except OSError as exc:
+            raise ManagerError("launch workspace cannot be captured from the current directory") from exc
+    else:
+        raw = Path(raw_workspace)
+        if not raw.is_absolute():
+            fail("launch workspace must be an absolute path")
+    try:
+        raw_info = raw.lstat()
+    except FileNotFoundError:
+        fail("launch workspace is missing")
+    if stat.S_ISLNK(raw_info.st_mode):
+        fail("launch workspace final path component must not be a symlink")
+    if not stat.S_ISDIR(raw_info.st_mode):
+        fail("launch workspace must be a directory")
+    try:
+        resolved = raw.resolve(strict=True)
+    except FileNotFoundError:
+        fail("launch workspace disappeared during resolution")
+    resolved_info = require_directory(resolved, "launch workspace")
+    if not os.access(resolved, os.R_OK | os.X_OK):
+        fail("launch workspace is not accessible to the current user")
+    if identity_of(raw_info) != identity_of(resolved_info):
+        raise ConcurrentTargetChange("launch workspace changed during resolution")
+    return resolved
+
+
+def launch_command_for_profile(
+    executable: str,
+    profile_id: str,
+    forwarded: list[str],
+    workspace: Path | str | None = None,
+) -> list[str]:
+    resolved_workspace = resolve_launch_workspace(workspace)
+    base = [executable, "run", "--dir", os.fspath(resolved_workspace)]
     if profile_id == "full-auto":
-        return [executable, "run", "--auto", *forwarded]
-    return [executable, "run", *forwarded]
+        return [*base, "--auto", *forwarded]
+    return [*base, *forwarded]
 
 
-def launch_command_for_setup(executable: str, setup_id: str, forwarded: list[str]) -> list[str]:
+def launch_command_for_setup(
+    executable: str,
+    setup_id: str,
+    forwarded: list[str],
+    workspace: Path | str | None = None,
+) -> list[str]:
     """Backward-compatible helper for callers that passed legacy setup ids."""
     if setup_id == DEFAULT_SETUP_ID:
-        return launch_command_for_profile(executable, DEFAULT_PROFILE_ID, forwarded)
+        return launch_command_for_profile(executable, DEFAULT_PROFILE_ID, forwarded, workspace)
     fail(f"legacy setup cannot be launched: {setup_id}")
 
 
-def launch(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+def launch(
+    target: Path,
+    child_args: list[str],
+    *,
+    timeout_seconds: int = 3600,
+    workspace: str | Path | None = None,
+) -> int:
+    resolved_workspace = resolve_launch_workspace(workspace)
     with bootstrap_lifecycle_lock(target) as locked_target:
         target = resolve_target(locked_target, create=False)
-        return _launch_locked(target, child_args, timeout_seconds=timeout_seconds)
+        return _launch_locked(
+            target,
+            child_args,
+            timeout_seconds=timeout_seconds,
+            workspace=resolved_workspace,
+        )
 
 
-def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int = 3600) -> int:
+def _launch_locked(
+    target: Path,
+    child_args: list[str],
+    *,
+    timeout_seconds: int = 3600,
+    workspace: Path,
+) -> int:
     if timeout_seconds <= 0:
         fail("launch timeout must be positive")
     forwarded = normalize_launch_child_args(child_args)
     with target_lock(target):
+        if drain_cleanup_before_mutation(target):
+            fail("cleanup pending must be drained before launch")
         stamp = require_active_clean_installed(target)
         installation = require_current_software(target)
         env = clean_launch_env(target)
@@ -3856,10 +6395,12 @@ def _launch_locked(target: Path, child_args: list[str], *, timeout_seconds: int 
                 revalidate_launch_executable(target, installation),
                 profile_id,
                 forwarded,
+                workspace,
             )
             try:
                 process = subprocess.Popen(
                     command,
+                    cwd=workspace,
                     env=env,
                     start_new_session=(os.name == "posix"),
                 )
@@ -3957,6 +6498,10 @@ def build_parser() -> argparse.ArgumentParser:
         "launch", help="launch Kilo with isolated HOME and KILO_CONFIG"
     )
     launch_parser.add_argument("--target", required=True)
+    launch_parser.add_argument(
+        "--workspace",
+        help="absolute project workspace passed to Kilo run --dir and used as the child cwd",
+    )
     launch_parser.add_argument("--timeout-seconds", type=int, default=3600)
     launch_parser.add_argument("child_args", nargs=argparse.REMAINDER)
 
@@ -3997,9 +6542,13 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_setup(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "software-status":
-        with bootstrap_lifecycle_lock(Path(args.target)) as locked_target:
+        def read_locked(locked_target: Path) -> dict[str, Any]:
             target = resolve_target(locked_target, create=False)
-            print_payload(software_status(target), as_json=args.json)
+            return software_status(target)
+        print_payload(
+            read_bootstrap_lifecycle_payload(Path(args.target), read_locked),
+            as_json=args.json,
+        )
         return 0
     if args.command in {"install-cli", "update-cli"}:
         print_payload(install_or_update_cli(Path(args.target), args.command), as_json=args.json)
@@ -4008,7 +6557,12 @@ def dispatch(args: argparse.Namespace) -> int:
         print_payload(remove_cli(Path(args.target)), as_json=args.json)
         return 0
     if args.command == "launch":
-        return launch(Path(args.target), args.child_args, timeout_seconds=args.timeout_seconds)
+        return launch(
+            Path(args.target),
+            args.child_args,
+            timeout_seconds=args.timeout_seconds,
+            workspace=args.workspace,
+        )
     fail(f"unknown command: {args.command}")
 
 

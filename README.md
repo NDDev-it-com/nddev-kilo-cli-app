@@ -58,7 +58,7 @@ python3 cli-tools/nddev_kilo_cli.py update-cli --target /absolute/kilo-target --
 python3 cli-tools/nddev_kilo_cli.py restore --backup 0 --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py remove-cli --target /absolute/kilo-target --json
 python3 cli-tools/nddev_kilo_cli.py remove --target /absolute/kilo-target --json
-python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --timeout-seconds 3600 -- "implement the task"
+python3 cli-tools/nddev_kilo_cli.py launch --target /absolute/kilo-target --workspace /absolute/project --timeout-seconds 3600 -- "implement the task"
 ```
 
 `install-cli` and `update-cli` maintain target-owned CLI software through the
@@ -69,13 +69,15 @@ contract, and drift checks are owned by `references/kilo-cli-baseline.json`,
 current installed provenance with `software-status --json`.
 
 `launch` requires a clean managed setup and current target-owned CLI software.
-It holds lifecycle locks through child completion or timeout cleanup, preserves
-the runtime writability Kilo needs, and denies concurrent lifecycle mutations
-while the child is running. Exact lock structure, lock ordering, runtime
-environment, executable handoff, child argument filtering, and timeout behavior
-are owned by `cli-tools/nddev_kilo_cli.py` and summarized in
-`config/nddev-contract.json`; inspect target state with `status --json` and
-`software-status --json`.
+It runs native `kilo run` with an explicit project workspace: pass
+`--workspace`, or omit it to capture the caller's current directory at launch
+entry. It holds lifecycle locks through child completion or timeout cleanup,
+preserves the runtime writability Kilo needs, and denies concurrent lifecycle
+mutations while the child is running. Exact lock structure, lock ordering,
+workspace binding, runtime environment, executable handoff, child argument
+filtering, and timeout behavior are owned by `cli-tools/nddev_kilo_cli.py` and
+summarized in `config/nddev-contract.json`; inspect target state with
+`status --json` and `software-status --json`.
 
 The launch boundary is a manager-verified path handoff under a no-sandbox
 same-UID threat model. It does not claim portable file-descriptor execution or

@@ -39,6 +39,7 @@ LEGACY_SETUPS = nddev_kilo_cli.LEGACY_SETUP_IDS
 MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
+EXPECTED_CLEANUP_LIFECYCLE = dict(nddev_kilo_cli.CLEANUP_JOURNAL_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 CONTRACT_KEYS = {
     "contract_version",
@@ -50,6 +51,7 @@ CONTRACT_KEYS = {
     "setup_system",
     "managed_state",
     "software_lifecycle",
+    "cleanup_lifecycle",
     "builder",
     "safety",
 }
@@ -132,6 +134,16 @@ def validate_versions() -> None:
         fail("manifest launch executable revalidation must be enabled")
     if runtime.get("denies_lifecycle_mutations_while_running") is not True:
         fail("manifest launch mutation denial contract mismatch")
+    expected_workspace_scope = {
+        "target_role": "managed-runtime-home",
+        "default": "captured-caller-cwd",
+        "manager_flag": "--workspace",
+        "native_form": ["run", "--dir", "<workspace>"],
+        "child_cwd": "same-resolved-workspace",
+        "explicit_workspace": "absolute-existing-directory-final-component-not-symlink",
+    }
+    if runtime.get("workspace_scope") != expected_workspace_scope:
+        fail("manifest launch workspace scope contract mismatch")
     if runtime.get("executable_handoff") != {
         "kind": "write-protected-verified-path",
         "portable_fd_execution": False,
@@ -169,6 +181,8 @@ def validate_versions() -> None:
         fail("manifest software path bound mismatch")
     if "stage_version_probe_timeout_seconds" in software.get("bounds", {}):
         fail("manifest must not declare an install-time target binary probe")
+    if manifest.get("cleanup_lifecycle") != EXPECTED_CLEANUP_LIFECYCLE:
+        fail("manifest cleanup lifecycle contract mismatch")
 
 
 def validate_contract() -> None:
@@ -200,6 +214,16 @@ def validate_contract() -> None:
         fail("runtime launch must revalidate the executable before child start")
     if runtime_launch.get("denies_lifecycle_mutations_while_running") is not True:
         fail("runtime launch must deny lifecycle mutations while running")
+    expected_workspace_scope = {
+        "target_role": "managed-runtime-home",
+        "default": "captured-caller-cwd",
+        "manager_flag": "--workspace",
+        "native_form": ["run", "--dir", "<workspace>"],
+        "child_cwd": "same-resolved-workspace",
+        "explicit_workspace": "absolute-existing-directory-final-component-not-symlink",
+    }
+    if runtime_launch.get("workspace_scope") != expected_workspace_scope:
+        fail("runtime launch workspace scope contract mismatch")
     handoff = runtime_launch.get("executable_handoff")
     if handoff != {
         "kind": "write-protected-verified-path",
@@ -257,6 +281,8 @@ def validate_contract() -> None:
         fail("software lifecycle entrypoint kind mismatch")
     if software.get("native_executable_policy") != "selected-native-package-bin-kilo":
         fail("software lifecycle native executable policy mismatch")
+    if contract.get("cleanup_lifecycle") != EXPECTED_CLEANUP_LIFECYCLE:
+        fail("cleanup lifecycle contract mismatch")
     builder = contract.get("builder", {})
     if builder.get("projection") != nddev_kilo_cli.BUILDER_PROJECTION:
         fail("builder projection mismatch")
@@ -595,21 +621,38 @@ def validate_manager_parse_args() -> None:
     nddev_kilo_cli.parse_args(["migrate", "--profile", "safe", "--target", "/tmp/nddev-kilo-check"])
     nddev_kilo_cli.parse_args(["status", "--target", "/tmp/nddev-kilo-check", "--json"])
     nddev_kilo_cli.parse_args(["software-status", "--target", "/tmp/nddev-kilo-check", "--json"])
+    nddev_kilo_cli.parse_args(
+        [
+            "launch",
+            "--target",
+            "/tmp/nddev-kilo-check",
+            "--workspace",
+            "/tmp",
+            "--",
+            "prompt",
+        ]
+    )
 
 
 def validate_launch_guard() -> None:
     executable = "/tmp/nddev-kilo-check/bin/kilo"
+    workspace = ROOT
     expected = {
-        "full-auto": [executable, "run", "--auto", "prompt"],
-        "safe": [executable, "run", "prompt"],
+        "full-auto": [executable, "run", "--dir", str(ROOT), "--auto", "prompt"],
+        "safe": [executable, "run", "--dir", str(ROOT), "prompt"],
     }
     for profile_id, command in expected.items():
-        observed = nddev_kilo_cli.launch_command_for_profile(executable, profile_id, ["prompt"])
+        observed = nddev_kilo_cli.launch_command_for_profile(
+            executable,
+            profile_id,
+            ["prompt"],
+            workspace,
+        )
         if observed != command:
             fail(f"{profile_id}: launch argv mismatch")
     for setup_id in LEGACY_SETUPS:
         try:
-            nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"])
+            nddev_kilo_cli.launch_command_for_setup(executable, setup_id, ["prompt"], workspace)
         except nddev_kilo_cli.ManagerError:
             continue
         fail(f"legacy setup launch helper accepted {setup_id}")
@@ -631,6 +674,7 @@ def validate_launch_guard() -> None:
         ["--", "-f/tmp/secret"],
         ["--", "--", "--auto"],
         ["--", "prompt", "--", "--dangerously-skip-permissions"],
+        ["--", "--dir", "/tmp/other"],
         ["--", "--dir=/tmp/other"],
         ["--", "--attach", "http://127.0.0.1:4096"],
         ["--", "--share"],
@@ -923,107 +967,6 @@ def validate_child_cannot_unlink_persistent_lock() -> None:
             )
         if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
             fail("persistent lock parent mode was not restored after child exit")
-
-
-def validate_external_lock_blocks_internal_lock_parent_rename() -> None:
-    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-dual-lock-") as raw:
-        workspace = Path(raw)
-        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
-        target = workspace / "target"
-        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
-        target = target.resolve(strict=False)
-        started = target / "child-started"
-        renamed = target / ".nddev-kilo-cli.lock.renamed"
-        rename_result = target / "child-rename-result"
-        stop = target / "child-stop"
-        executable, _native, installation = fake_launch_installation(
-            target,
-            (
-                "#!/bin/sh\n"
-                "set -eu\n"
-                f'printf started > "{started}"\n'
-                f'if /bin/mv "{nddev_kilo_cli.lock_path(target)}" "{renamed}" 2>/dev/null; then\n'
-                f'  printf renamed > "{rename_result}"\n'
-                "else\n"
-                f'  printf denied > "{rename_result}"\n'
-                "fi\n"
-                f'while [ ! -f "{stop}" ]; do /bin/sleep 0.05; done\n'
-            ).encode("utf-8"),
-        )
-        del executable
-        original_require_current_software = nddev_kilo_cli.require_current_software
-        launch_result: dict[str, Any] = {}
-
-        def run_launch() -> None:
-            try:
-                launch_result["code"] = nddev_kilo_cli.launch(target, [], timeout_seconds=10)
-            except BaseException as exc:
-                launch_result["error"] = exc
-
-        nddev_kilo_cli.require_current_software = fake_current_software(target, installation)
-        thread = threading.Thread(target=run_launch)
-        thread.start()
-        try:
-            wait_until(
-                "child internal lock parent rename attempt",
-                lambda: rename_result.exists() or bool(launch_result.get("error")),
-            )
-            if "error" in launch_result:
-                raise launch_result["error"]
-            if rename_result.read_text(encoding="utf-8") != "renamed":
-                fail("internal lock parent rename regression did not exercise the rename path")
-            for label, mutation in (
-                (
-                    "switch",
-                    lambda: nddev_kilo_cli.mutate_setup(
-                        target,
-                        nddev_kilo_cli.DEFAULT_SETUP_ID,
-                        "safe",
-                        "switch",
-                    ),
-                ),
-                ("remove", lambda: nddev_kilo_cli.remove_setup(target)),
-                (
-                    "install",
-                    lambda: nddev_kilo_cli.mutate_setup(
-                        target,
-                        nddev_kilo_cli.DEFAULT_SETUP_ID,
-                        nddev_kilo_cli.DEFAULT_PROFILE_ID,
-                        "install",
-                    ),
-                ),
-            ):
-                try:
-                    mutation()
-                except nddev_kilo_cli.ManagerError as exc:
-                    if "target is locked" not in str(exc):
-                        fail(f"{label} after internal lock rename failed for the wrong reason: {exc}")
-                else:
-                    fail(f"{label} was accepted after child renamed the internal lock parent")
-            stop.write_bytes(b"stop\n")
-            stop.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
-            thread.join(timeout=5)
-        finally:
-            nddev_kilo_cli.require_current_software = original_require_current_software
-            if thread.is_alive():
-                stop.write_bytes(b"stop\n")
-                thread.join(timeout=10)
-            if renamed.exists() and not renamed.is_symlink():
-                with contextlib.suppress(OSError):
-                    renamed.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
-        if thread.is_alive():
-            fail("launch child thread did not finish after internal lock rename regression")
-        if "error" in launch_result:
-            raise launch_result["error"]
-        if launch_result.get("code") != 0:
-            fail(
-                "internal lock rename child returned unexpected code: "
-                f"{launch_result.get('code')}"
-            )
-        if not nddev_kilo_cli.lock_path(target).is_dir():
-            fail("canonical internal lock parent was not restored after child rename")
-        if private_directory_mode(nddev_kilo_cli.lock_path(target)) != 0o700:
-            fail("canonical internal lock parent mode was not restored after child rename")
 
 
 def validate_launch_handoff_denies_ordinary_replace_unlink() -> None:
@@ -1560,16 +1503,40 @@ def snapshot_bootstrap_root_shallow(
     if not stat.S_ISDIR(info.st_mode):
         return [record_for(root, ".", info)]
     records = [record_for(root, ".", info)]
-    entries = sorted(root.iterdir(), key=lambda item: item.name)
-    if len(entries) > 256:
-        fail("real bootstrap lock root contains too many entries for bounded validation")
-    for path in entries:
-        records.append(record_for(path, path.name, path.lstat()))
+
+    def walk(directory: Path, relative_parent: str) -> None:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        if len(entries) > 256:
+            fail("real bootstrap lock root contains too many entries for bounded validation")
+        for path in entries:
+            relative = path.name if relative_parent == "." else f"{relative_parent}/{path.name}"
+            child_info = path.lstat()
+            records.append(record_for(path, relative, child_info))
+            if stat.S_ISDIR(child_info.st_mode) and not stat.S_ISLNK(child_info.st_mode):
+                walk(path, relative)
+
+    walk(root, ".")
     return records
 
 
 def snapshot_real_bootstrap_state() -> list[dict[str, Any]]:
     return snapshot_bootstrap_root_shallow(real_bootstrap_root_path())
+
+
+def directory_metadata_tuple(
+    path: Path,
+) -> tuple[int, int, int, int, int, int | None, int | None, int]:
+    info = path.lstat()
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_nlink,
+        stat.S_IMODE(info.st_mode),
+        getattr(info, "st_uid", None),
+        getattr(info, "st_gid", None),
+        info.st_mtime_ns,
+    )
 
 
 def validate_real_bootstrap_state_unchanged(
@@ -1640,7 +1607,12 @@ def validate_bootstrap_lock_precreation_guards() -> None:
             root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
             shutil.rmtree(root)
 
-            root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            nddev_kilo_cli.ensure_target_bootstrap_lock_root(root)
+            product_lock = nddev_kilo_cli.product_bootstrap_lock_file_path(root)
+            if not product_lock.is_file():
+                fail("bootstrap product lock was not published for precreation guard")
             os.symlink(marker, nddev_kilo_cli.bootstrap_lock_file_path(target))
             expect_manager_error("symlink bootstrap lock file", acquire_bootstrap)
             if marker.read_bytes() != b"preserve\n":
@@ -1729,6 +1701,821 @@ def validate_bootstrap_lock_precreation_guards() -> None:
                 fail("bootstrap lock binding is not the canonical expected object")
 
 
+def bootstrap_stage_path(lock_file: Path, index: int = 1) -> Path:
+    return lock_file.with_name(f".{lock_file.name}.nddev.tmp.{os.getpid()}.{index}")
+
+
+def write_bootstrap_stage(path: Path, payload: bytes, mode: int | None = None) -> None:
+    path.write_bytes(payload)
+    path.chmod(nddev_kilo_cli.OWNER_FILE_MODE if mode is None else mode)
+
+
+def validate_bootstrap_stage_recovery_after_sigkill() -> None:
+    if not hasattr(os, "fork"):
+        fail("bootstrap stage recovery regression requires POSIX fork")
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-stage-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        other = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+
+            def die_after_stage_fsync(publish_target: Path) -> None:
+                original_rename = nddev_kilo_cli.rename_no_replace
+
+                def kill_before_rename(source: Path, destination: Path, label: str) -> bool:
+                    del source, destination, label
+                    os.kill(os.getpid(), signal.SIGKILL)
+                    return original_rename(source, destination, label)  # pragma: no cover
+
+                nddev_kilo_cli.rename_no_replace = kill_before_rename
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(publish_target):
+                    pass
+
+            pid = os.fork()
+            if pid == 0:
+                die_after_stage_fsync(target)
+                os._exit(0)
+            wait_for_sigkill(pid, "bootstrap product staged alias publisher")
+
+            product_stages = nddev_kilo_cli.product_lock_stage_aliases(root)
+            if len(product_stages) != 1:
+                fail("bootstrap product staged alias SIGKILL proof did not leave one exact stage")
+            before_read = snapshot_bootstrap_root_shallow(root)
+            expect_manager_error(
+                "read-only staged bootstrap product recovery",
+                lambda: nddev_kilo_cli.status_payload(target),
+            )
+            if snapshot_bootstrap_root_shallow(root) != before_read:
+                fail("read-only staged bootstrap product path mutated the recovery namespace")
+
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            if nddev_kilo_cli.product_lock_stage_aliases(root):
+                fail("exclusive staged bootstrap product recovery left staged aliases")
+            lock_file = nddev_kilo_cli.bootstrap_lock_file_path(target)
+            if not lock_file.is_file():
+                fail("exclusive staged bootstrap recovery did not publish the target anchor")
+            record = load_json(lock_file)
+            expected = {
+                "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA,
+                "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                "target": str(target),
+                "target_sha256": nddev_kilo_cli.target_binding_sha256(target),
+            }
+            if record != expected:
+                fail("exclusive staged bootstrap recovery published the wrong final binding")
+
+            pid = os.fork()
+            if pid == 0:
+                die_after_stage_fsync(other)
+                os._exit(0)
+            wait_for_sigkill(pid, "bootstrap target staged alias publisher")
+
+            other_lock = nddev_kilo_cli.bootstrap_lock_file_path(other)
+            stages = nddev_kilo_cli.bootstrap_lock_stage_aliases(other_lock, other)
+            if len(stages) != 1:
+                fail("bootstrap target staged alias SIGKILL proof did not leave one exact stage")
+            before_read = snapshot_bootstrap_root_shallow(root)
+            expect_manager_error(
+                "read-only staged bootstrap target recovery",
+                lambda: nddev_kilo_cli.status_payload(other),
+            )
+            if snapshot_bootstrap_root_shallow(root) != before_read:
+                fail("read-only staged bootstrap target path mutated the recovery namespace")
+
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(other):
+                pass
+            if nddev_kilo_cli.bootstrap_lock_stage_aliases(other_lock, other):
+                fail("exclusive staged bootstrap target recovery left staged aliases")
+            if not other_lock.is_file():
+                fail("exclusive staged bootstrap target recovery did not publish the final anchor")
+            record = load_json(other_lock)
+            expected = {
+                "schema_version": nddev_kilo_cli.BOOTSTRAP_LOCK_SCHEMA,
+                "product_name": nddev_kilo_cli.PRODUCT_NAME,
+                "target": str(other),
+                "target_sha256": nddev_kilo_cli.target_binding_sha256(other),
+            }
+            if record != expected:
+                fail("exclusive staged bootstrap target recovery published the wrong final binding")
+
+
+def validate_bootstrap_stage_ordinary_failure_rolls_back() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-stage-rollback-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            before_tree = snapshot_bootstrap_root_shallow(root)
+            before_metadata = directory_metadata_tuple(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+
+            def fail_after_stage_fsync(source: Path, destination: Path, label: str) -> bool:
+                del source, destination, label
+                raise nddev_kilo_cli.ManagerError("injected no-replace failure")
+
+            nddev_kilo_cli.rename_no_replace = fail_after_stage_fsync
+            try:
+                expect_manager_error(
+                    "ordinary staged bootstrap publication failure",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if snapshot_bootstrap_root_shallow(root) != before_tree:
+                fail("ordinary staged bootstrap failure left namespace residue")
+            if directory_metadata_tuple(root) != before_metadata:
+                fail("ordinary staged bootstrap failure changed parent metadata")
+
+
+def validate_bootstrap_product_root_publication_transaction() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-root-tx-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            if root.exists():
+                fail("bootstrap root transaction fixture started with a root")
+            before_parent = directory_metadata_tuple(parent)
+            before_tree = snapshot_bootstrap_root_shallow(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+
+            def fail_product_publication(source: Path, destination: Path, label: str) -> bool:
+                del source, destination
+                if label == "bootstrap product lock":
+                    raise nddev_kilo_cli.ManagerError("injected product publication failure")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = fail_product_publication
+            try:
+                expect_manager_error(
+                    "product anchor publication failure",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if snapshot_bootstrap_root_shallow(root) != before_tree:
+                fail("product anchor publication failure left a created root or stage")
+            if directory_metadata_tuple(parent) != before_parent:
+                fail("product anchor publication failure changed system parent metadata")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-root-nonempty-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            original_rename = nddev_kilo_cli.rename_no_replace
+            marker: Path | None = None
+
+            def fail_with_nonempty_root(source: Path, destination: Path, label: str) -> bool:
+                nonlocal marker
+                del source, destination
+                if label == "bootstrap product lock":
+                    marker = root / "unexpected-root-content"
+                    marker.write_bytes(b"evidence\n")
+                    marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                    raise nddev_kilo_cli.ManagerError("injected nonempty root rollback failure")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = fail_with_nonempty_root
+            try:
+                expect_manager_error(
+                    "nonempty product root rollback",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if marker is None or marker.read_bytes() != b"evidence\n":
+                fail("nonempty product root rollback did not preserve explicit evidence")
+            if not root.is_dir():
+                fail("nonempty product root rollback removed the evidence root")
+
+
+def validate_bootstrap_target_root_publication_transaction() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-root-tx-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            before_tree = snapshot_bootstrap_root_shallow(root)
+            before_metadata = directory_metadata_tuple(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+
+            def fail_target_publication(source: Path, destination: Path, label: str) -> bool:
+                del source, destination
+                if label == "bootstrap lifecycle lock file":
+                    raise nddev_kilo_cli.ManagerError("injected target publication failure")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = fail_target_publication
+            try:
+                expect_manager_error(
+                    "target anchor publication failure",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if snapshot_bootstrap_root_shallow(root) != before_tree:
+                fail("target anchor publication failure left a created targets root or stage")
+            if directory_metadata_tuple(root) != before_metadata:
+                fail("target anchor publication failure changed product root metadata")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-root-nonempty-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            target_root = nddev_kilo_cli.target_bootstrap_lock_root(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+            marker: Path | None = None
+
+            def fail_with_nonempty_target_root(
+                source: Path, destination: Path, label: str
+            ) -> bool:
+                nonlocal marker
+                del source, destination
+                if label == "bootstrap lifecycle lock file":
+                    marker = target_root / "unexpected-target-root-content"
+                    marker.write_bytes(b"evidence\n")
+                    marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                    raise nddev_kilo_cli.ManagerError("injected nonempty target root rollback")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = fail_with_nonempty_target_root
+            try:
+                expect_manager_error(
+                    "nonempty target root rollback",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if marker is None or marker.read_bytes() != b"evidence\n":
+                fail("nonempty target root rollback did not preserve explicit evidence")
+            if not target_root.is_dir():
+                fail("nonempty target root rollback removed the evidence root")
+
+
+def validate_bootstrap_target_root_replacement_cleanup_guard() -> None:
+    def replacement_identity(path: Path) -> tuple[int, int]:
+        info = path.lstat()
+        return info.st_dev, info.st_ino
+
+    def force_parent_metadata_marker(path: Path) -> tuple[int, int, int, int, int, int, int]:
+        info = path.lstat()
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+        return directory_metadata_tuple(path)
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-root-replace-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            target_root = nddev_kilo_cli.target_bootstrap_lock_root(root)
+            original_fsync = nddev_kilo_cli.fsync_directory
+            injected_identity: tuple[int, int] | None = None
+            injected_parent_metadata: tuple[int, int, int, int, int, int, int] | None = None
+
+            def replace_empty_target_root_before_fsync(path: Path) -> None:
+                nonlocal injected_identity, injected_parent_metadata
+                if path == root and injected_identity is None and target_root.exists():
+                    target_root.rmdir()
+                    target_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                    target_root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                    injected_identity = replacement_identity(target_root)
+                    injected_parent_metadata = force_parent_metadata_marker(root)
+                    raise OSError("injected target-root replacement before fsync")
+                original_fsync(path)
+
+            nddev_kilo_cli.fsync_directory = replace_empty_target_root_before_fsync
+            try:
+                expect_manager_error(
+                    "target root creation replacement cleanup",
+                    lambda: nddev_kilo_cli.ensure_target_bootstrap_lock_root(root),
+                )
+            finally:
+                nddev_kilo_cli.fsync_directory = original_fsync
+            if injected_identity is None or injected_parent_metadata is None:
+                fail("target root creation replacement smoke did not inject replacement")
+            if replacement_identity(target_root) != injected_identity:
+                fail("target root creation cleanup removed the same-path replacement")
+            if any(target_root.iterdir()):
+                fail("target root creation replacement should remain empty")
+            if directory_metadata_tuple(root) != injected_parent_metadata:
+                fail("target root creation cleanup falsely restored product-root metadata")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-publish-replace-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            target_root = nddev_kilo_cli.target_bootstrap_lock_root(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+            injected_identity: tuple[int, int] | None = None
+            injected_parent_metadata: tuple[int, int, int, int, int, int, int] | None = None
+
+            def replace_empty_target_root_during_publication(
+                source: Path, destination: Path, label: str
+            ) -> bool:
+                nonlocal injected_identity, injected_parent_metadata
+                if label == "bootstrap lifecycle lock file":
+                    source.unlink()
+                    target_root.rmdir()
+                    target_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                    target_root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                    injected_identity = replacement_identity(target_root)
+                    injected_parent_metadata = force_parent_metadata_marker(root)
+                    raise nddev_kilo_cli.ManagerError("injected target-root replacement during publish")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = replace_empty_target_root_during_publication
+            try:
+                expect_manager_error(
+                    "target anchor replacement cleanup",
+                    lambda: nddev_kilo_cli.publish_target_anchor_if_missing(root, target),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if injected_identity is None or injected_parent_metadata is None:
+                fail("target anchor replacement smoke did not inject replacement")
+            if replacement_identity(target_root) != injected_identity:
+                fail("target anchor cleanup removed the same-path replacement")
+            if any(target_root.iterdir()):
+                fail("target anchor replacement should remain empty")
+            if directory_metadata_tuple(root) != injected_parent_metadata:
+                fail("target anchor cleanup falsely restored product-root metadata")
+
+
+def validate_bootstrap_stage_ordinary_cleanup_replacement_guard() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-cleanup-replace-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            product_lock = nddev_kilo_cli.product_bootstrap_lock_file_path(root)
+            payload = nddev_kilo_cli.product_lock_binding_payload()
+            original_rename = nddev_kilo_cli.rename_no_replace
+            replacement_stage: Path | None = None
+
+            def replace_stage_then_fail(source: Path, destination: Path, label: str) -> bool:
+                nonlocal replacement_stage
+                if label == "bootstrap product lock":
+                    replacement_stage = source
+                    source.unlink()
+                    write_bootstrap_stage(source, b"replacement-stage\n")
+                    raise nddev_kilo_cli.ManagerError("injected ordinary cleanup replacement")
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = replace_stage_then_fail
+            try:
+                expect_manager_error(
+                    "ordinary cleanup replacement stage",
+                    lambda: nddev_kilo_cli.publish_missing_anchor_file(
+                        product_lock,
+                        payload,
+                        "bootstrap product lock",
+                    ),
+                )
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if replacement_stage is None:
+                fail("ordinary cleanup replacement smoke did not replace the stage")
+            if replacement_stage.read_bytes() != b"replacement-stage\n":
+                fail("ordinary cleanup removed or rewrote a replacement stage")
+            if product_lock.exists():
+                fail("ordinary cleanup replacement smoke published a final product anchor")
+
+
+def validate_bootstrap_eexist_winner_smokes() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-eexist-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            original_rename = nddev_kilo_cli.rename_no_replace
+
+            def valid_winner(source: Path, destination: Path, label: str) -> bool:
+                if label == "bootstrap product lock":
+                    write_bootstrap_stage(destination, nddev_kilo_cli.product_lock_binding_payload())
+                    return False
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = valid_winner
+            try:
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                    pass
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            if nddev_kilo_cli.product_lock_stage_aliases(root):
+                fail("valid EEXIST winner left this process product stage after lock recovery")
+            product_lock = nddev_kilo_cli.product_bootstrap_lock_file_path(root)
+            if load_json(product_lock).get("kind") != "product":
+                fail("valid EEXIST winner did not leave a product anchor")
+
+        with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-eexist-bad-") as bad_raw:
+            bad_workspace = Path(bad_raw)
+            bad_workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            bad_parent = bad_workspace / "bootstrap-parent"
+            bad_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            with patched_bootstrap_lock_parent(bad_parent):
+                root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+                product_lock = nddev_kilo_cli.product_bootstrap_lock_file_path(root)
+                product_lock.write_bytes(b"{not-json\n")
+                product_lock.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                before_metadata = directory_metadata_tuple(root)
+                expect_manager_error(
+                    "invalid EEXIST product winner",
+                    lambda: nddev_kilo_cli.publish_missing_anchor_file(
+                        product_lock,
+                        nddev_kilo_cli.product_lock_binding_payload(),
+                        "bootstrap product lock",
+                    ),
+                )
+                if product_lock.read_bytes() != b"{not-json\n":
+                    fail("invalid EEXIST winner final anchor was modified")
+                if nddev_kilo_cli.product_lock_stage_aliases(root):
+                    fail("invalid EEXIST winner left this process staged alias")
+                if directory_metadata_tuple(root) != before_metadata:
+                    fail("invalid EEXIST winner changed parent metadata after cleanup")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-eexist-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+            nddev_kilo_cli.publish_product_anchor_if_missing(root)
+            target_root = nddev_kilo_cli.target_bootstrap_lock_root(root)
+            original_rename = nddev_kilo_cli.rename_no_replace
+
+            def valid_target_winner(source: Path, destination: Path, label: str) -> bool:
+                if label == "bootstrap lifecycle lock file":
+                    write_bootstrap_stage(
+                        destination,
+                        nddev_kilo_cli.bootstrap_lock_binding_payload(target),
+                    )
+                    return False
+                return original_rename(source, destination, label)
+
+            nddev_kilo_cli.rename_no_replace = valid_target_winner
+            try:
+                with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                    pass
+            finally:
+                nddev_kilo_cli.rename_no_replace = original_rename
+            lock_file = nddev_kilo_cli.bootstrap_lock_file_path_for_root(root, target)
+            if nddev_kilo_cli.bootstrap_lock_stage_aliases(lock_file, target):
+                fail("valid target EEXIST winner left this process target stage after lock recovery")
+            if load_json(lock_file).get("target") != str(target):
+                fail("valid target EEXIST winner did not leave the target anchor")
+            if not target_root.is_dir():
+                fail("valid target EEXIST winner removed the target root")
+
+        with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-target-eexist-bad-") as bad_raw:
+            bad_workspace = Path(bad_raw)
+            bad_workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            bad_parent = bad_workspace / "bootstrap-parent"
+            bad_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            bad_target_parent = bad_workspace / "targets"
+            bad_target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            bad_target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(
+                bad_target_parent / "target"
+            )
+            with patched_bootstrap_lock_parent(bad_parent):
+                root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+                nddev_kilo_cli.publish_product_anchor_if_missing(root)
+                target_root = nddev_kilo_cli.ensure_target_bootstrap_lock_root(root)
+                lock_file = nddev_kilo_cli.bootstrap_lock_file_path_for_root(root, bad_target)
+                lock_file.write_bytes(b"{not-json\n")
+                lock_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                before_metadata = directory_metadata_tuple(target_root)
+                expect_manager_error(
+                    "invalid EEXIST target winner",
+                    lambda: nddev_kilo_cli.publish_missing_bootstrap_lock_file(
+                        lock_file,
+                        bad_target,
+                    ),
+                )
+                if lock_file.read_bytes() != b"{not-json\n":
+                    fail("invalid target EEXIST winner final anchor was modified")
+                if nddev_kilo_cli.bootstrap_lock_stage_aliases(lock_file, bad_target):
+                    fail("invalid target EEXIST winner left this process staged alias")
+                if directory_metadata_tuple(target_root) != before_metadata:
+                    fail("invalid target EEXIST winner changed target root metadata after cleanup")
+
+        with tempfile.TemporaryDirectory(
+            prefix="nddev-kilo-public-target-eexist-replace-"
+        ) as replace_raw:
+            replace_workspace = Path(replace_raw)
+            replace_workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            replace_parent = replace_workspace / "bootstrap-parent"
+            replace_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            replace_target_parent = replace_workspace / "targets"
+            replace_target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            replace_target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(
+                replace_target_parent / "target"
+            )
+            with patched_bootstrap_lock_parent(replace_parent):
+                root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+                nddev_kilo_cli.publish_product_anchor_if_missing(root)
+                nddev_kilo_cli.ensure_target_bootstrap_lock_root(root)
+                lock_file = nddev_kilo_cli.bootstrap_lock_file_path_for_root(root, replace_target)
+                original_rename = nddev_kilo_cli.rename_no_replace
+                replacement_stage: Path | None = None
+
+                def replace_target_stage_then_win_invalid(
+                    source: Path, destination: Path, label: str
+                ) -> bool:
+                    nonlocal replacement_stage
+                    if label == "bootstrap lifecycle lock file":
+                        replacement_stage = source
+                        source.unlink()
+                        write_bootstrap_stage(source, b"replacement-target-stage\n")
+                        destination.write_bytes(b"{not-json\n")
+                        destination.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                        return False
+                    return original_rename(source, destination, label)
+
+                nddev_kilo_cli.rename_no_replace = replace_target_stage_then_win_invalid
+                try:
+                    expect_manager_error(
+                        "invalid target EEXIST replacement stage",
+                        lambda: nddev_kilo_cli.publish_missing_bootstrap_lock_file(
+                            lock_file,
+                            replace_target,
+                        ),
+                    )
+                finally:
+                    nddev_kilo_cli.rename_no_replace = original_rename
+                if replacement_stage is None:
+                    fail("target EEXIST replacement smoke did not replace the stage")
+                if replacement_stage.read_bytes() != b"replacement-target-stage\n":
+                    fail("target EEXIST cleanup removed or rewrote a replacement stage")
+                if lock_file.read_bytes() != b"{not-json\n":
+                    fail("target EEXIST replacement smoke modified the invalid final anchor")
+
+
+def validate_bootstrap_stage_signature_replacement_guard() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-stage-replace-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        other = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+        with patched_bootstrap_lock_parent(parent):
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                pass
+            lock_file = nddev_kilo_cli.bootstrap_lock_file_path(target)
+            payload = nddev_kilo_cli.bootstrap_lock_binding_payload(target)
+            stage = bootstrap_stage_path(lock_file)
+            write_bootstrap_stage(stage, payload)
+            original_aliases = nddev_kilo_cli.anchor_stage_aliases
+            swapped = False
+
+            def replace_after_signature(
+                observed_lock: Path, observed_payload: bytes, label: str
+            ) -> list[nddev_kilo_cli.AnchorStageSignature]:
+                nonlocal swapped
+                signatures = original_aliases(observed_lock, observed_payload, label)
+                if observed_lock == lock_file and signatures and not swapped:
+                    swapped = True
+                    signatures[0].path.unlink()
+                    write_bootstrap_stage(signatures[0].path, observed_payload)
+                return signatures
+
+            nddev_kilo_cli.anchor_stage_aliases = replace_after_signature
+            try:
+                expect_manager_error(
+                    "stage replacement before drain unlink",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(target).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.anchor_stage_aliases = original_aliases
+            if not swapped:
+                fail("stage replacement drain smoke did not exercise the replacement path")
+            if not stage.exists():
+                fail("stage replacement before drain unlink was deleted")
+
+            other_lock = nddev_kilo_cli.bootstrap_lock_file_path(other)
+            other_payload = nddev_kilo_cli.bootstrap_lock_binding_payload(other)
+            other_stage = bootstrap_stage_path(other_lock)
+            write_bootstrap_stage(other_stage, other_payload)
+            swapped = False
+
+            def replace_before_promote(
+                observed_lock: Path, observed_payload: bytes, label: str
+            ) -> list[nddev_kilo_cli.AnchorStageSignature]:
+                nonlocal swapped
+                signatures = original_aliases(observed_lock, observed_payload, label)
+                if observed_lock == other_lock and signatures and not swapped:
+                    swapped = True
+                    signatures[0].path.unlink()
+                    write_bootstrap_stage(signatures[0].path, observed_payload)
+                return signatures
+
+            nddev_kilo_cli.anchor_stage_aliases = replace_before_promote
+            try:
+                expect_manager_error(
+                    "stage replacement before promote",
+                    lambda: nddev_kilo_cli.bootstrap_lifecycle_lock(other).__enter__(),
+                )
+            finally:
+                nddev_kilo_cli.anchor_stage_aliases = original_aliases
+            if not swapped:
+                fail("stage replacement promote smoke did not exercise the replacement path")
+            if other_lock.exists():
+                fail("stage replacement before promote published a final anchor")
+            if not other_stage.exists():
+                fail("stage replacement before promote was deleted")
+
+
+def validate_readonly_bootstrap_double_snapshot() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-bootstrap-readonly-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        parent = workspace / "bootstrap-parent"
+        parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+        with patched_bootstrap_lock_parent(parent):
+            root = nddev_kilo_cli.bootstrap_lock_root()
+            if root.exists():
+                fail("read-only bootstrap double-snapshot fixture started with a lock root")
+            original_software_status = nddev_kilo_cli.software_status
+
+            def mutate_namespace_during_read(observed_target: Path) -> dict[str, Any]:
+                root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                marker = root / "unexpected-reader-created"
+                marker.write_bytes(b"mutation\n")
+                marker.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                return original_software_status(observed_target)
+
+            nddev_kilo_cli.software_status = mutate_namespace_during_read
+            try:
+                expect_manager_error(
+                    "read-only bootstrap namespace double snapshot",
+                    lambda: nddev_kilo_cli.status_payload(target),
+                )
+            finally:
+                nddev_kilo_cli.software_status = original_software_status
+
+
+def validate_bootstrap_stage_adversarial_cases() -> None:
+    cases = ("invalid-name", "partial", "symlink", "hardlink", "wrong-target", "excessive")
+    for label in cases:
+        with tempfile.TemporaryDirectory(prefix=f"nddev-kilo-public-bootstrap-{label}-") as raw:
+            workspace = Path(raw)
+            workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            parent = workspace / "bootstrap-parent"
+            parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target_parent = workspace / "targets"
+            target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+            other = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+            with patched_bootstrap_lock_parent(parent):
+                root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+                nddev_kilo_cli.publish_product_anchor_if_missing(root)
+                nddev_kilo_cli.ensure_target_bootstrap_lock_root(root)
+                lock_file = nddev_kilo_cli.bootstrap_lock_file_path(target)
+                payload = nddev_kilo_cli.bootstrap_lock_binding_payload(target)
+                if label == "invalid-name":
+                    write_bootstrap_stage(
+                        lock_file.with_name(f".{lock_file.name}.nddev.tmp.bad"),
+                        payload,
+                    )
+                elif label == "partial":
+                    write_bootstrap_stage(bootstrap_stage_path(lock_file), b"{not-json\n")
+                elif label == "symlink":
+                    marker = workspace / "outside-marker"
+                    marker.write_bytes(b"preserve\n")
+                    os.symlink(marker, bootstrap_stage_path(lock_file))
+                elif label == "hardlink":
+                    stage = bootstrap_stage_path(lock_file)
+                    write_bootstrap_stage(stage, payload)
+                    os.link(stage, workspace / "hardlink-alias")
+                elif label == "wrong-target":
+                    write_bootstrap_stage(
+                        bootstrap_stage_path(lock_file),
+                        nddev_kilo_cli.bootstrap_lock_binding_payload(other),
+                    )
+                elif label == "excessive":
+                    for index in range(nddev_kilo_cli.BOOTSTRAP_LOCK_MAX_STAGE_ALIASES + 1):
+                        write_bootstrap_stage(bootstrap_stage_path(lock_file, index + 1), payload)
+                before_read = snapshot_bootstrap_root_shallow(root)
+                expect_manager_error(
+                    f"read-only adversarial bootstrap stage {label}",
+                    lambda: nddev_kilo_cli.status_payload(target),
+                )
+                if snapshot_bootstrap_root_shallow(root) != before_read:
+                    fail(f"read-only adversarial bootstrap stage mutated namespace: {label}")
+
+                def acquire_exclusive_bootstrap() -> None:
+                    with nddev_kilo_cli.bootstrap_lifecycle_lock(target):
+                        pass
+
+                expect_manager_error(
+                    f"exclusive adversarial bootstrap stage {label}",
+                    acquire_exclusive_bootstrap,
+                )
+                if snapshot_bootstrap_root_shallow(root) != before_read:
+                    fail(f"exclusive adversarial bootstrap stage mutated namespace: {label}")
+
+
+def validate_cold_product_namespace_fail_closed() -> None:
+    cases = ("product-stage", "target-root", "unknown-entry")
+    for label in cases:
+        with tempfile.TemporaryDirectory(prefix=f"nddev-kilo-public-cold-product-{label}-") as raw:
+            workspace = Path(raw)
+            workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+            parent = workspace / "bootstrap-parent"
+            parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target_parent = workspace / "targets"
+            target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+            target = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "target")
+            with patched_bootstrap_lock_parent(parent):
+                root = nddev_kilo_cli.ensure_bootstrap_lock_root()
+                if label == "product-stage":
+                    write_bootstrap_stage(
+                        bootstrap_stage_path(nddev_kilo_cli.product_bootstrap_lock_file_path(root)),
+                        nddev_kilo_cli.product_lock_binding_payload(),
+                    )
+                elif label == "target-root":
+                    target_root = nddev_kilo_cli.target_bootstrap_lock_root(root)
+                    target_root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+                    target_root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+                    other = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "other")
+                    lock_file = nddev_kilo_cli.bootstrap_lock_file_path_for_root(root, other)
+                    write_bootstrap_stage(lock_file, nddev_kilo_cli.bootstrap_lock_binding_payload(other))
+                elif label == "unknown-entry":
+                    unknown = root / "unexpected"
+                    unknown.write_bytes(b"unexpected\n")
+                    unknown.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+                before = snapshot_bootstrap_root_shallow(root)
+                expect_manager_error(
+                    f"cold product namespace {label}",
+                    lambda: nddev_kilo_cli.status_payload(target),
+                )
+                if snapshot_bootstrap_root_shallow(root) != before:
+                    fail(f"cold product namespace read mutated state: {label}")
+
+
 def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -1744,6 +2531,23 @@ def wait_for_process(pid: int, label: str, *, seconds: float = 10.0) -> None:
     with contextlib.suppress(ChildProcessError):
         os.waitpid(pid, 0)
     fail(f"{label} did not exit before timeout")
+
+
+def wait_for_sigkill(pid: int, label: str, *, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        observed, status = os.waitpid(pid, os.WNOHANG)
+        if observed == 0:
+            time.sleep(0.02)
+            continue
+        if os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL:
+            return
+        fail(f"{label} did not stop at the expected SIGKILL boundary: status {status}")
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+    fail(f"{label} did not stop before timeout")
 
 
 def terminate_process(pid: int) -> None:
@@ -1865,6 +2669,59 @@ def validate_bootstrap_lock_persistent_inode_handover() -> None:
         record = load_json(lock_file)
         if record.get("target") != str(target):
             fail("bootstrap lock persistent binding target mismatch after handover")
+
+
+def validate_bootstrap_lock_different_target_handoff() -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        fail("bootstrap different-target handoff regression requires fork-capable multiprocessing")
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-different-target-") as raw:
+        workspace = Path(raw)
+        workspace.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target_parent = workspace / "targets"
+        target_parent.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target_a = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "a")
+        target_b = nddev_kilo_cli.canonical_target_for_bootstrap_lock(target_parent / "b")
+        a_ready = workspace / "a-ready"
+        a_release = workspace / "a-release"
+        b_holding = workspace / "b-holding"
+
+        def process_a() -> None:
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target_a):
+                a_ready.write_text("ready\n", encoding="utf-8")
+                while not a_release.exists():
+                    time.sleep(0.02)
+
+        def process_b() -> None:
+            while not a_ready.exists():
+                time.sleep(0.02)
+            with nddev_kilo_cli.bootstrap_lifecycle_lock(target_b):
+                b_holding.write_text("holding\n", encoding="utf-8")
+
+        pids: list[tuple[int, str]] = []
+        try:
+            pid_a = fork_validation_child("different-a", workspace, process_a)
+            pids.append((pid_a, "different-target process A"))
+            wait_until("different-target process A lock", a_ready.exists)
+            pid_b = fork_validation_child("different-b", workspace, process_b)
+            pids.append((pid_b, "different-target process B"))
+            wait_until("different-target process B lock", b_holding.exists, seconds=2.0)
+            wait_for_process(pid_b, "different-target process B")
+            pids = [(pid, label) for pid, label in pids if pid != pid_b]
+            a_release.write_text("release\n", encoding="utf-8")
+            wait_for_process(pid_a, "different-target process A")
+            pids = [(pid, label) for pid, label in pids if pid != pid_a]
+        finally:
+            for pid, label in pids:
+                del label
+                terminate_process(pid)
+        lock_a = nddev_kilo_cli.bootstrap_lock_file_path(target_a)
+        lock_b = nddev_kilo_cli.bootstrap_lock_file_path(target_b)
+        if lock_a.lstat().st_ino == lock_b.lstat().st_ino:
+            fail("different target locks resolved to the same inode")
+        if load_json(lock_a).get("target") != str(target_a):
+            fail("different target A lock binding mismatch")
+        if load_json(lock_b).get("target") != str(target_b):
+            fail("different target B lock binding mismatch")
 
 
 def validate_package_lock_regressions() -> None:
@@ -2241,6 +3098,172 @@ def validate_lock_and_backup_precreation_guards() -> None:
             fail("world-writable backup pool was accepted")
 
 
+def write_cleanup_source(target: Path, *, backup_slot: int | None = None) -> tuple[str, Path]:
+    if backup_slot is None:
+        source = nddev_kilo_cli.software_stage_root(target)
+        kind = "software-staging"
+    else:
+        pool = nddev_kilo_cli.backup_pool(target)
+        pool.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, exist_ok=True)
+        pool.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        source = pool / str(backup_slot)
+        kind = f"retired-backup-slot-{backup_slot}"
+    source.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    source.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    child = source / "payload"
+    child.write_bytes(b"cleanup-payload\n")
+    child.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+    nested = source / "nested"
+    nested.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    nested.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    nested_file = nested / "data"
+    nested_file.write_bytes(b"nested\n")
+    nested_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+    return kind, source
+
+
+def publish_cleanup_intent_after_move_without_journal(
+    target: Path,
+    kind: str,
+    source: Path,
+) -> None:
+    root = nddev_kilo_cli.cleanup_root_path(target)
+    root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    tombstone = nddev_kilo_cli.cleanup_tombstone_path(target)
+    tombstone.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    tombstone.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    entry = {"kind": kind, "tombstone": f"0-{kind}"}
+    intent_entries = nddev_kilo_cli.cleanup_intent_entries(target, [entry], [(kind, source)])
+    content = nddev_kilo_cli.cleanup_intent_content(target, "prepare-smoke", intent_entries)
+    nddev_kilo_cli.publish_cleanup_file_no_replace(
+        root,
+        nddev_kilo_cli.CLEANUP_INTENT_NAME,
+        content,
+        "cleanup pending intent",
+    )
+    destination = tombstone / entry["tombstone"]
+    if not nddev_kilo_cli.rename_no_replace(source, destination, "cleanup test tombstone"):
+        fail("cleanup prepare test tombstone destination already existed")
+    nddev_kilo_cli.fsync_directory(tombstone)
+    nddev_kilo_cli.fsync_directory(source.parent)
+
+
+def validate_cleanup_prepare_recovery_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-prepare-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        publish_cleanup_intent_after_move_without_journal(target, kind, source)
+        before_read = snapshot_tree(target)
+        expect_manager_error("read-only cleanup intent without journal", lambda: nddev_kilo_cli.status_payload(target))
+        if snapshot_tree(target) != before_read:
+            fail("read-only cleanup intent recovery mutated target state")
+        if nddev_kilo_cli.drain_cleanup_before_mutation(target):
+            fail("cleanup prepare recovery left pending state")
+        if nddev_kilo_cli.cleanup_root_path(target).exists():
+            fail("cleanup prepare recovery left cleanup root")
+
+
+def validate_cleanup_postcommit_failure_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-postcommit-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        original_remove = nddev_kilo_cli.remove_exact_cleanup_entry
+        calls = {"value": 0}
+
+        def fail_first_remove(path: Path, record: dict[str, Any]) -> None:
+            calls["value"] += 1
+            if calls["value"] == 1:
+                raise nddev_kilo_cli.ManagerError("injected cleanup drain failure")
+            original_remove(path, record)
+
+        nddev_kilo_cli.remove_exact_cleanup_entry = fail_first_remove
+        try:
+            pending = nddev_kilo_cli.finish_post_commit_cleanup(target, "postcommit-smoke", [(kind, source)])
+        finally:
+            nddev_kilo_cli.remove_exact_cleanup_entry = original_remove
+        if not pending:
+            fail("postcommit cleanup failure did not report cleanup_pending")
+        status = nddev_kilo_cli.status_payload(target)
+        plan = nddev_kilo_cli.plan_payload(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+        )
+        if status.get("cleanup_pending") is not True or plan.get("cleanup_pending") is not True:
+            fail("status/plan did not expose valid cleanup_pending")
+        if nddev_kilo_cli.drain_cleanup_before_mutation(target):
+            fail("postcommit cleanup retry left pending state")
+
+
+def validate_cleanup_replacement_preservation_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-replace-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target, backup_slot=0)
+        nddev_kilo_cli.promote_cleanup_tombstone(target, "replace-smoke", [(kind, source)])
+        payload = nddev_kilo_cli.cleanup_tombstone_path(target) / f"0-{kind}" / "payload"
+        payload.write_bytes(b"same-uid replacement\n")
+        payload.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = snapshot_tree(target)
+        expect_manager_error("replaced cleanup tombstone", lambda: nddev_kilo_cli.drain_cleanup_pending(target))
+        if snapshot_tree(target) != before:
+            fail("cleanup drain changed a replaced tombstone")
+
+
+def validate_cleanup_malformed_fail_closed_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-malformed-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        root = nddev_kilo_cli.cleanup_root_path(target)
+        root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        journal = nddev_kilo_cli.cleanup_journal_path(target)
+        journal.write_bytes(b"{\"schema_version\":999}\n")
+        journal.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = snapshot_tree(target)
+        expect_manager_error("malformed cleanup journal status", lambda: nddev_kilo_cli.status_payload(target))
+        expect_manager_error(
+            "malformed cleanup journal plan",
+            lambda: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        )
+        expect_manager_error("malformed cleanup journal mutation", lambda: nddev_kilo_cli.drain_cleanup_before_mutation(target))
+        if snapshot_tree(target) != before:
+            fail("malformed cleanup journal path was mutated")
+
+
+def validate_cleanup_repeated_drain_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-repeat-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        nddev_kilo_cli.promote_cleanup_tombstone(target, "repeat-smoke", [(kind, source)])
+        drained, pending = nddev_kilo_cli.drain_cleanup_pending(target)
+        if not drained or pending:
+            fail("cleanup first drain did not complete")
+        drained, pending = nddev_kilo_cli.drain_cleanup_pending(target)
+        if drained or pending:
+            fail("cleanup second drain was not an exact no-op")
+        if nddev_kilo_cli.cleanup_root_path(target).exists():
+            fail("cleanup repeated drain left residue")
+
+
 def validate_sticky_tmp_target() -> None:
     candidates = [Path("/tmp"), Path(tempfile.gettempdir())]
     tmp = next((path for path in candidates if path.exists()), candidates[-1])
@@ -2303,6 +3326,39 @@ def validate_no_public_bootstrap_override_references() -> None:
                     fail(f"public artifact documents unsupported bootstrap override: {path}")
 
 
+def validate_bootstrap_anchor_publication_static_contract() -> None:
+    source = MANAGER_PATH.read_text(encoding="utf-8")
+    required_terms = (
+        "def rename_no_replace(",
+        "renameatx_np",
+        "RENAME_EXCL_DARWIN",
+        "RENAME_NOREPLACE_LINUX",
+        "BOOTSTRAP_PRODUCT_LOCK_NAME",
+        "acquire_product_lock",
+        "publish_product_anchor_if_missing",
+        "validate_product_namespace_entries",
+        "cold_bootstrap_product_namespace_signature",
+        "class AnchorStageSignature",
+        "cleanup_anchor_stage_signature",
+        "revalidate_anchor_stage_signature",
+        "publish_missing_bootstrap_lock_file",
+        "drain_bootstrap_lock_stage_aliases",
+        "readonly_bootstrap_lifecycle_lock",
+        "bootstrap lifecycle lock file binding is empty",
+    )
+    for term in required_terms:
+        if term not in source:
+            fail(f"bootstrap anchor publication contract is missing {term!r}")
+    forbidden_terms = (
+        "def write_bootstrap_lock_record(",
+        "os.ftruncate(descriptor",
+        "if record is None:\n            write_bootstrap_lock_record",
+    )
+    for term in forbidden_terms:
+        if term in source:
+            fail(f"bootstrap anchor publication still permits in-place final binding: {term!r}")
+
+
 def run_all_validations(injected_bootstrap_parent: Path) -> None:
     with patched_bootstrap_lock_parent(injected_bootstrap_parent):
         validate_bootstrap_injection_is_active(injected_bootstrap_parent)
@@ -2318,10 +3374,21 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_manager_parse_args()
         validate_launch_guard()
         validate_bootstrap_lock_precreation_guards()
+        validate_bootstrap_stage_ordinary_failure_rolls_back()
+        validate_bootstrap_product_root_publication_transaction()
+        validate_bootstrap_target_root_publication_transaction()
+        validate_bootstrap_target_root_replacement_cleanup_guard()
+        validate_bootstrap_stage_ordinary_cleanup_replacement_guard()
+        validate_bootstrap_eexist_winner_smokes()
+        validate_bootstrap_stage_signature_replacement_guard()
+        validate_bootstrap_stage_recovery_after_sigkill()
+        validate_readonly_bootstrap_double_snapshot()
+        validate_cold_product_namespace_fail_closed()
+        validate_bootstrap_stage_adversarial_cases()
         validate_bootstrap_lock_persistent_inode_handover()
+        validate_bootstrap_lock_different_target_handoff()
         validate_launch_lock_scope_and_executable_revalidation()
         validate_child_cannot_unlink_persistent_lock()
-        validate_external_lock_blocks_internal_lock_parent_rename()
         validate_launch_handoff_denies_ordinary_replace_unlink()
         validate_stale_launch_protection_recovery()
         validate_runtime_paths_reject_symlinks_before_child()
@@ -2333,6 +3400,12 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()
+        validate_cleanup_prepare_recovery_smoke()
+        validate_cleanup_postcommit_failure_smoke()
+        validate_cleanup_replacement_preservation_smoke()
+        validate_cleanup_malformed_fail_closed_smoke()
+        validate_cleanup_repeated_drain_smoke()
+        validate_bootstrap_anchor_publication_static_contract()
         validate_sticky_tmp_target()
         validate_fake_path_is_ignored()
         validate_no_public_bootstrap_override_references()

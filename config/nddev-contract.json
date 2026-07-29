@@ -22,6 +22,18 @@
     "auto_for_profiles": [
       "full-auto"
     ],
+    "workspace_scope": {
+      "target_role": "managed-runtime-home",
+      "default": "captured-caller-cwd",
+      "manager_flag": "--workspace",
+      "native_form": [
+        "run",
+        "--dir",
+        "<workspace>"
+      ],
+      "child_cwd": "same-resolved-workspace",
+      "explicit_workspace": "absolute-existing-directory-final-component-not-symlink"
+    },
     "config_env": "KILO_CONFIG",
     "config_path": "xdg-config/kilo/kilo.jsonc",
     "isolated_child_home": true,
@@ -36,14 +48,19 @@
     "forwards_child_exit_code": true,
     "lifecycle_lock": "persistent-flock-held-through-child",
     "bootstrap_lock": {
-      "kind": "external-product-uid-flock",
+      "kind": "external-product-anchor-and-persistent-target-flock",
       "system_root": "fixed-real-sticky-system-temp",
       "macos_system_root": "/private/tmp",
       "ubuntu_system_root": "/tmp",
       "product_root_mode": "0700",
+      "product_anchor": "global.lock",
+      "target_anchor_root": "targets",
       "file_mode": "0600",
       "filename": "sha256-product-namespace-and-canonical-target",
       "target_binding": "json-product-canonical-target-and-sha256",
+      "anchor_publication": "native-rename-no-replace-complete-binding",
+      "empty_or_partial_final_binding": "fail-closed",
+      "stage_alias_recovery": "exclusive-mutator-only-exact-payload",
       "binding_exact": true,
       "binding_revalidated_before_yield": true,
       "fd_path_inode_revalidated_before_yield": true,
@@ -183,6 +200,23 @@
     "entrypoint_kind": "target-owned-native-wrapper",
     "native_executable_policy": "selected-native-package-bin-kilo",
     "target_owned": true
+  },
+  "cleanup_lifecycle": {
+    "kind": "durable-intent-and-immutable-pending-journal",
+    "root": ".nddev-kilo-cli-cleanup",
+    "intent": "intent.json",
+    "journal": "journal.json",
+    "tombstone": "tombstone",
+    "schema_version": 1,
+    "publication": "native-rename-no-replace-complete-binding",
+    "prepare_before_first_move": true,
+    "mutation_drains_first": true,
+    "read_only_repairs": false,
+    "top_level_cleanup_pending": true,
+    "malformed_state": "fail-closed-exit-2-no-mutation",
+    "max_paths": 120538,
+    "max_bytes": 1346371584,
+    "serialized_max_bytes": 8388608
   },
   "builder": {
     "enabled_by_default": true,
