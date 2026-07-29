@@ -39,6 +39,7 @@ LEGACY_SETUPS = nddev_kilo_cli.LEGACY_SETUP_IDS
 MANAGED_FILES = nddev_kilo_cli.MANAGED_FILES
 REAL_BOOTSTRAP_LOCK_PARENT = nddev_kilo_cli.bootstrap_lock_parent
 EXPECTED_BOOTSTRAP_LOCK = dict(nddev_kilo_cli.BOOTSTRAP_LOCK_CONTRACT)
+EXPECTED_CLEANUP_LIFECYCLE = dict(nddev_kilo_cli.CLEANUP_JOURNAL_CONTRACT)
 FORBIDDEN_BOOTSTRAP_OVERRIDE_NAMES = nddev_kilo_cli.FORBIDDEN_BOOTSTRAP_LOCK_ENV_NAMES
 CONTRACT_KEYS = {
     "contract_version",
@@ -50,6 +51,7 @@ CONTRACT_KEYS = {
     "setup_system",
     "managed_state",
     "software_lifecycle",
+    "cleanup_lifecycle",
     "builder",
     "safety",
 }
@@ -179,6 +181,8 @@ def validate_versions() -> None:
         fail("manifest software path bound mismatch")
     if "stage_version_probe_timeout_seconds" in software.get("bounds", {}):
         fail("manifest must not declare an install-time target binary probe")
+    if manifest.get("cleanup_lifecycle") != EXPECTED_CLEANUP_LIFECYCLE:
+        fail("manifest cleanup lifecycle contract mismatch")
 
 
 def validate_contract() -> None:
@@ -277,6 +281,8 @@ def validate_contract() -> None:
         fail("software lifecycle entrypoint kind mismatch")
     if software.get("native_executable_policy") != "selected-native-package-bin-kilo":
         fail("software lifecycle native executable policy mismatch")
+    if contract.get("cleanup_lifecycle") != EXPECTED_CLEANUP_LIFECYCLE:
+        fail("cleanup lifecycle contract mismatch")
     builder = contract.get("builder", {})
     if builder.get("projection") != nddev_kilo_cli.BUILDER_PROJECTION:
         fail("builder projection mismatch")
@@ -3092,6 +3098,172 @@ def validate_lock_and_backup_precreation_guards() -> None:
             fail("world-writable backup pool was accepted")
 
 
+def write_cleanup_source(target: Path, *, backup_slot: int | None = None) -> tuple[str, Path]:
+    if backup_slot is None:
+        source = nddev_kilo_cli.software_stage_root(target)
+        kind = "software-staging"
+    else:
+        pool = nddev_kilo_cli.backup_pool(target)
+        pool.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE, exist_ok=True)
+        pool.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        source = pool / str(backup_slot)
+        kind = f"retired-backup-slot-{backup_slot}"
+    source.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    source.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    child = source / "payload"
+    child.write_bytes(b"cleanup-payload\n")
+    child.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+    nested = source / "nested"
+    nested.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    nested.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    nested_file = nested / "data"
+    nested_file.write_bytes(b"nested\n")
+    nested_file.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+    return kind, source
+
+
+def publish_cleanup_intent_after_move_without_journal(
+    target: Path,
+    kind: str,
+    source: Path,
+) -> None:
+    root = nddev_kilo_cli.cleanup_root_path(target)
+    root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    tombstone = nddev_kilo_cli.cleanup_tombstone_path(target)
+    tombstone.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+    tombstone.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+    entry = {"kind": kind, "tombstone": f"0-{kind}"}
+    intent_entries = nddev_kilo_cli.cleanup_intent_entries(target, [entry], [(kind, source)])
+    content = nddev_kilo_cli.cleanup_intent_content(target, "prepare-smoke", intent_entries)
+    nddev_kilo_cli.publish_cleanup_file_no_replace(
+        root,
+        nddev_kilo_cli.CLEANUP_INTENT_NAME,
+        content,
+        "cleanup pending intent",
+    )
+    destination = tombstone / entry["tombstone"]
+    if not nddev_kilo_cli.rename_no_replace(source, destination, "cleanup test tombstone"):
+        fail("cleanup prepare test tombstone destination already existed")
+    nddev_kilo_cli.fsync_directory(tombstone)
+    nddev_kilo_cli.fsync_directory(source.parent)
+
+
+def validate_cleanup_prepare_recovery_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-prepare-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        publish_cleanup_intent_after_move_without_journal(target, kind, source)
+        before_read = snapshot_tree(target)
+        expect_manager_error("read-only cleanup intent without journal", lambda: nddev_kilo_cli.status_payload(target))
+        if snapshot_tree(target) != before_read:
+            fail("read-only cleanup intent recovery mutated target state")
+        if nddev_kilo_cli.drain_cleanup_before_mutation(target):
+            fail("cleanup prepare recovery left pending state")
+        if nddev_kilo_cli.cleanup_root_path(target).exists():
+            fail("cleanup prepare recovery left cleanup root")
+
+
+def validate_cleanup_postcommit_failure_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-postcommit-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        original_remove = nddev_kilo_cli.remove_exact_cleanup_entry
+        calls = {"value": 0}
+
+        def fail_first_remove(path: Path, record: dict[str, Any]) -> None:
+            calls["value"] += 1
+            if calls["value"] == 1:
+                raise nddev_kilo_cli.ManagerError("injected cleanup drain failure")
+            original_remove(path, record)
+
+        nddev_kilo_cli.remove_exact_cleanup_entry = fail_first_remove
+        try:
+            pending = nddev_kilo_cli.finish_post_commit_cleanup(target, "postcommit-smoke", [(kind, source)])
+        finally:
+            nddev_kilo_cli.remove_exact_cleanup_entry = original_remove
+        if not pending:
+            fail("postcommit cleanup failure did not report cleanup_pending")
+        status = nddev_kilo_cli.status_payload(target)
+        plan = nddev_kilo_cli.plan_payload(
+            target,
+            nddev_kilo_cli.DEFAULT_SETUP_ID,
+            nddev_kilo_cli.DEFAULT_PROFILE_ID,
+        )
+        if status.get("cleanup_pending") is not True or plan.get("cleanup_pending") is not True:
+            fail("status/plan did not expose valid cleanup_pending")
+        if nddev_kilo_cli.drain_cleanup_before_mutation(target):
+            fail("postcommit cleanup retry left pending state")
+
+
+def validate_cleanup_replacement_preservation_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-replace-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target, backup_slot=0)
+        nddev_kilo_cli.promote_cleanup_tombstone(target, "replace-smoke", [(kind, source)])
+        payload = nddev_kilo_cli.cleanup_tombstone_path(target) / f"0-{kind}" / "payload"
+        payload.write_bytes(b"same-uid replacement\n")
+        payload.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = snapshot_tree(target)
+        expect_manager_error("replaced cleanup tombstone", lambda: nddev_kilo_cli.drain_cleanup_pending(target))
+        if snapshot_tree(target) != before:
+            fail("cleanup drain changed a replaced tombstone")
+
+
+def validate_cleanup_malformed_fail_closed_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-malformed-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        root = nddev_kilo_cli.cleanup_root_path(target)
+        root.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        root.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        journal = nddev_kilo_cli.cleanup_journal_path(target)
+        journal.write_bytes(b"{\"schema_version\":999}\n")
+        journal.chmod(nddev_kilo_cli.OWNER_FILE_MODE)
+        before = snapshot_tree(target)
+        expect_manager_error("malformed cleanup journal status", lambda: nddev_kilo_cli.status_payload(target))
+        expect_manager_error(
+            "malformed cleanup journal plan",
+            lambda: nddev_kilo_cli.plan_payload(
+                target,
+                nddev_kilo_cli.DEFAULT_SETUP_ID,
+                nddev_kilo_cli.DEFAULT_PROFILE_ID,
+            ),
+        )
+        expect_manager_error("malformed cleanup journal mutation", lambda: nddev_kilo_cli.drain_cleanup_before_mutation(target))
+        if snapshot_tree(target) != before:
+            fail("malformed cleanup journal path was mutated")
+
+
+def validate_cleanup_repeated_drain_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-kilo-public-cleanup-repeat-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=nddev_kilo_cli.OWNER_DIR_MODE)
+        target.chmod(nddev_kilo_cli.OWNER_DIR_MODE)
+        target = target.resolve(strict=False)
+        kind, source = write_cleanup_source(target)
+        nddev_kilo_cli.promote_cleanup_tombstone(target, "repeat-smoke", [(kind, source)])
+        drained, pending = nddev_kilo_cli.drain_cleanup_pending(target)
+        if not drained or pending:
+            fail("cleanup first drain did not complete")
+        drained, pending = nddev_kilo_cli.drain_cleanup_pending(target)
+        if drained or pending:
+            fail("cleanup second drain was not an exact no-op")
+        if nddev_kilo_cli.cleanup_root_path(target).exists():
+            fail("cleanup repeated drain left residue")
+
+
 def validate_sticky_tmp_target() -> None:
     candidates = [Path("/tmp"), Path(tempfile.gettempdir())]
     tmp = next((path for path in candidates if path.exists()), candidates[-1])
@@ -3228,6 +3400,11 @@ def run_all_validations(injected_bootstrap_parent: Path) -> None:
         validate_wrong_platform_native_regression()
         validate_private_target_required()
         validate_lock_and_backup_precreation_guards()
+        validate_cleanup_prepare_recovery_smoke()
+        validate_cleanup_postcommit_failure_smoke()
+        validate_cleanup_replacement_preservation_smoke()
+        validate_cleanup_malformed_fail_closed_smoke()
+        validate_cleanup_repeated_drain_smoke()
         validate_bootstrap_anchor_publication_static_contract()
         validate_sticky_tmp_target()
         validate_fake_path_is_ignored()
