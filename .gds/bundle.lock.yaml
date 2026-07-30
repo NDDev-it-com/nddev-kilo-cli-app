@@ -1,0 +1,20 @@
+# GENERATED FILE - DO NOT EDIT DIRECTLY
+schema_version: 1
+
+bundle:
+  version: "0.1.0-dev"
+  release_sequence: 0
+  channel: "development"
+  source_commit: "97e8bbaa3a0734b156b03bad704503bc46d7575b"
+  digest: "sha256:fd66beb15c847e94b68a00083df5f218c22f4e1174d39d4bd10ed7fb321b13bc"
+
+projection:
+  input_digest: "sha256:4ae5175926f49a98f7fb36132271f9773900dd5d4acff98f9ffa367645924b56"
+  output_digest: "sha256:be223ac71fec634fe251cee9c829a2e75c9609dada9f7ac5b887a23c1ec3d2a0"
+  files:
+    - path: ".claude/CLAUDE.md"
+      digest: "sha256:bfe23b7dece06b1d85b0ada9b7b3034b5eaf8fbf208ab9612deefd604fcd93f7"
+    - path: ".gds/compiled-policy.json"
+      digest: "sha256:3337cedb0109095ea4cf735a778093c626e232cd3adcf0c8473a0874a0af5f34"
+    - path: "AGENTS.md"
+      digest: "sha256:02fbca9db1beaf6fe1686d6efb044bd402a914ce558073850c15bd919751461a"
