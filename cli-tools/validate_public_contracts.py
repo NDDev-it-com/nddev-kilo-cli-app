@@ -35,13 +35,36 @@ REQUIRED_MANAGER_FUNCTIONS = {
 PRIVATE_PARTS = {"validation", ".agents", ".serena", "__pycache__", ".pytest_cache"}
 SHARED_WORKFLOW_PIN = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
 RELEASE_ARCHIVE_ROOTS = {
-    ".claude", ".gds", ".github", "AGENTS.md", "CHANGELOG.md", "LICENSE",
-    "README.md", "SECURITY.md", "VERSION", "build", "cli-tools", "config",
-    "docs", "profiles", "references", "setups",
+    ".claude",
+    ".gds",
+    ".github",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "VERSION",
+    "build",
+    "cli-tools",
+    "config",
+    "docs",
+    "profiles",
+    "references",
+    "setups",
 }
 RELEASE_RUNTIME_ROOTS = {
-    ".claude", "AGENTS.md", "LICENSE", "README.md", "VERSION", "build", "cli-tools",
-    "config", "docs", "profiles", "references", "setups",
+    ".claude",
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "VERSION",
+    "build",
+    "cli-tools",
+    "config",
+    "docs",
+    "profiles",
+    "references",
+    "setups",
 }
 
 
@@ -221,8 +244,14 @@ def validate_release_and_workflows() -> None:
     lines = release.splitlines()
     archive_index = next(i for i, line in enumerate(lines) if "archive_paths:" in line)
     runtime_index = next(i for i, line in enumerate(lines) if "runtime_paths:" in line)
-    archive = set(" ".join(line.strip() for line in lines[archive_index + 1:runtime_index]).split())
-    runtime = set(" ".join(line.strip() for line in lines[runtime_index + 1:] if line.startswith("        ")).split())
+    archive = set(
+        " ".join(line.strip() for line in lines[archive_index + 1 : runtime_index]).split()
+    )
+    runtime = set(
+        " ".join(
+            line.strip() for line in lines[runtime_index + 1 :] if line.startswith("        ")
+        ).split()
+    )
     if not RELEASE_ARCHIVE_ROOTS.issubset(archive):
         fail(f"release archive roots are incomplete: {sorted(RELEASE_ARCHIVE_ROOTS - archive)}")
     if not RELEASE_RUNTIME_ROOTS.issubset(runtime):

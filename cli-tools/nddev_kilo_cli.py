@@ -783,9 +783,7 @@ def native_package_matrix() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     if not isinstance(production, dict) or not isinstance(optional, dict):
         fail("Kilo CLI baseline native package records are invalid")
     if not all(
-        isinstance(package, str)
-        and isinstance(version, str)
-        and version == KILO_CURRENT_VERSION
+        isinstance(package, str) and isinstance(version, str) and version == KILO_CURRENT_VERSION
         for package, version in optional.items()
     ):
         fail("Kilo CLI baseline native optional dependency map is invalid")
