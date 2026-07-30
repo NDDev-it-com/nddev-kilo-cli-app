@@ -323,11 +323,6 @@
       }
     }
   },
-  "latest_release_observation": {
-    "cli_source": "https://registry.npmjs.org/@kilocode/cli",
-    "non_cli_source_not_used": "https://api.github.com/repos/Kilo-Org/kilocode/releases/latest",
-    "reason": "GitHub releases/latest can point at non-CLI artifacts such as JetBrains releases."
-  },
   "native_surfaces": {
     "config_schema": "https://app.kilo.ai/config.json",
     "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/config.ts",
