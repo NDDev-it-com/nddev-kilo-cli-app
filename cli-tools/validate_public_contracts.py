@@ -7,6 +7,7 @@ import argparse
 import ast
 import json
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -251,6 +252,12 @@ def validate_runtime_integrity_sources() -> None:
 
 
 def validate_public_surface() -> None:
+    claude = ROOT / ".claude"
+    if not stat.S_ISDIR(claude.lstat().st_mode) or claude.is_symlink():
+        fail(".claude must be a real directory")
+    if sorted(path.name for path in claude.iterdir()) != ["CLAUDE.md"]:
+        fail(".claude must contain exactly CLAUDE.md")
+    require_file("AGENTS.md")
     bridge = require_file(".claude/CLAUDE.md")
     if bridge.read_bytes() != b"@../AGENTS.md\n":
         fail("Claude bridge must point to AGENTS.md")
