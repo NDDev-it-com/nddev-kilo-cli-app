@@ -10,12 +10,12 @@
   },
   "npm": {
     "package": "@kilocode/cli",
-    "version": "7.4.16",
+    "version": "7.4.17",
     "dist_tags": {
       "alpha": "0.0.5",
       "next": "1.0.8",
       "rc": "7.4.13",
-      "latest": "7.4.16"
+      "latest": "7.4.17"
     },
     "bin": {
       "kilo": "bin/kilo",
@@ -25,7 +25,7 @@
       "postinstall": "node ./postinstall.mjs"
     },
     "postinstall_analysis": {
-      "source": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
+      "source": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
       "observed_at": "2026-07-28",
       "executes_node_code": true,
       "executes_native_binary": true,
@@ -35,15 +35,15 @@
       "managed_policy": "verify pinned JS and selected native package tarballs before extracting local bytes without lifecycle scripts"
     },
     "dist": {
-      "integrity": "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/nk0OGNO1kRaygEyc7+Htr2Q==",
-      "shasum": "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d",
-      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.16.tgz",
-      "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.16"
+      "integrity": "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BAFoYbz8xTqkgqpkZxzwZ8MA==",
+      "shasum": "046eda3dcaa4df0e68ccf869f3ef88d37898e12c",
+      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
+      "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.17"
     },
     "native_packages": {
       "catalog": {
         "@kilocode/cli-darwin-arm64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -52,13 +52,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-m+YADdbjJExwetzk45ldWmSW1CDtbpH5Ib+gQgRQYTKP6HGT3kgz1HBkW6koGyW3Y2NmVxdA9IZ4Oh33oTB2tA==",
-            "shasum": "071d3724f0c3833df331e7e26077ba46feb67858",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.16.tgz"
+            "integrity": "sha512-MGIaXFRP6AZ9Mo/2qjkTq1ndYEvAVFhGzNtbEBxYqvfdbPn4lbe4vg29b5ionly3prhdMKthzlCba2CvxL8JJQ==",
+            "shasum": "6dbd195b4e7a9cffb10e7d26e6d1f6dcb5b270af",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-darwin-x64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -67,13 +67,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-+4VqpJ3HQKRSWUDUYswA9J50drgavucWC2Gg5NDgmI+MybYbLQDawU4qSO3GCr5qsER3rmMsMppxW2skH05Vtw==",
-            "shasum": "d21f40963036f373f5625fae7c2614d18c6000bc",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.16.tgz"
+            "integrity": "sha512-Sra1gT2gHkejiZFIJftoySM6pAW7Yyz1Uzi2sz5plLF72TgfKL2RIeK02rzPQ02u4IJ6rLyoft6WvsthAIPBQw==",
+            "shasum": "8996784b2b9cee5b529c6ca0947c48f0c8ec8cd3",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-darwin-x64-baseline": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -82,13 +82,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-07TwFGTRNsx10KxFdE4pqDe58ftnN+wQGiEiWOz7aehtEbqilPelCEtotDOwq1Qtur7s4UrFSFajd+s7GtpX+w==",
-            "shasum": "35a346847260d8a143b30a8db960d332fa3467df",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.16.tgz"
+            "integrity": "sha512-4Oc1OQHOsGCimiXBkEWYr2ibda8eim948uFyAq3y1Sx4dPupq7ORK0l6bk3OlK+w3ELcGl6iGEfv0vcUkpW6ow==",
+            "shasum": "ed8e8026710c365ff5239fd6fbe3506a9c1f039b",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-arm64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -97,13 +97,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-RXgMU29amB6zs6M5UgtyDRXduKGUDNDOjxDY2/SFhQ7BHshB3USSWseQH9n4kLU5+qoPUBUb0gxgSj1N0t2kwQ==",
-            "shasum": "35a6bf77c8ed0b5c2d85f115fae97ba2719b4920",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.16.tgz"
+            "integrity": "sha512-mn3vMVNChjp6NyXblStrNLJp0ftq6xfwo8i/sZFVKO9w+WSK50dK3GtMw+358Z95QQ/CfvHiNl4F1nq5g7u3Sg==",
+            "shasum": "e30ed504b5c054ac5087fba3772a0cf615e4afb0",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-arm64-musl": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -114,13 +114,13 @@
             "musl"
           ],
           "dist": {
-            "integrity": "sha512-4tT24ZzFRVZ8jLTXhVnTZG1oErlxTdGX0fKOI/4pH/fUXUmRGOyrgeJwqyY9kDpklDtDN90AQZADgxEIBitWYw==",
-            "shasum": "8bc8cc53be649558e1b066b5818063e6b78163e7",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64-musl/-/cli-linux-arm64-musl-7.4.16.tgz"
+            "integrity": "sha512-nf5hx5OSdygy5cxT/yc8xSX+Jp8AqeHbtPy0uBvPlT4/YfMoHJSWtR4NlTpOVTanG5fYp8ooxJaLKzRd1MjoHQ==",
+            "shasum": "f9c487afdb46e8e78a764ff669ef84d72fc67224",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64-musl/-/cli-linux-arm64-musl-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -129,13 +129,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-jO20+U1htCyp0UPSrzCE8yNycg01QpGiuYajsDMxY5dTql8CoaHukPtqtDtMIm1UgYKdImL2YAhXqbu1YxF8SA==",
-            "shasum": "2975588f4efc5a45374a6b7b9670689d2c90f78a",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.16.tgz"
+            "integrity": "sha512-1VuVYJVVwQdrgk5r8/sUbge2zWcnKAlLJt3/Ds8RqbsupC1Te/zwOb1NCEklyKJFVNy7/yyZGnCwASPlRAPUeg==",
+            "shasum": "b958d18f202396e59658c8dbd20928b2864c565e",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64-baseline": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -144,13 +144,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-LLTctqZQADOp3MS2jHq3ELiVP46L05KuEg6DymvS2h78aAIC5b4f0jGlpgTME5meHmq9dozrDQrG9JWKlDXckQ==",
-            "shasum": "0499983060cf670a39a8014061043781bada66a1",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.16.tgz"
+            "integrity": "sha512-s9A/YfNGKhAFcWVtvBKf6n8nOnh0X/MrX+3EXI4FM7ELx6QuzkPgwH6OSR6+glp7yP7P67eBpSpVBDulNiJZqg==",
+            "shasum": "f485e814bbc7363809671fac45ee4a83458e5903",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64-baseline-musl": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -161,13 +161,13 @@
             "musl"
           ],
           "dist": {
-            "integrity": "sha512-LZ8Ry5VWF/osxPPfPtH5viZ1D6wdGm75vth2n4ddbtZsCvrcVpEbGK/Gjf5q06rh5ujZzUA++c0xvLIKBM9ZEA==",
-            "shasum": "77cbec06657cfa07d44987abe56890d9f0324d6f",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline-musl/-/cli-linux-x64-baseline-musl-7.4.16.tgz"
+            "integrity": "sha512-7u/tvFGWMbreuhSsRR5bdg7zfp467dI/EZ5vD8pilF3eXRd7qUtZ/hIXQZUOgY+Tff56S8oQnKWATq2NRqaUZw==",
+            "shasum": "7fc19d29ba00b8deda411b1c928037d0ad82e086",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline-musl/-/cli-linux-x64-baseline-musl-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64-musl": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -178,13 +178,13 @@
             "musl"
           ],
           "dist": {
-            "integrity": "sha512-z1byOIz81nsprwHz8fPIde6JWY0iTv0hiEEP4SqJg8oFGAHyK7Khu7uV8rMhJ8RyOQsb4dcpr6VWanEslWcBnQ==",
-            "shasum": "13969db6562db7f7b33b23a5b09f1b1b8874f054",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-musl/-/cli-linux-x64-musl-7.4.16.tgz"
+            "integrity": "sha512-NH0AZSMmhj6W1Thz8JvseR/zM48kDYU8rkhBnPtabT66FIPLJ5g/aJYGugXH9gCOB7TFlNdrdmSFZAKzCFUp/g==",
+            "shasum": "350107d8abfd46a71b46d239031e3e8aa26ba8b9",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-musl/-/cli-linux-x64-musl-7.4.17.tgz"
           }
         },
         "@kilocode/cli-windows-arm64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "win32"
           ],
@@ -193,13 +193,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-2NUwUW93yPYR8O6neQ+F6CAGRQIR613efDucemPzfa1bknenMr+y91+8yuRcz/HTgXL0+01bW7g6F8w0i2Pptw==",
-            "shasum": "26da7dc29f6d769860d6777dab6a37388cc0eac0",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-arm64/-/cli-windows-arm64-7.4.16.tgz"
+            "integrity": "sha512-1CWe7kunycJTcBMW4i04tknAfuWeMr93yw5n5Z4y6L8f1eavcqWeyg5+14b0Auq2dL9dkgbYRxeIzY9ivBg8pA==",
+            "shasum": "2ab4089f5b2479a818bbdd40eb141079f6a7aa2f",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-arm64/-/cli-windows-arm64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-windows-x64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "win32"
           ],
@@ -208,13 +208,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-XojHS5kN8UmXkhVbVpqSdu01gxsrvGKrECasEb2VK80ZBPa3C3qMAL5SNUE5F34kK2+DSqDXyj8Rfq5UiFmyug==",
-            "shasum": "10d9f101a6659fc1f50680b885ca3118fe3be9bc",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64/-/cli-windows-x64-7.4.16.tgz"
+            "integrity": "sha512-7epH+qp+9kndZt3PDOSvsu+Soc91D/c29JwTipdQOp0UVh3/27qZ5Ktvd2LGISl27BCxqUEu0ZL0x9qzwBru/A==",
+            "shasum": "92906ad3a2d4c970c6a637f9fe4032f01a51ac5c",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64/-/cli-windows-x64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-windows-x64-baseline": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "win32"
           ],
@@ -223,15 +223,15 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-R8Qa29BauHVkkMzLIFoNz86XItvePVG7QqtxeyqFAgWN7bGjhFN1fauxQaza9QgLhiUKLOiz+HE/HTKM7Uqv8g==",
-            "shasum": "6428ce2e2bf75e8ab285c52dbe8d1dd2c2f747c0",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64-baseline/-/cli-windows-x64-baseline-7.4.16.tgz"
+            "integrity": "sha512-BfF38WIj4k7oYKSIDmbhzKxqkbH8W0Bj7OmhDnFzeb8hLi1XmW4sEVcKoSKwDKXdNQE0BygvTlDtz6yQ+O2S6Q==",
+            "shasum": "8c8136675175d4d83ffc2ae2d912b071d8897fe2",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-windows-x64-baseline/-/cli-windows-x64-baseline-7.4.17.tgz"
           }
         }
       },
       "production": {
         "@kilocode/cli-darwin-arm64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -240,13 +240,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-m+YADdbjJExwetzk45ldWmSW1CDtbpH5Ib+gQgRQYTKP6HGT3kgz1HBkW6koGyW3Y2NmVxdA9IZ4Oh33oTB2tA==",
-            "shasum": "071d3724f0c3833df331e7e26077ba46feb67858",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.16.tgz"
+            "integrity": "sha512-MGIaXFRP6AZ9Mo/2qjkTq1ndYEvAVFhGzNtbEBxYqvfdbPn4lbe4vg29b5ionly3prhdMKthzlCba2CvxL8JJQ==",
+            "shasum": "6dbd195b4e7a9cffb10e7d26e6d1f6dcb5b270af",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-darwin-x64-baseline": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -255,13 +255,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-07TwFGTRNsx10KxFdE4pqDe58ftnN+wQGiEiWOz7aehtEbqilPelCEtotDOwq1Qtur7s4UrFSFajd+s7GtpX+w==",
-            "shasum": "35a346847260d8a143b30a8db960d332fa3467df",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.16.tgz"
+            "integrity": "sha512-4Oc1OQHOsGCimiXBkEWYr2ibda8eim948uFyAq3y1Sx4dPupq7ORK0l6bk3OlK+w3ELcGl6iGEfv0vcUkpW6ow==",
+            "shasum": "ed8e8026710c365ff5239fd6fbe3506a9c1f039b",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.17.tgz"
           }
         },
         "@kilocode/cli-darwin-x64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "darwin"
           ],
@@ -270,13 +270,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-+4VqpJ3HQKRSWUDUYswA9J50drgavucWC2Gg5NDgmI+MybYbLQDawU4qSO3GCr5qsER3rmMsMppxW2skH05Vtw==",
-            "shasum": "d21f40963036f373f5625fae7c2614d18c6000bc",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.16.tgz"
+            "integrity": "sha512-Sra1gT2gHkejiZFIJftoySM6pAW7Yyz1Uzi2sz5plLF72TgfKL2RIeK02rzPQ02u4IJ6rLyoft6WvsthAIPBQw==",
+            "shasum": "8996784b2b9cee5b529c6ca0947c48f0c8ec8cd3",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-arm64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -285,13 +285,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-RXgMU29amB6zs6M5UgtyDRXduKGUDNDOjxDY2/SFhQ7BHshB3USSWseQH9n4kLU5+qoPUBUb0gxgSj1N0t2kwQ==",
-            "shasum": "35a6bf77c8ed0b5c2d85f115fae97ba2719b4920",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.16.tgz"
+            "integrity": "sha512-mn3vMVNChjp6NyXblStrNLJp0ftq6xfwo8i/sZFVKO9w+WSK50dK3GtMw+358Z95QQ/CfvHiNl4F1nq5g7u3Sg==",
+            "shasum": "e30ed504b5c054ac5087fba3772a0cf615e4afb0",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64-baseline": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -300,13 +300,13 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-LLTctqZQADOp3MS2jHq3ELiVP46L05KuEg6DymvS2h78aAIC5b4f0jGlpgTME5meHmq9dozrDQrG9JWKlDXckQ==",
-            "shasum": "0499983060cf670a39a8014061043781bada66a1",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.16.tgz"
+            "integrity": "sha512-s9A/YfNGKhAFcWVtvBKf6n8nOnh0X/MrX+3EXI4FM7ELx6QuzkPgwH6OSR6+glp7yP7P67eBpSpVBDulNiJZqg==",
+            "shasum": "f485e814bbc7363809671fac45ee4a83458e5903",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.17.tgz"
           }
         },
         "@kilocode/cli-linux-x64": {
-          "version": "7.4.16",
+          "version": "7.4.17",
           "os": [
             "linux"
           ],
@@ -315,9 +315,9 @@
           ],
           "libc": null,
           "dist": {
-            "integrity": "sha512-jO20+U1htCyp0UPSrzCE8yNycg01QpGiuYajsDMxY5dTql8CoaHukPtqtDtMIm1UgYKdImL2YAhXqbu1YxF8SA==",
-            "shasum": "2975588f4efc5a45374a6b7b9670689d2c90f78a",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.16.tgz"
+            "integrity": "sha512-1VuVYJVVwQdrgk5r8/sUbge2zWcnKAlLJt3/Ds8RqbsupC1Te/zwOb1NCEklyKJFVNy7/yyZGnCwASPlRAPUeg==",
+            "shasum": "b958d18f202396e59658c8dbd20928b2864c565e",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.17.tgz"
           }
         }
       }
@@ -325,8 +325,8 @@
   },
   "native_surfaces": {
     "config_schema": "https://app.kilo.ai/config.json",
-    "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/config.ts",
-    "config_parser": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/config/parse.ts",
+    "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/config.ts",
+    "config_parser": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/config/parse.ts",
     "config_file": "~/.config/kilo/kilo.jsonc",
     "trusted_config_env": "KILO_CONFIG",
     "permission": "permission values use ask, allow, and deny actions",
@@ -343,13 +343,13 @@
   "sources": [
     "https://kilo.ai/docs/code-with-ai/platforms/cli",
     "https://kilo.ai/docs/automate/extending/plugins",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/kilo-docs/markdoc/partials/install-cli.md",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/kilo-docs/markdoc/partials/install-cli.md",
     "https://registry.npmjs.org/@kilocode/cli",
-    "https://registry.npmjs.org/@kilocode%2fcli/7.4.16",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/config.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/core/src/v1/config/plugin.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/config/plugin.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/plugin/loader.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.16/packages/opencode/src/plugin/shared.ts"
+    "https://registry.npmjs.org/@kilocode%2fcli/7.4.17",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/config.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/plugin/loader.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/plugin/shared.ts"
   ]
 }

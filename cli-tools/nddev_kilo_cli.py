@@ -120,21 +120,21 @@ CONFIG_MANAGED_KEYS = (
     "experimental",
 )
 BUILDER_PROJECTION = "native-agent-skill-command-plugin-config"
-KILO_CURRENT_VERSION = "7.4.16"
+KILO_CURRENT_VERSION = "7.4.17"
 KILO_PACKAGE = "@kilocode/cli"
 KILO_COMMAND = "kilo"
 KILO_PACKAGE_SPEC = f"{KILO_PACKAGE}@{KILO_CURRENT_VERSION}"
 NPM_REGISTRY = "https://registry.npmjs.org/"
-KILO_PACKAGE_METADATA_URL = "https://registry.npmjs.org/@kilocode%2fcli/7.4.16"
+KILO_PACKAGE_METADATA_URL = "https://registry.npmjs.org/@kilocode%2fcli/7.4.17"
 ALLOWED_SYSTEM_SYMLINK_ANCESTORS = {
     Path("/tmp"): Path("/private/tmp"),
     Path("/var"): Path("/private/var"),
 }
 KILO_PACKAGE_INTEGRITY = (
-    "sha512-sOvq0HW6CZebCvGyUn0fTFj/1mX4nplpuoCJuqe6QjDUliLNYRC6ky9Rjl8kdT/"
-    "nk0OGNO1kRaygEyc7+Htr2Q=="
+    "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BA"
+    "FoYbz8xTqkgqpkZxzwZ8MA=="
 )
-KILO_PACKAGE_SHASUM = "c39f0f94f1cae2aeed28b4a5b5a952a5efab2b1d"
+KILO_PACKAGE_SHASUM = "046eda3dcaa4df0e68ccf869f3ef88d37898e12c"
 PRODUCTION_HOSTS = {
     "macos-arm64": {
         "os": "darwin",
