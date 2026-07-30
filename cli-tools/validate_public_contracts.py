@@ -40,7 +40,7 @@ RELEASE_ARCHIVE_ROOTS = {
     "docs", "profiles", "references", "setups",
 }
 RELEASE_RUNTIME_ROOTS = {
-    ".claude", "LICENSE", "README.md", "VERSION", "build", "cli-tools",
+    ".claude", "AGENTS.md", "LICENSE", "README.md", "VERSION", "build", "cli-tools",
     "config", "docs", "profiles", "references", "setups",
 }
 
