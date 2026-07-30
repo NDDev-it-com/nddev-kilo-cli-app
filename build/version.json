@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "build_version": "0.2.0",
+  "build_version": "0.3.0",
   "kilo_cli_current": "7.4.17",
   "kilo_cli_min": "7.4.17",
   "kilo_cli_package": "@kilocode/cli",

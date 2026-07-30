@@ -764,7 +764,7 @@ def read_json_file(
 
 def baseline() -> dict[str, Any]:
     value = read_json_file(BASELINE_PATH, "Kilo CLI baseline", max_bytes=METADATA_MAX_BYTES)
-    if value.get("schema_version") != 2:
+    if value.get("schema_version") != 3:
         fail("Kilo CLI baseline schema is unsupported")
     npm = value.get("npm")
     if not isinstance(npm, dict):

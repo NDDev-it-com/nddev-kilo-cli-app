@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "product_name": "nddev-kilo-cli-app",
-  "build_version": "0.2.0",
+  "build_version": "0.3.0",
   "runtime_baseline": "references/kilo-cli-baseline.json",
   "contract": "config/nddev-contract.json",
   "manager": "cli-tools/nddev_kilo_cli.py",

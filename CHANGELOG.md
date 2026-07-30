@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Correct the runtime baseline schema to 3, the public contract version to 3,
+  and the build manifest schema to 2.
+- Keep release metadata in lockstep at 0.3.0.
+- Migration: consumers that validate public metadata must accept baseline and
+  contract schema 3 and build manifest schema 2 before upgrading.
+
 ## 0.2.0
 
 - Replace setup variants with one `nddev-builder` setup and orthogonal
