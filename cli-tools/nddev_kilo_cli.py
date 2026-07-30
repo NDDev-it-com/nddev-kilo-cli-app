@@ -774,20 +774,29 @@ def baseline() -> dict[str, Any]:
     return value
 
 
-def native_package_matrix() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def native_package_matrix() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     native = baseline().get("npm", {}).get("native_packages")
     if not isinstance(native, dict):
         fail("Kilo CLI baseline omits native package records")
     production = native.get("production")
-    catalog = native.get("catalog")
-    if not isinstance(production, dict) or not isinstance(catalog, dict):
+    optional = native.get("optional_dependencies")
+    if not isinstance(production, dict) or not isinstance(optional, dict):
         fail("Kilo CLI baseline native package records are invalid")
-    return production, catalog
+    if not all(
+        isinstance(package, str)
+        and isinstance(version, str)
+        and version == KILO_CURRENT_VERSION
+        for package, version in optional.items()
+    ):
+        fail("Kilo CLI baseline native optional dependency map is invalid")
+    if not set(production).issubset(optional):
+        fail("Kilo CLI production native packages are missing from optional dependencies")
+    return production, optional
 
 
-def native_package_catalog() -> dict[str, dict[str, Any]]:
-    _production, catalog = native_package_matrix()
-    return catalog
+def production_native_packages() -> dict[str, dict[str, Any]]:
+    production, _optional = native_package_matrix()
+    return production
 
 
 def package_name_from_lock_path(path: str) -> str | None:
@@ -957,7 +966,7 @@ def native_record_matches_platform(record: dict[str, Any], host: dict[str, Any])
 
 
 def expected_native_records_for_host() -> dict[str, dict[str, Any]]:
-    production, _catalog = native_package_matrix()
+    production = production_native_packages()
     host = require_supported_production_platform()
     matches = {
         package: record
@@ -978,7 +987,7 @@ def native_package_preference_order(host: dict[str, Any]) -> tuple[str, ...]:
 
 
 def selected_native_package_name_for_host(host: dict[str, Any]) -> str:
-    production, _catalog = native_package_matrix()
+    production = production_native_packages()
     for package in native_package_preference_order(host):
         if package in production:
             return package
@@ -5096,8 +5105,8 @@ def verify_registry_metadata(metadata: dict[str, Any]) -> None:
     scripts = metadata.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
         fail("npm registry metadata vendor lifecycle script baseline changed")
-    supported, unsupported = native_package_matrix()
-    expected_native = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    _supported, unsupported = native_package_matrix()
+    expected_native = unsupported
     optional = metadata.get("optionalDependencies")
     if optional != expected_native:
         fail("npm registry metadata native optional dependency map is not synchronized")
@@ -5253,7 +5262,7 @@ def write_verified_package_lock(live_stage: Path, selected_native: str) -> None:
                 "integrity": package_dist["integrity"],
                 "bin": {"kilo": "bin/kilo", "kilocode": "bin/kilo"},
                 "optionalDependencies": {
-                    package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)
+                    package: version for package, version in unsupported.items()
                 },
             },
             f"node_modules/{selected_native}": native_lock,
@@ -5286,7 +5295,6 @@ def package_lock_records(root: Path) -> dict[str, Any]:
             },
         },
         **supported,
-        **unsupported,
     }
     for path, record in packages.items():
         if path == "":
@@ -5320,7 +5328,7 @@ def package_lock_records(root: Path) -> dict[str, Any]:
     if not isinstance(cli, dict):
         fail("Kilo CLI package lock omits @kilocode/cli")
     optional = cli.get("optionalDependencies")
-    expected_optional = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    expected_optional = unsupported
     if optional != expected_optional:
         fail("Kilo CLI package lock omits native optional dependencies")
     return lock
@@ -5547,8 +5555,8 @@ def package_metadata(root: Path) -> dict[str, Any]:
     if not isinstance(scripts, dict) or scripts.get("postinstall") != "node ./postinstall.mjs":
         fail("Kilo CLI package vendor lifecycle script baseline changed")
     optional = metadata.get("optionalDependencies")
-    supported, unsupported = native_package_matrix()
-    expected_optional = {package: KILO_CURRENT_VERSION for package in (*supported, *unsupported)}
+    _supported, unsupported = native_package_matrix()
+    expected_optional = unsupported
     if optional != expected_optional:
         fail("Kilo CLI package native optional dependency map is invalid")
     return metadata

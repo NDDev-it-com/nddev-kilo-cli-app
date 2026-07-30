@@ -11,8 +11,7 @@
     "official_source": {
       "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
       "repository": "https://github.com/Kilo-Org/kilocode",
-      "npm": "https://registry.npmjs.org/@kilocode%2fcli/7.4.17",
-      "latest_dist_tags": "https://registry.npmjs.org/@kilocode/cli"
+      "npm": "https://registry.npmjs.org/@kilocode%2fcli/7.4.17"
     }
   },
   "runtime_launch": {
@@ -298,8 +297,7 @@
           "@kilocode/cli-linux-x64-baseline",
           "@kilocode/cli-linux-x64"
         ]
-      },
-      "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog"
+      }
     }
   },
   "builder": {

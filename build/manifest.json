@@ -173,8 +173,7 @@
           "@kilocode/cli-linux-x64-baseline",
           "@kilocode/cli-linux-x64"
         ]
-      },
-      "vendor_optional_catalog": "references/kilo-cli-baseline.json:npm.native_packages.catalog"
+      }
     }
   },
   "setups": [

@@ -170,19 +170,30 @@ def validate_native_setup() -> None:
 def validate_archive_metadata() -> None:
     baseline = load_json("references/kilo-cli-baseline.json")
     npm = baseline.get("npm", {})
+    if "verified_at" in baseline or "dist_tags" in npm:
+        fail("vendor currentness observations must remain private")
+    postinstall = npm.get("postinstall_analysis", {})
+    if isinstance(postinstall, dict) and "observed_at" in postinstall:
+        fail("postinstall observation timestamp must remain private")
     dist = npm.get("dist", {})
     if not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", str(dist.get("integrity"))):
         fail("main npm integrity is invalid")
     if not re.fullmatch(r"[0-9a-f]{40}", str(dist.get("shasum"))):
         fail("main npm shasum is invalid")
     native = npm.get("native_packages", {})
-    catalog = native.get("catalog", {})
+    if "catalog" in native:
+        fail("vendor native package catalog observations must remain private")
     production = native.get("production", {})
-    if not isinstance(catalog, dict) or not isinstance(production, dict) or not production:
-        fail("native package catalogs are incomplete")
-    if not set(production).issubset(catalog):
-        fail("production native packages must be drawn from the vendor catalog")
-    for name, record in catalog.items():
+    optional = native.get("optional_dependencies", {})
+    if not isinstance(production, dict) or not production:
+        fail("production native package records are incomplete")
+    if (
+        not isinstance(optional, dict)
+        or not set(production).issubset(optional)
+        or any(version != npm.get("version") for version in optional.values())
+    ):
+        fail("native optional dependency identities are incomplete")
+    for name, record in production.items():
         archive = record.get("dist", {}) if isinstance(record, dict) else {}
         if not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", str(archive.get("integrity"))):
             fail(f"{name}: native package integrity is invalid")
