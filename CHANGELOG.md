@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## [0.3.0]
 
 - Correct the runtime baseline schema to 3, the public contract version to 3,
   and the build manifest schema to 2.
