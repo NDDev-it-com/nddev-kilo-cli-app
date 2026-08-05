@@ -1,172 +1,172 @@
 {
-  "schema_version": 3,
-  "product": {
-    "name": "Kilo Code CLI",
-    "documented_command": "kilo",
-    "docs_title": "Kilo Code CLI: Run the AI Coding Agent from Your Terminal",
-    "official_install_command": "npm install -g @kilocode/cli",
-    "managed_install_channel": "target-owned verified npm archive extraction"
+  "native_surfaces": {
+    "agents": "agent markdown files and agent.<name> config",
+    "auth": "Kilo-owned provider auth, not managed by this module",
+    "commands": "command/*.md and command.<name> config",
+    "config_file": "~/.config/kilo/kilo.jsonc",
+    "config_parser": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/opencode/src/config/parse.ts",
+    "config_schema": "https://app.kilo.ai/config.json",
+    "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/core/src/v1/config/config.ts",
+    "marketplace": null,
+    "mcp": "mcp.<name> local or remote config, intentionally absent from this setup",
+    "memory": "Kilo-owned memory, not managed by this module",
+    "permission": "permission values use ask, allow, and deny actions",
+    "plugins": "plugin array with local file specs and plugin directories",
+    "sandbox": "sandbox.enabled, sandbox.network, sandbox.writable_paths, sandbox.allowed_hosts",
+    "skills": "skills.paths and local Agent Skills",
+    "trusted_config_env": "KILO_CONFIG"
   },
   "npm": {
-    "package": "@kilocode/cli",
-    "version": "7.4.17",
     "bin": {
       "kilo": "bin/kilo",
       "kilocode": "bin/kilo"
     },
+    "dist": {
+      "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.20",
+      "integrity": "sha512-u/9CvTuf5TkiHFqe5YDFcsglL1XWMDJ3f4Cjn6qIEMHPSrN4HBOLxog5kifrBoYjmmhhgfX73C8DyXKRwXGwxA==",
+      "shasum": "71e798b34d6a785624857c06ef2b081549e75b01",
+      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.20.tgz"
+    },
+    "native_packages": {
+      "optional_dependencies": {
+        "@kilocode/cli-darwin-arm64": "7.4.20",
+        "@kilocode/cli-darwin-x64": "7.4.20",
+        "@kilocode/cli-darwin-x64-baseline": "7.4.20",
+        "@kilocode/cli-linux-arm64": "7.4.20",
+        "@kilocode/cli-linux-arm64-musl": "7.4.20",
+        "@kilocode/cli-linux-x64": "7.4.20",
+        "@kilocode/cli-linux-x64-baseline": "7.4.20",
+        "@kilocode/cli-linux-x64-baseline-musl": "7.4.20",
+        "@kilocode/cli-linux-x64-musl": "7.4.20",
+        "@kilocode/cli-windows-arm64": "7.4.20",
+        "@kilocode/cli-windows-x64": "7.4.20",
+        "@kilocode/cli-windows-x64-baseline": "7.4.20"
+      },
+      "production": {
+        "@kilocode/cli-darwin-arm64": {
+          "cpu": [
+            "arm64"
+          ],
+          "dist": {
+            "integrity": "sha512-7Z2pGAdz0Y4MEb6vd+5kcbFoT07L6gOLo1AVM5w3UvhXhq2mCLbzVV2EjvvxoWruEVJ2FM0KPsYWcuIKvaNLgA==",
+            "shasum": "841d58a0b6c32c4ec674c3b8bc6c92d213d19e46",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "darwin"
+          ],
+          "version": "7.4.20"
+        },
+        "@kilocode/cli-darwin-x64": {
+          "cpu": [
+            "x64"
+          ],
+          "dist": {
+            "integrity": "sha512-+/svQYYKXnEFdhNssMp2GX5bt3Ms+ofk6y8Un9meVjeUL2q1YbsTwKCIIlv1uoBJhU6TRaOCRtpDtZkAPC2Qpg==",
+            "shasum": "740430f90cf302ae22cc92da45e4966c23442471",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "darwin"
+          ],
+          "version": "7.4.20"
+        },
+        "@kilocode/cli-darwin-x64-baseline": {
+          "cpu": [
+            "x64"
+          ],
+          "dist": {
+            "integrity": "sha512-HD7HeAxCICH7HpfnF6fF5gzFt9jKR15YT3S4NMqEbB7qn5LMV0hiSF3BqT8H5OnEiBZtrv+DGCnEKF5HrJFeiA==",
+            "shasum": "86351f7ed0a789b23920bddabb45e3e131189c9d",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "darwin"
+          ],
+          "version": "7.4.20"
+        },
+        "@kilocode/cli-linux-arm64": {
+          "cpu": [
+            "arm64"
+          ],
+          "dist": {
+            "integrity": "sha512-SUJy+ZurV8N3d0oO5M8g+67r7j0oFzs+e4IVmvqP+TW+fPmhqxPNytcduJXy5v4SuUrwxvutHqqIPn28k9/sdg==",
+            "shasum": "b4e6003fd47c6a09597c89de6b709e63a2fc2967",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "linux"
+          ],
+          "version": "7.4.20"
+        },
+        "@kilocode/cli-linux-x64": {
+          "cpu": [
+            "x64"
+          ],
+          "dist": {
+            "integrity": "sha512-+FfrqdocnxW9+nw9ycBq92NNew/NB4b7OslAp8VWxedV6E5tn4O3D55hIxYu0xbdgAlgW1pV5iaxN/+bsqeL9g==",
+            "shasum": "bc9e8b1ec71b0802c3dd9fd09e58342ec8d11851",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "linux"
+          ],
+          "version": "7.4.20"
+        },
+        "@kilocode/cli-linux-x64-baseline": {
+          "cpu": [
+            "x64"
+          ],
+          "dist": {
+            "integrity": "sha512-l8riKK59J8YUrmAuCmD9MJVKUUs2kqae9DKXnHDhc5Hvesf/u/+hOB+InX37R9MOoj9yWzZGCOQbsPUfNPkD1g==",
+            "shasum": "2f42618a97a289f60a72bd4e4b10122386090ded",
+            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.20.tgz"
+          },
+          "libc": null,
+          "os": [
+            "linux"
+          ],
+          "version": "7.4.20"
+        }
+      }
+    },
+    "package": "@kilocode/cli",
+    "postinstall_analysis": {
+      "copies_and_removes_files": true,
+      "executes_native_binary": true,
+      "executes_node_code": true,
+      "managed_policy": "verify pinned JS and selected native package tarballs before extracting local bytes without lifecycle scripts",
+      "nested_npm_install_fallback": true,
+      "source": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.20.tgz",
+      "uses_sysctl_or_ldd": true
+    },
     "scripts": {
       "postinstall": "node ./postinstall.mjs"
     },
-    "postinstall_analysis": {
-      "source": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
-      "executes_node_code": true,
-      "executes_native_binary": true,
-      "copies_and_removes_files": true,
-      "uses_sysctl_or_ldd": true,
-      "nested_npm_install_fallback": true,
-      "managed_policy": "verify pinned JS and selected native package tarballs before extracting local bytes without lifecycle scripts"
-    },
-    "dist": {
-      "integrity": "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BAFoYbz8xTqkgqpkZxzwZ8MA==",
-      "shasum": "046eda3dcaa4df0e68ccf869f3ef88d37898e12c",
-      "tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
-      "attestations": "https://registry.npmjs.org/-/npm/v1/attestations/@kilocode%2fcli@7.4.17"
-    },
-    "native_packages": {
-      "production": {
-        "@kilocode/cli-darwin-arm64": {
-          "version": "7.4.17",
-          "os": [
-            "darwin"
-          ],
-          "cpu": [
-            "arm64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-MGIaXFRP6AZ9Mo/2qjkTq1ndYEvAVFhGzNtbEBxYqvfdbPn4lbe4vg29b5ionly3prhdMKthzlCba2CvxL8JJQ==",
-            "shasum": "6dbd195b4e7a9cffb10e7d26e6d1f6dcb5b270af",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-arm64/-/cli-darwin-arm64-7.4.17.tgz"
-          }
-        },
-        "@kilocode/cli-darwin-x64-baseline": {
-          "version": "7.4.17",
-          "os": [
-            "darwin"
-          ],
-          "cpu": [
-            "x64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-4Oc1OQHOsGCimiXBkEWYr2ibda8eim948uFyAq3y1Sx4dPupq7ORK0l6bk3OlK+w3ELcGl6iGEfv0vcUkpW6ow==",
-            "shasum": "ed8e8026710c365ff5239fd6fbe3506a9c1f039b",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64-baseline/-/cli-darwin-x64-baseline-7.4.17.tgz"
-          }
-        },
-        "@kilocode/cli-darwin-x64": {
-          "version": "7.4.17",
-          "os": [
-            "darwin"
-          ],
-          "cpu": [
-            "x64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-Sra1gT2gHkejiZFIJftoySM6pAW7Yyz1Uzi2sz5plLF72TgfKL2RIeK02rzPQ02u4IJ6rLyoft6WvsthAIPBQw==",
-            "shasum": "8996784b2b9cee5b529c6ca0947c48f0c8ec8cd3",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-darwin-x64/-/cli-darwin-x64-7.4.17.tgz"
-          }
-        },
-        "@kilocode/cli-linux-arm64": {
-          "version": "7.4.17",
-          "os": [
-            "linux"
-          ],
-          "cpu": [
-            "arm64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-mn3vMVNChjp6NyXblStrNLJp0ftq6xfwo8i/sZFVKO9w+WSK50dK3GtMw+358Z95QQ/CfvHiNl4F1nq5g7u3Sg==",
-            "shasum": "e30ed504b5c054ac5087fba3772a0cf615e4afb0",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-arm64/-/cli-linux-arm64-7.4.17.tgz"
-          }
-        },
-        "@kilocode/cli-linux-x64-baseline": {
-          "version": "7.4.17",
-          "os": [
-            "linux"
-          ],
-          "cpu": [
-            "x64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-s9A/YfNGKhAFcWVtvBKf6n8nOnh0X/MrX+3EXI4FM7ELx6QuzkPgwH6OSR6+glp7yP7P67eBpSpVBDulNiJZqg==",
-            "shasum": "f485e814bbc7363809671fac45ee4a83458e5903",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-7.4.17.tgz"
-          }
-        },
-        "@kilocode/cli-linux-x64": {
-          "version": "7.4.17",
-          "os": [
-            "linux"
-          ],
-          "cpu": [
-            "x64"
-          ],
-          "libc": null,
-          "dist": {
-            "integrity": "sha512-1VuVYJVVwQdrgk5r8/sUbge2zWcnKAlLJt3/Ds8RqbsupC1Te/zwOb1NCEklyKJFVNy7/yyZGnCwASPlRAPUeg==",
-            "shasum": "b958d18f202396e59658c8dbd20928b2864c565e",
-            "tarball": "https://registry.npmjs.org/@kilocode/cli-linux-x64/-/cli-linux-x64-7.4.17.tgz"
-          }
-        }
-      },
-      "optional_dependencies": {
-        "@kilocode/cli-darwin-arm64": "7.4.17",
-        "@kilocode/cli-darwin-x64": "7.4.17",
-        "@kilocode/cli-darwin-x64-baseline": "7.4.17",
-        "@kilocode/cli-linux-arm64": "7.4.17",
-        "@kilocode/cli-linux-arm64-musl": "7.4.17",
-        "@kilocode/cli-linux-x64": "7.4.17",
-        "@kilocode/cli-linux-x64-baseline": "7.4.17",
-        "@kilocode/cli-linux-x64-baseline-musl": "7.4.17",
-        "@kilocode/cli-linux-x64-musl": "7.4.17",
-        "@kilocode/cli-windows-arm64": "7.4.17",
-        "@kilocode/cli-windows-x64": "7.4.17",
-        "@kilocode/cli-windows-x64-baseline": "7.4.17"
-      }
-    }
+    "version": "7.4.20"
   },
-  "native_surfaces": {
-    "config_schema": "https://app.kilo.ai/config.json",
-    "config_source": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/config.ts",
-    "config_parser": "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/config/parse.ts",
-    "config_file": "~/.config/kilo/kilo.jsonc",
-    "trusted_config_env": "KILO_CONFIG",
-    "permission": "permission values use ask, allow, and deny actions",
-    "sandbox": "sandbox.enabled, sandbox.network, sandbox.writable_paths, sandbox.allowed_hosts",
-    "agents": "agent markdown files and agent.<name> config",
-    "skills": "skills.paths and local Agent Skills",
-    "commands": "command/*.md and command.<name> config",
-    "plugins": "plugin array with local file specs and plugin directories",
-    "mcp": "mcp.<name> local or remote config, intentionally absent from this setup",
-    "auth": "Kilo-owned provider auth, not managed by this module",
-    "memory": "Kilo-owned memory, not managed by this module",
-    "marketplace": null
+  "product": {
+    "docs_title": "Kilo Code CLI: Run the AI Coding Agent from Your Terminal",
+    "documented_command": "kilo",
+    "managed_install_channel": "target-owned verified npm archive extraction",
+    "name": "Kilo Code CLI",
+    "official_install_command": "npm install -g @kilocode/cli"
   },
+  "schema_version": 3,
   "sources": [
     "https://kilo.ai/docs/code-with-ai/platforms/cli",
     "https://kilo.ai/docs/automate/extending/plugins",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/kilo-docs/markdoc/partials/install-cli.md",
-    "https://registry.npmjs.org/@kilocode%2fcli/7.4.17",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/config.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/core/src/v1/config/plugin.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/config/plugin.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/plugin/loader.ts",
-    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.17/packages/opencode/src/plugin/shared.ts"
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/kilo-docs/markdoc/partials/install-cli.md",
+    "https://registry.npmjs.org/@kilocode%2fcli/7.4.20",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/core/src/v1/config/config.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/core/src/v1/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/opencode/src/config/plugin.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/opencode/src/plugin/loader.ts",
+    "https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.4.20/packages/opencode/src/plugin/shared.ts"
   ]
 }

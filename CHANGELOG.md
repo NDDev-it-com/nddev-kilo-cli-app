@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-08-05
+
+- Update Kilo Code CLI to stable `7.4.20` with exact umbrella and native npm
+  package integrity, shasum, tarball, platform, CPU, and libc metadata.
+
 ## [0.3.0]
 
 - Correct the runtime baseline schema to 3, the public contract version to 3,

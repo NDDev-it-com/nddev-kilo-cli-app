@@ -4,14 +4,14 @@
   "github_repository": "NDDev-it-com/nddev-kilo-cli-app",
   "license": "AGPL-3.0-or-later",
   "runtime_compatibility": {
-    "current_version": "7.4.17",
-    "minimum_version": "7.4.17",
+    "current_version": "7.4.20",
+    "minimum_version": "7.4.20",
     "package": "@kilocode/cli",
     "python_requires": ">=3.9",
     "official_source": {
       "documentation": "https://kilo.ai/docs/code-with-ai/platforms/cli",
       "repository": "https://github.com/Kilo-Org/kilocode",
-      "npm": "https://registry.npmjs.org/@kilocode%2fcli/7.4.17"
+      "npm": "https://registry.npmjs.org/@kilocode%2fcli/7.4.20"
     }
   },
   "runtime_launch": {
@@ -201,12 +201,12 @@
   },
   "software_lifecycle": {
     "package": "@kilocode/cli",
-    "version": "7.4.17",
+    "version": "7.4.20",
     "command": "kilo",
     "official_alias": "kilocode",
     "install_tool": "verified-npm-archive-set",
     "archive_authority": {
-      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
+      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.20.tgz",
       "native_tarball": "host-selected-production-native-package",
       "verification": [
         "sha512-integrity",
@@ -214,8 +214,8 @@
       ],
       "materialization": "extract-verified-local-bytes-without-scripts"
     },
-    "package_integrity": "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BAFoYbz8xTqkgqpkZxzwZ8MA==",
-    "package_shasum": "046eda3dcaa4df0e68ccf869f3ef88d37898e12c",
+    "package_integrity": "sha512-u/9CvTuf5TkiHFqe5YDFcsglL1XWMDJ3f4Cjn6qIEMHPSrN4HBOLxog5kifrBoYjmmhhgfX73C8DyXKRwXGwxA==",
+    "package_shasum": "71e798b34d6a785624857c06ef2b081549e75b01",
     "lifecycle_scripts": "disabled",
     "official_postinstall": {
       "present": true,

@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "build_version": "0.3.0",
-  "kilo_cli_current": "7.4.17",
-  "kilo_cli_min": "7.4.17",
+  "build_version": "0.3.1",
+  "kilo_cli_current": "7.4.20",
+  "kilo_cli_min": "7.4.20",
   "kilo_cli_package": "@kilocode/cli",
-  "kilo_cli_package_integrity": "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BAFoYbz8xTqkgqpkZxzwZ8MA==",
-  "kilo_cli_package_shasum": "046eda3dcaa4df0e68ccf869f3ef88d37898e12c",
+  "kilo_cli_package_integrity": "sha512-u/9CvTuf5TkiHFqe5YDFcsglL1XWMDJ3f4Cjn6qIEMHPSrN4HBOLxog5kifrBoYjmmhhgfX73C8DyXKRwXGwxA==",
+  "kilo_cli_package_shasum": "71e798b34d6a785624857c06ef2b081549e75b01",
   "kilo_cli_install_channel": "npm",
   "python_requires": ">=3.9",
   "runtime_baseline": "references/kilo-cli-baseline.json"

@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "product_name": "nddev-kilo-cli-app",
-  "build_version": "0.3.0",
+  "build_version": "0.3.1",
   "runtime_baseline": "references/kilo-cli-baseline.json",
   "contract": "config/nddev-contract.json",
   "manager": "cli-tools/nddev_kilo_cli.py",
@@ -10,7 +10,7 @@
   "runtime": {
     "command": "kilo",
     "package": "@kilocode/cli",
-    "version": "7.4.17",
+    "version": "7.4.20",
     "target_owned_executable": "bin/kilo",
     "path_inherited": false,
     "subcommand": [
@@ -86,15 +86,15 @@
     ],
     "installer": {
       "tool": "verified-npm-archive-set",
-      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.17.tgz",
+      "package_tarball": "https://registry.npmjs.org/@kilocode/cli/-/cli-7.4.20.tgz",
       "native_tarball": "host-selected-production-native-package",
       "verification": [
         "sha512-integrity",
         "sha1-shasum"
       ],
       "materialization": "extract-verified-local-bytes-without-scripts",
-      "package_integrity": "sha512-cSXfes5MSZWxyCk2HHD/xLq/NRTUVSWpTaqe6eFtcUKQXIXAzWAQKd/x7OUXl1BAFoYbz8xTqkgqpkZxzwZ8MA==",
-      "package_shasum": "046eda3dcaa4df0e68ccf869f3ef88d37898e12c",
+      "package_integrity": "sha512-u/9CvTuf5TkiHFqe5YDFcsglL1XWMDJ3f4Cjn6qIEMHPSrN4HBOLxog5kifrBoYjmmhhgfX73C8DyXKRwXGwxA==",
+      "package_shasum": "71e798b34d6a785624857c06ef2b081549e75b01",
       "lifecycle_scripts": "disabled",
       "nested_npm_fallback_allowed": false
     },
