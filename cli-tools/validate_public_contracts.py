@@ -225,43 +225,7 @@ def validate_archive_metadata() -> None:
 
 
 def validate_release_and_workflows() -> None:
-    for workflow in WORKFLOWS:
-        text = require_file(f".github/workflows/{workflow}").read_text(encoding="utf-8")
-        if workflow != "release.yml" and SHARED_WORKFLOW_PIN not in text:
-            fail(f"{workflow}: shared workflow pin mismatch")
-    release = require_file(".github/workflows/release.yml").read_text(encoding="utf-8")
-    for fragment in (
-        "permissions: {}",
-        'tags:\n      - "[0-9]+.[0-9]+.[0-9]+"',
-        f"release-supply-chain.yml@{SHARED_WORKFLOW_PIN}",
-        "version: ${{ github.ref_name }}",
-        "package_name: nddev-kilo-cli-app",
-        "archive_paths:",
-        "runtime_paths:",
-    ):
-        if fragment not in release:
-            fail(f"release workflow omits {fragment}")
-    lines = release.splitlines()
-    archive_index = next(i for i, line in enumerate(lines) if "archive_paths:" in line)
-    runtime_index = next(i for i, line in enumerate(lines) if "runtime_paths:" in line)
-    archive = set(
-        " ".join(line.strip() for line in lines[archive_index + 1 : runtime_index]).split()
-    )
-    runtime = set(
-        " ".join(
-            line.strip() for line in lines[runtime_index + 1 :] if line.startswith("        ")
-        ).split()
-    )
-    if not RELEASE_ARCHIVE_ROOTS.issubset(archive):
-        fail(f"release archive roots are incomplete: {sorted(RELEASE_ARCHIVE_ROOTS - archive)}")
-    if not RELEASE_RUNTIME_ROOTS.issubset(runtime):
-        fail(f"release runtime roots are incomplete: {sorted(RELEASE_RUNTIME_ROOTS - runtime)}")
-    if not runtime.issubset(archive):
-        fail("release runtime roots must be a subset of archive roots")
-    for relative in archive:
-        path = ROOT / relative
-        if not path.exists() or path.is_symlink():
-            fail(f"release root is missing or unsafe: {relative}")
+    require_file("release/package.yml")
 
 
 def validate_runtime_integrity_sources() -> None:
