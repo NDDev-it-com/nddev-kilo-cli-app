@@ -33,7 +33,7 @@ REQUIRED_MANAGER_FUNCTIONS = {
     "launch_environment",
 }
 PRIVATE_PARTS = {"validation", ".agents", ".serena", "__pycache__", ".pytest_cache"}
-SHARED_WORKFLOW_PIN = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
+SHARED_WORKFLOW_PIN = "f6ea891f09653b8d449098817c8acfdb510731f6"
 RELEASE_ARCHIVE_ROOTS = {
     ".claude",
     ".gds",
