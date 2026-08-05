@@ -4690,8 +4690,20 @@ def launch_handoff_directories(target: Path, installation: dict[str, Any]) -> li
             if not isinstance(path, str):
                 continue
             resource_relative = safe_relative_path(path)
-            append_directory_chain(target, resource_relative / "resource-placeholder", directories)
-            directories.append(target / resource_relative)
+            resource_path = target / resource_relative
+            # The native resource contract deliberately contains both trees
+            # (console, licenses, tree-sitter) and files (bwrap, sandbox
+            # worker). Protect every parent handoff directory, but never pass a
+            # regular resource file to the directory-mode hardening path.
+            append_directory_chain(target, resource_relative, directories)
+            try:
+                resource_info = resource_path.lstat()
+            except OSError as exc:
+                fail(f"cannot inspect launch resource path: {resource_path}: {exc}")
+            if stat.S_ISDIR(resource_info.st_mode):
+                directories.append(resource_path)
+            elif not stat.S_ISREG(resource_info.st_mode):
+                fail(f"launch resource path must be a regular file or directory: {resource_path}")
     unique: dict[Path, None] = {}
     for directory in directories:
         unique.setdefault(directory, None)
